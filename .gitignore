@@ -1,0 +1,52 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# Node
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Build
+dist/
+internal/web/dist/
+
+# Account data (contains secrets)
+accounts/*.json
+accounts/.token_stats.json
+accounts/.register_history.json
+
+# Config (contains API keys)
+config.yaml
+
+# Go build output (anchored to repo root so it only matches the built
+# binary, NOT the cmd/notion-manager/ source directory)
+/notion-manager
+/notion-manager.exe
