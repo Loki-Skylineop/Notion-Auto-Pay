@@ -23,7 +23,7 @@ function Hero({ onAdd, accountCount, spaceCount }: { onAdd: () => void; accountC
       <div aria-hidden="true" className="mesh-hero pointer-events-none absolute -top-56 left-1/2 -translate-x-1/2 w-[150%] h-[520px] opacity-70" />
       <div className="relative max-w-[1100px] mx-auto px-6 pt-16 pb-12 text-center">
         <span className="eyebrow inline-flex items-center gap-1.5 bg-white/5 backdrop-blur border border-border rounded-full px-3 py-1 shadow-card">
-          <IconSpark /> Motion Pay
+          <IconSpark /> Notion Auto Pay
         </span>
         <div className="flex items-center justify-center gap-3 mt-7">
           <button
