@@ -42,8 +42,10 @@ type AutoPayConfig struct {
 	Card            *AutoPaySavedCard `json:"card,omitempty"`
 	// Spaces maps a workspace space_id -> whether auto-pay is armed for it.
 	Spaces map[string]bool `json:"spaces"`
-	// Paid guards against charging the same space twice before the new tier
-	// propagates back from Notion (space_id -> unix-ms timestamp).
+	// Paid records the last time a space was paid (space_id -> unix-ms). It is
+	// kept only for display/log purposes — it does NOT gate re-payment, because
+	// the user wants auto-pay to keep paying a space as long as Notion still
+	// reports it as free.
 	Paid map[string]int64 `json:"paid"`
 }
 
@@ -424,9 +426,10 @@ func (m *AutoPayManager) runOnce() {
 				continue
 			}
 			totArmedFree++
+			// NB: специально НЕТ проверки «уже оплачено» — пользователь хочет, чтобы
+			// автооплата повторялась каждый скан, пока Notion всё ещё видит пространство free.
 			if ts, ok := cfg.Paid[sp.SpaceID]; ok {
-				log.Printf("[autopay]   – %s (%s): уже оплачен ранее (%s) — пропуск", name, shortID, time.UnixMilli(ts).Format("15:04:05"))
-				continue
+				log.Printf("[autopay]   ↺ %s (%s): платили ранее (%s), но всё ещё free — плачу снова", name, shortID, time.UnixMilli(ts).Format("15:04:05"))
 			}
 
 			log.Printf("[autopay]   → плачу %s (%s): план %s, создаю токен карты...", name, shortID, cfg.Plan)
@@ -454,6 +457,57 @@ func (m *AutoPayManager) runOnce() {
 	if len(msgs) > 0 {
 		m.appendLog(msgs)
 	}
+}
+
+// PaySpace pays a SINGLE workspace using the server-saved card. It's used by
+// the dashboard's manual "Оплатить сохранённой картой" button so the user
+// doesn't have to re-type the card. Returns the paid account email and plan.
+func (m *AutoPayManager) PaySpace(token, spaceID, plan, country string) (string, string, error) {
+	cfg := m.snapshot()
+	if cfg.Card == nil || strings.TrimSpace(cfg.Card.Number) == "" {
+		return "", "", fmt.Errorf("сохранённая карта не задана")
+	}
+	if strings.TrimSpace(token) == "" || strings.TrimSpace(spaceID) == "" {
+		return "", "", fmt.Errorf("token_v2 и space_id обязательны")
+	}
+	if strings.TrimSpace(plan) == "" {
+		plan = cfg.Plan
+	}
+	if strings.TrimSpace(country) == "" {
+		country = cfg.Country
+	}
+	ws, err := DiscoverWorkspacesFromToken(token)
+	if err != nil {
+		return "", "", err
+	}
+	var target *WorkspaceInfo
+	for i := range ws.Spaces {
+		if ws.Spaces[i].SpaceID == spaceID {
+			target = &ws.Spaces[i]
+			break
+		}
+	}
+	if target == nil {
+		return "", "", fmt.Errorf("пространство %s не найдено для этого токена", truncate(spaceID, 8))
+	}
+	name := target.Name
+	if name == "" {
+		name = "Workspace"
+	}
+	log.Printf("[autopay] ручная оплата сохранённой картой: %s (%s) план %s страна %s", name, truncate(spaceID, 8), plan, country)
+	pmID, err := createStripePaymentMethod(m.stripeKey, country, *cfg.Card)
+	if err != nil {
+		log.Printf("[autopay]   ✗ %s: Stripe отклонил карту: %v", name, err)
+		return "", "", err
+	}
+	if err := callNotionUpdateSubscription(token, ws.UserID, spaceID, pmID, plan, ws.UserEmail, ws.UserName, country, DefaultClientVersion); err != nil {
+		log.Printf("[autopay]   ✗ %s: Notion отклонил оплату: %v", name, err)
+		return "", "", err
+	}
+	log.Printf("[autopay]   ✓ %s (%s): ОПЛАЧЕНО (вручную, план %s)", name, truncate(spaceID, 8), plan)
+	m.markPaid(spaceID)
+	m.appendLog([]string{"✓ " + name + " (вручную): " + plan})
+	return ws.UserEmail, plan, nil
 }
 
 // createStripePaymentMethod mints a fresh Stripe PaymentMethod from raw card
@@ -555,5 +609,38 @@ func HandleAutoPayRun(m *AutoPayManager, auth *DashboardAuth) http.HandlerFunc {
 		}
 		started := m.TriggerRun()
 		json.NewEncoder(w).Encode(map[string]bool{"started": started})
+	}
+}
+
+// HandleAutoPayPaySpace pays one workspace with the server-saved card
+// (POST /admin/autopay/pay-space). Body: {token_v2, space_id, plan, country}.
+func HandleAutoPayPaySpace(m *AutoPayManager, auth *DashboardAuth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			http.Error(w, `{"error":"method not allowed"}`, http.StatusMethodNotAllowed)
+			return
+		}
+		if auth.HasAdminPassword() && !auth.ValidateSession(r) {
+			http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+			return
+		}
+		var req struct {
+			TokenV2 string `json:"token_v2"`
+			SpaceID string `json:"space_id"`
+			Plan    string `json:"plan"`
+			Country string `json:"country"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+		email, plan, err := m.PaySpace(req.TokenV2, req.SpaceID, req.Plan, req.Country)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "email": email, "plan": plan})
 	}
 }

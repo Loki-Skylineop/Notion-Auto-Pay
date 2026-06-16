@@ -97,6 +97,9 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	// even with the dashboard/browser closed.
 	mux.HandleFunc("/admin/autopay", proxy.HandleAutoPay(autoPay, dashAuth))
 	mux.HandleFunc("/admin/autopay/run", proxy.HandleAutoPayRun(autoPay, dashAuth))
+	// Pay a single workspace using the server-saved card (manual button in
+	// the Subscribe modal, so the user doesn't have to re-type the card).
+	mux.HandleFunc("/admin/autopay/pay-space", proxy.HandleAutoPayPaySpace(autoPay, dashAuth))
 
 	// Dashboard (React SPA with embedded API key + auth)
 	mux.Handle("/dashboard/", proxy.HandleDashboard(apiKey, dashAuth))
@@ -244,6 +247,7 @@ func main() {
 	log.Printf("  GET  /admin/stats                 (token usage stats)")
 	log.Printf("  GET  /admin/autopay               (server auto-pay config)")
 	log.Printf("  POST /admin/autopay/run           (trigger auto-pay scan now)")
+	log.Printf("  POST /admin/autopay/pay-space     (pay one workspace with saved card)")
 	log.Printf("  POST /admin/register              (bulk MS-SSO register, sync)")
 	log.Printf("  POST /admin/register/start        (async job)")
 	log.Printf("  GET  /admin/register/jobs/{id}/events (SSE progress)")
