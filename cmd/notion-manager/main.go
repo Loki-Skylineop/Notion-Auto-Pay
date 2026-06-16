@@ -48,7 +48,7 @@ func apiKeyAuthMiddleware(apiKey string, next http.Handler) http.Handler {
 	})
 }
 
-func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth *proxy.DashboardAuth, usageStats *proxy.UsageStats, regDeps *proxy.RegisterJobsDeps) *http.ServeMux {
+func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth *proxy.DashboardAuth, usageStats *proxy.UsageStats, regDeps *proxy.RegisterJobsDeps, autoPay *proxy.AutoPayManager) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	// Anthropic + OpenAI-compatible API endpoints
@@ -91,6 +91,12 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 
 	// Workspace discovery endpoint
 	mux.HandleFunc("/admin/discover", proxy.HandleDiscoverWorkspaces(dashAuth))
+
+	// Server-side auto-pay config + manual trigger. The actual paying is done
+	// by the background scheduler (AutoPayManager.Start) so it keeps running
+	// even with the dashboard/browser closed.
+	mux.HandleFunc("/admin/autopay", proxy.HandleAutoPay(autoPay, dashAuth))
+	mux.HandleFunc("/admin/autopay/run", proxy.HandleAutoPayRun(autoPay, dashAuth))
 
 	// Dashboard (React SPA with embedded API key + auth)
 	mux.Handle("/dashboard/", proxy.HandleDashboard(apiKey, dashAuth))
@@ -177,6 +183,13 @@ func main() {
 	usageStats := proxy.InitUsageStats(statsPath)
 	usageStats.StartFlushLoop(5 * time.Second)
 
+	// Server-side auto-pay: loads accounts/.autopay.json and runs an
+	// unattended scan loop (interval is configured in SECONDS via the
+	// dashboard). Re-tokenizes the saved card per workspace so it works
+	// with the browser closed.
+	autoPay := proxy.NewAutoPayManager(pool, accountsDir, cfg.Stripe.Key)
+	autoPay.Start()
+
 	// Async batch-register store + provider registry.
 	regStore, err := regjob.NewStore(cfg.Register.HistoryFile, cfg.Register.HistoryMemoryCap)
 	if err != nil {
@@ -209,7 +222,7 @@ func main() {
 		})
 	}
 
-	mux := newMux(pool, accountsDir, apiKey, dashAuth, usageStats, regDeps)
+	mux := newMux(pool, accountsDir, apiKey, dashAuth, usageStats, regDeps, autoPay)
 
 	log.Printf("=== notion-manager ===")
 	log.Printf("Listening on :%s", port)
@@ -229,6 +242,8 @@ func main() {
 	log.Printf("  GET  /admin/models")
 	log.Printf("  GET  /admin/settings              (search/proxy/ASK settings)")
 	log.Printf("  GET  /admin/stats                 (token usage stats)")
+	log.Printf("  GET  /admin/autopay               (server auto-pay config)")
+	log.Printf("  POST /admin/autopay/run           (trigger auto-pay scan now)")
 	log.Printf("  POST /admin/register              (bulk MS-SSO register, sync)")
 	log.Printf("  POST /admin/register/start        (async job)")
 	log.Printf("  GET  /admin/register/jobs/{id}/events (SSE progress)")
