@@ -51,6 +51,12 @@ type AutoPayConfig struct {
 
 const autoPayMinIntervalSeconds = 5
 
+// autoPayLowCreditThreshold is the number of premium AI credits remaining at
+// or below which an armed, already-paid workspace is automatically switched
+// back to the Free plan (its subscription is canceled). Per the user's
+// request: «если меньше 50 токенов — переходить на тариф фри».
+const autoPayLowCreditThreshold = 50
+
 func defaultAutoPayConfig() *AutoPayConfig {
 	return &AutoPayConfig{
 		Enabled:         false,
@@ -163,6 +169,17 @@ func (m *AutoPayManager) markPaid(spaceID string) {
 	}
 	m.cfg.Paid[spaceID] = time.Now().UnixMilli()
 	m.saveLocked()
+	m.mu.Unlock()
+}
+
+// clearPaid forgets the last-paid timestamp for a space. Called right after a
+// space is downgraded back to Free so the "платили ранее" note doesn't linger.
+func (m *AutoPayManager) clearPaid(spaceID string) {
+	m.mu.Lock()
+	if m.cfg.Paid != nil {
+		delete(m.cfg.Paid, spaceID)
+		m.saveLocked()
+	}
 	m.mu.Unlock()
 }
 
@@ -337,9 +354,12 @@ func (m *AutoPayManager) TriggerRun() bool {
 	return true
 }
 
-// runOnce scans every pooled account's workspaces and pays each armed,
-// still-free space using a freshly minted PaymentMethod. It logs every
-// decision to the console so it's clear why a free space was or wasn't paid.
+// runOnce scans every pooled account's workspaces. For each armed space it:
+//   - pays the space if it is still Free (fresh PaymentMethod per charge), and
+//   - downgrades the space back to Free (cancels the subscription) once its
+//     premium AI credit balance drops to/below autoPayLowCreditThreshold.
+// Every decision is logged to the console so it's clear why a space was paid,
+// downgraded, or skipped.
 func (m *AutoPayManager) runOnce() {
 	m.mu.Lock()
 	if m.running {
@@ -386,7 +406,7 @@ func (m *AutoPayManager) runOnce() {
 	log.Printf("[autopay] аккаунтов в пуле: %d", len(tokens))
 
 	var msgs []string
-	totFree, totArmedFree, totPaid := 0, 0, 0
+	totFree, totArmedFree, totPaid, totDowngraded := 0, 0, 0, 0
 	for _, token := range tokens {
 		ws, err := DiscoverWorkspacesFromToken(token)
 		if err != nil {
@@ -422,7 +442,33 @@ func (m *AutoPayManager) runOnce() {
 				continue
 			}
 			if !isFree {
-				log.Printf("[autopay]   – %s (%s): уже платный (tier=%q) — пропуск", name, shortID, tier)
+				// Armed but already on a paid plan: watch the premium AI credit
+				// balance and switch the space back to Free once it runs low
+				// (<= autoPayLowCreditThreshold remaining). This is the
+				// «меньше 50 токенов → тариф фри» rule.
+				used, limit := fetchSpaceAIUsage(token, ws.UserID, sp.SpaceID)
+				if limit <= 0 {
+					log.Printf("[autopay]   – %s (%s): платный (tier=%q), AI-бюджет не определён — пропуск", name, shortID, tier)
+					continue
+				}
+				remaining := limit - used
+				if remaining < 0 {
+					remaining = 0
+				}
+				if remaining > autoPayLowCreditThreshold {
+					log.Printf("[autopay]   – %s (%s): платный, AI-кредитов осталось %d из %d (> %d) — пропуск", name, shortID, remaining, limit, autoPayLowCreditThreshold)
+					continue
+				}
+				log.Printf("[autopay]   ↓ %s (%s): осталось %d из %d AI-кредитов (≤ %d) — перевожу на Free (отмена подписки)...", name, shortID, remaining, limit, autoPayLowCreditThreshold)
+				if err := cancelNotionSubscription(token, ws.UserID, sp.SpaceID); err != nil {
+					log.Printf("[autopay]   ✗ %s (%s): отмена подписки не удалась: %v", name, shortID, err)
+					msgs = append(msgs, "✗ "+name+": отмена — "+err.Error())
+					continue
+				}
+				log.Printf("[autopay]   ✓ %s (%s): подписка отменена — переход на Free", name, shortID)
+				msgs = append(msgs, fmt.Sprintf("↓ %s: осталось %d из %d → Free", name, remaining, limit))
+				m.clearPaid(sp.SpaceID)
+				totDowngraded++
 				continue
 			}
 			totArmedFree++
@@ -453,10 +499,50 @@ func (m *AutoPayManager) runOnce() {
 		}
 	}
 
-	log.Printf("[autopay] === скан завершён === free всего=%d, free+«Авто»=%d, оплачено сейчас=%d", totFree, totArmedFree, totPaid)
+	log.Printf("[autopay] === скан завершён === free всего=%d, free+«Авто»=%d, оплачено сейчас=%d, переведено на Free=%d", totFree, totArmedFree, totPaid, totDowngraded)
 	if len(msgs) > 0 {
 		m.appendLog(msgs)
 	}
+}
+
+// cancelNotionSubscription switches a workspace back to the Free plan by
+// hitting /api/v3/cancelSubscription with {spaceId, cancelImmediately:false}
+// — exactly the request Notion's own dashboard sends when you cancel a plan.
+// cancelImmediately:false matches the captured client behaviour (the plan is
+// not renewed and reverts to Free). Returns an error on any non-200 response.
+func cancelNotionSubscription(tokenV2, userID, spaceID string) error {
+	if strings.TrimSpace(spaceID) == "" {
+		return fmt.Errorf("spaceId required")
+	}
+	payload, _ := json.Marshal(map[string]interface{}{
+		"spaceId":           spaceID,
+		"cancelImmediately": false,
+	})
+	client := getChromeHTTPClient(AppConfig.APITimeoutDuration())
+	req, err := http.NewRequest("POST", NotionAPIBase+"/cancelSubscription", strings.NewReader(string(payload)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Cookie", "token_v2="+tokenV2)
+	req.Header.Set("User-Agent", AppConfig.Browser.UserAgent)
+	if userID != "" {
+		req.Header.Set("x-notion-active-user-header", userID)
+	}
+	req.Header.Set("x-notion-space-id", spaceID)
+	req.Header.Set("notion-client-version", DefaultClientVersion)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("cancelSubscription %d: %s", resp.StatusCode, truncate(string(body), 200))
+	}
+	return nil
 }
 
 // PaySpace pays a SINGLE workspace using the server-saved card. It's used by
