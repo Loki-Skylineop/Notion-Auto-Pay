@@ -62,14 +62,15 @@ func defaultAutoPayConfig() *AutoPayConfig {
 
 // AutoPayManager owns the persisted config and the background scheduler.
 type AutoPayManager struct {
-	mu          sync.Mutex
-	cfg         *AutoPayConfig
-	path        string
-	pool        *AccountPool
-	stripeKey   string
-	running     bool
-	lastRun     time.Time
-	log         []string
+	mu             sync.Mutex
+	cfg            *AutoPayConfig
+	path           string
+	pool           *AccountPool
+	stripeKey      string
+	running        bool
+	lastRun        time.Time
+	log            []string
+	lastSkipReason string
 }
 
 // NewAutoPayManager loads the persisted config (or defaults) and returns a
@@ -102,6 +103,15 @@ func NewAutoPayManager(pool *AccountPool, accountsDir, stripeKey string) *AutoPa
 	if cfg.IntervalSeconds < autoPayMinIntervalSeconds {
 		cfg.IntervalSeconds = autoPayMinIntervalSeconds
 	}
+	hasCard := cfg.Card != nil && strings.TrimSpace(cfg.Card.Number) != ""
+	armed := 0
+	for _, on := range cfg.Spaces {
+		if on {
+			armed++
+		}
+	}
+	log.Printf("[autopay] config loaded: enabled=%v has_card=%v plan=%s country=%s interval=%ds armed_spaces=%d paid=%d",
+		cfg.Enabled, hasCard, cfg.Plan, cfg.Country, cfg.IntervalSeconds, armed, len(cfg.Paid))
 	return &AutoPayManager{cfg: cfg, path: path, pool: pool, stripeKey: stripeKey}
 }
 
@@ -207,11 +217,11 @@ func (m *AutoPayManager) PublicJSON() map[string]interface{} {
 
 // AutoPayPatch is the editable subset accepted by PUT /admin/autopay.
 type AutoPayPatch struct {
-	Enabled         *bool             `json:"enabled"`
-	Plan            *string           `json:"plan"`
-	Country         *string           `json:"country"`
-	IntervalSeconds *int              `json:"interval_seconds"`
-	Spaces          map[string]bool   `json:"spaces"`
+	Enabled         *bool           `json:"enabled"`
+	Plan            *string         `json:"plan"`
+	Country         *string         `json:"country"`
+	IntervalSeconds *int            `json:"interval_seconds"`
+	Spaces          map[string]bool `json:"spaces"`
 	Space           *struct {
 		ID string `json:"id"`
 		On bool   `json:"on"`
@@ -225,12 +235,15 @@ func (m *AutoPayManager) applyPatch(p AutoPayPatch) {
 	defer m.mu.Unlock()
 	if p.Enabled != nil {
 		m.cfg.Enabled = *p.Enabled
+		log.Printf("[autopay] config: enabled=%v", *p.Enabled)
 	}
 	if p.Plan != nil && strings.TrimSpace(*p.Plan) != "" {
 		m.cfg.Plan = strings.TrimSpace(*p.Plan)
+		log.Printf("[autopay] config: plan=%s", m.cfg.Plan)
 	}
 	if p.Country != nil && strings.TrimSpace(*p.Country) != "" {
 		m.cfg.Country = strings.TrimSpace(*p.Country)
+		log.Printf("[autopay] config: country=%s", m.cfg.Country)
 	}
 	if p.IntervalSeconds != nil {
 		v := *p.IntervalSeconds
@@ -241,6 +254,7 @@ func (m *AutoPayManager) applyPatch(p AutoPayPatch) {
 			v = 86400
 		}
 		m.cfg.IntervalSeconds = v
+		log.Printf("[autopay] config: interval=%ds", v)
 	}
 	if m.cfg.Spaces == nil {
 		m.cfg.Spaces = map[string]bool{}
@@ -250,9 +264,11 @@ func (m *AutoPayManager) applyPatch(p AutoPayPatch) {
 	}
 	if p.Space != nil && p.Space.ID != "" {
 		m.cfg.Spaces[p.Space.ID] = p.Space.On
+		log.Printf("[autopay] config: space %s armed=%v", truncate(p.Space.ID, 8), p.Space.On)
 	}
 	if p.ClearCard {
 		m.cfg.Card = nil
+		log.Printf("[autopay] config: card cleared")
 	} else if p.Card != nil && strings.TrimSpace(p.Card.Number) != "" {
 		m.cfg.Card = &AutoPaySavedCard{
 			Number:   strings.TrimSpace(p.Card.Number),
@@ -260,6 +276,12 @@ func (m *AutoPayManager) applyPatch(p AutoPayPatch) {
 			ExpYear:  strings.TrimSpace(p.Card.ExpYear),
 			CVC:      strings.TrimSpace(p.Card.CVC),
 		}
+		digits := digitsOnly(m.cfg.Card.Number)
+		last4 := digits
+		if len(digits) >= 4 {
+			last4 = digits[len(digits)-4:]
+		}
+		log.Printf("[autopay] config: card saved ···· %s", last4)
 	}
 	m.saveLocked()
 }
@@ -279,6 +301,20 @@ func (m *AutoPayManager) Start() {
 			cfg = m.snapshot()
 			if cfg.Enabled && cfg.Card != nil {
 				m.runOnce()
+				continue
+			}
+			// Log WHY we're not paying — but only when the reason changes, so
+			// a 5s interval doesn't flood the console.
+			reason := "выключено в настройках"
+			if cfg.Enabled && cfg.Card == nil {
+				reason = "карта не задана (введите карту в «Настроить карту и план»)"
+			}
+			m.mu.Lock()
+			changed := m.lastSkipReason != reason
+			m.lastSkipReason = reason
+			m.mu.Unlock()
+			if changed {
+				log.Printf("[autopay] планировщик не платит: %s", reason)
 			}
 		}
 	}()
@@ -290,15 +326,18 @@ func (m *AutoPayManager) TriggerRun() bool {
 	m.mu.Lock()
 	if m.running {
 		m.mu.Unlock()
+		log.Printf("[autopay] ручной запуск пропущен: скан уже идёт")
 		return false
 	}
 	m.mu.Unlock()
+	log.Printf("[autopay] ручной запуск скана")
 	go m.runOnce()
 	return true
 }
 
 // runOnce scans every pooled account's workspaces and pays each armed,
-// still-free space using a freshly minted PaymentMethod.
+// still-free space using a freshly minted PaymentMethod. It logs every
+// decision to the console so it's clear why a free space was or wasn't paid.
 func (m *AutoPayManager) runOnce() {
 	m.mu.Lock()
 	if m.running {
@@ -316,7 +355,20 @@ func (m *AutoPayManager) runOnce() {
 
 	cfg := m.snapshot()
 	if !cfg.Enabled || cfg.Card == nil {
+		log.Printf("[autopay] скан пропущен: enabled=%v has_card=%v", cfg.Enabled, cfg.Card != nil)
 		return
+	}
+
+	armed := 0
+	for _, on := range cfg.Spaces {
+		if on {
+			armed++
+		}
+	}
+	log.Printf("[autopay] === скан старт === план=%s страна=%s интервал=%ds отмечено «Авто»=%d", cfg.Plan, cfg.Country, cfg.IntervalSeconds, armed)
+
+	if armed == 0 {
+		log.Printf("[autopay] ⚠ ни одно пространство не отмечено «Авто» — оплачивать нечего. Отметьте нужные пространства галочкой «Авто».")
 	}
 
 	// Collect tokens from the live pool (same package, so we can read the
@@ -329,46 +381,76 @@ func (m *AutoPayManager) runOnce() {
 		}
 	}
 	m.pool.mu.RUnlock()
+	log.Printf("[autopay] аккаунтов в пуле: %d", len(tokens))
 
 	var msgs []string
+	totFree, totArmedFree, totPaid := 0, 0, 0
 	for _, token := range tokens {
 		ws, err := DiscoverWorkspacesFromToken(token)
 		if err != nil {
+			log.Printf("[autopay] ✗ discover ошибка: %v", err)
+			msgs = append(msgs, "✗ discover: "+err.Error())
 			continue
 		}
+
+		accFree := 0
 		for _, sp := range ws.Spaces {
-			if !cfg.Spaces[sp.SpaceID] {
-				continue
-			}
 			tier := strings.ToLower(strings.TrimSpace(sp.PlanType))
-			isFree := !sp.IsSubscribed && (tier == "" || tier == "free" || tier == "personal")
-			if !isFree {
-				continue
+			if !sp.IsSubscribed && (tier == "" || tier == "free" || tier == "personal") {
+				accFree++
 			}
-			if _, ok := cfg.Paid[sp.SpaceID]; ok {
-				continue
-			}
+		}
+		totFree += accFree
+		log.Printf("[autopay] аккаунт %s: пространств=%d, из них free=%d", ws.UserEmail, len(ws.Spaces), accFree)
+
+		for _, sp := range ws.Spaces {
 			name := sp.Name
 			if name == "" {
 				name = "Workspace"
 			}
+			shortID := truncate(sp.SpaceID, 8)
+			tier := strings.ToLower(strings.TrimSpace(sp.PlanType))
+			isFree := !sp.IsSubscribed && (tier == "" || tier == "free" || tier == "personal")
+			armedOn := cfg.Spaces[sp.SpaceID]
+
+			if !armedOn {
+				if isFree {
+					log.Printf("[autopay]   – %s (%s): free, но НЕ отмечено «Авто» — пропуск", name, shortID)
+				}
+				continue
+			}
+			if !isFree {
+				log.Printf("[autopay]   – %s (%s): уже платный (tier=%q) — пропуск", name, shortID, tier)
+				continue
+			}
+			totArmedFree++
+			if ts, ok := cfg.Paid[sp.SpaceID]; ok {
+				log.Printf("[autopay]   – %s (%s): уже оплачен ранее (%s) — пропуск", name, shortID, time.UnixMilli(ts).Format("15:04:05"))
+				continue
+			}
+
+			log.Printf("[autopay]   → плачу %s (%s): план %s, создаю токен карты...", name, shortID, cfg.Plan)
 			pmID, err := createStripePaymentMethod(m.stripeKey, cfg.Country, *cfg.Card)
 			if err != nil {
-				log.Printf("[autopay] %s: payment method failed: %v", truncate(sp.SpaceID, 8), err)
+				log.Printf("[autopay]   ✗ %s (%s): Stripe отклонил карту: %v", name, shortID, err)
 				msgs = append(msgs, "✗ "+name+": карта — "+err.Error())
 				continue
 			}
+			log.Printf("[autopay]   • %s (%s): карта токенизирована (%s), отправляю в Notion...", name, shortID, pmID)
 			err = callNotionUpdateSubscription(token, ws.UserID, sp.SpaceID, pmID, cfg.Plan, ws.UserEmail, ws.UserName, cfg.Country, DefaultClientVersion)
 			if err != nil {
-				log.Printf("[autopay] %s: updateSubscription failed: %v", truncate(sp.SpaceID, 8), err)
+				log.Printf("[autopay]   ✗ %s (%s): Notion отклонил оплату: %v", name, shortID, err)
 				msgs = append(msgs, "✗ "+name+": "+err.Error())
 				continue
 			}
-			log.Printf("[autopay] %s (%s): paid %s on %s", name, ws.UserEmail, cfg.Plan, truncate(sp.SpaceID, 8))
+			log.Printf("[autopay]   ✓ %s (%s): ОПЛАЧЕНО — план %s", name, shortID, cfg.Plan)
 			msgs = append(msgs, "✓ "+name+": "+cfg.Plan)
 			m.markPaid(sp.SpaceID)
+			totPaid++
 		}
 	}
+
+	log.Printf("[autopay] === скан завершён === free всего=%d, free+«Авто»=%d, оплачено сейчас=%d", totFree, totArmedFree, totPaid)
 	if len(msgs) > 0 {
 		m.appendLog(msgs)
 	}
