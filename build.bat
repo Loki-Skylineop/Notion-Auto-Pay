@@ -3,22 +3,51 @@ chcp 65001 >nul
 setlocal enableextensions enabledelayedexpansion
 
 REM ============================================================
-REM  Motion Pay - универсальная сборка и запуск одной командой
+REM  Notion Auto Pay - универсальная сборка и запуск одной командой
 REM
 REM  Использование:
-REM    build.bat            - собрать фронт + собрать и запустить сервер
-REM    build.bat exe        - только собрать motion-pay.exe (без запуска)
-REM    build.bat run        - собрать фронт и запустить (эквивалент без аргументов)
-REM    build.bat clean      - удалить артефакты сборки
+REM    build.bat                       - собрать фронт + собрать и запустить сервер
+REM    build.bat exe                   - только собрать notion-auto-pay.exe (без запуска)
+REM    build.bat run                   - собрать фронт и запустить (эквивалент без аргументов)
+REM    build.bat clean                 - удалить артефакты сборки
+REM
+REM  Защита панели паролем (rate limit включается автоматически):
+REM    build.bat --password=МойПароль       - запустить с паролем на вход в панель
+REM    build.bat run --password=МойПароль    - то же самое
+REM    build.bat --password МойПароль        - пробел вместо '=' тоже поддерживается
+REM    set DASHBOARD_PASSWORD=МойПароль       - либо задать паролем через переменную окружения
+REM
+REM  Если пароль не задан, панель остаётся открытой.
 REM ============================================================
 
 cd /d "%~dp0"
-set "BINARY=motion-pay.exe"
+set "BINARY=notion-auto-pay.exe"
 set "CMD_PATH=./cmd/notion-manager"
-set "MODE=%~1"
+
+REM --- Разбор аргументов: режим (clean/exe/run) и --password ---
+set "MODE="
+set "DASH_PASSWORD="
+:parse_args
+if "%~1"=="" goto after_args
+set "ARG=%~1"
+if /i "!ARG!"=="clean" ( set "MODE=clean" & shift & goto parse_args )
+if /i "!ARG!"=="exe" ( set "MODE=exe" & shift & goto parse_args )
+if /i "!ARG!"=="run" ( set "MODE=run" & shift & goto parse_args )
+if /i "!ARG!"=="--password" ( set "DASH_PASSWORD=%~2" & shift & shift & goto parse_args )
+if /i "!ARG:~0,11!"=="--password=" ( set "DASH_PASSWORD=!ARG:~11!" & shift & goto parse_args )
+echo [warn] неизвестный аргумент пропущен: !ARG!
+shift
+goto parse_args
+:after_args
+
+REM --- Пароль: приоритет у --password, иначе переменная окружения DASHBOARD_PASSWORD ---
+if not defined DASH_PASSWORD if defined DASHBOARD_PASSWORD set "DASH_PASSWORD=!DASHBOARD_PASSWORD!"
+
+set "RUN_ARGS="
+if defined DASH_PASSWORD set "RUN_ARGS=--password=!DASH_PASSWORD!"
 
 echo ============================================
-echo  Motion Pay: сборка и запуск
+echo  Notion Auto Pay: сборка и запуск
 echo ============================================
 
 REM --- Режим clean ---
@@ -79,16 +108,26 @@ if /i "%MODE%"=="exe" (
   go build -o %BINARY% %CMD_PATH%
   if errorlevel 1 ( echo [ОШИБКА] go build не удался & pause & exit /b 1 )
   echo Готово: %BINARY% собран.
-  echo Запустить: %BINARY%
+  if defined DASH_PASSWORD (
+    echo Запустить с паролем: %BINARY% --password=ВашПароль
+  ) else (
+    echo Запустить: %BINARY%
+    echo Запустить с паролем на панель: %BINARY% --password=ВашПароль
+  )
   pause
   exit /b 0
 )
 
 echo.
 echo [4/4] Запуск сервера (go run %CMD_PATH%)...
+if defined DASH_PASSWORD (
+  echo Веб-панель защищена паролем (включён лимит попыток входа).
+) else (
+  echo Веб-панель открыта без пароля. Чтобы включить пароль: build.bat --password=ВашПароль
+)
 echo Дашборд будет доступен на http://localhost:8081/dashboard/
 echo Для остановки нажмите Ctrl+C
 echo.
-go run %CMD_PATH%
+go run %CMD_PATH% !RUN_ARGS!
 
 endlocal
