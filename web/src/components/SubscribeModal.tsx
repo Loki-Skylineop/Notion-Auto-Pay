@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
+import { fetchAutoPayConfig, paySpaceWithSavedCard } from '../autopay'
 
 declare global {
   interface Window {
@@ -42,6 +43,12 @@ export function SubscribeModal({
   const [error, setError] = useState('')
   const [result, setResult] = useState<string | null>(null)
   const [stripeLoaded, setStripeLoaded] = useState(false)
+  // Saved card (from the server-side auto-pay config / last payment). When
+  // present and we're paying a specific workspace, we offer a one-click
+  // "оплатить сохранённой картой" path that charges on the server without
+  // re-typing the card.
+  const [savedLast4, setSavedLast4] = useState('')
+  const [savedLoading, setSavedLoading] = useState(false)
   const cardRef = useRef<HTMLDivElement>(null)
   // IMPORTANT: a single Stripe instance must be shared between the Card Element
   // and createPaymentMethod. Creating a second window.Stripe(...) for the
@@ -59,6 +66,16 @@ export function SubscribeModal({
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
   }, [onClose])
+
+  // Load the server-saved card so we can show "···· 1234" and offer to pay with
+  // it. Best-effort — if it fails we just hide the saved-card block.
+  useEffect(() => {
+    let cancelled = false
+    fetchAutoPayConfig()
+      .then(c => { if (!cancelled && c.has_card) setSavedLast4(c.card_last4 || '••••') })
+      .catch(() => { /* ignore */ })
+    return () => { cancelled = true }
+  }, [])
 
   // Load Stripe.js and mount card element
   useEffect(() => {
@@ -147,6 +164,31 @@ export function SubscribeModal({
     }
   }
 
+  // One-click pay with the card already saved on the server. Only available
+  // when we're paying a specific workspace (we need its space_id) and a card
+  // is saved. The server re-tokenizes the saved card for this space.
+  const handlePaySaved = async () => {
+    if (!spaceId) return
+    const trimmedToken = token.trim()
+    if (!trimmedToken) { setError('token_v2 пуст') ; return }
+    setSavedLoading(true)
+    setError('')
+    setResult(null)
+    try {
+      const r = await paySpaceWithSavedCard({ token_v2: trimmedToken, space_id: spaceId, plan, country: country || 'DE' })
+      if (r.error) {
+        setError(r.error)
+      } else {
+        setResult(`Подписка ${r.plan || plan} активирована${r.email ? ' для ' + r.email : ''}`)
+        setTimeout(() => { onSuccess(); onClose() }, 2000)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Ошибка запроса')
+    } finally {
+      setSavedLoading(false)
+    }
+  }
+
   return (
     <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={onClose}>
       <div className="w-full max-w-lg bg-bg-card border border-border rounded-2xl shadow-modal p-6 max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
@@ -198,6 +240,26 @@ export function SubscribeModal({
           <label className="text-[11px] text-text-muted mb-1 block">Данные карты</label>
           <div ref={cardRef} className="py-2.5 px-3 bg-bg-input border border-border rounded-lg min-h-[40px] mb-3" />
 
+          {spaceId && savedLast4 && (
+            <div className="mb-3 p-3 bg-bg-secondary border border-border rounded-lg">
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-[11px] text-text-muted mb-0.5">Сохранённая карта</div>
+                  <div className="text-[13px] text-text-primary font-medium">···· {savedLast4}</div>
+                </div>
+                <button
+                  type="button"
+                  onClick={handlePaySaved}
+                  disabled={savedLoading || loading || !!result || !token.trim()}
+                  className="shrink-0 px-3 h-9 bg-white hover:bg-white/90 text-black rounded-full text-[12px] font-medium cursor-pointer border-none disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  {savedLoading ? 'Оплата...' : 'Оплатить сохранённой'}
+                </button>
+              </div>
+              <div className="text-[10px] text-text-muted mt-1.5">Оплата на сервере выбранным планом — новую карту вводить не нужно.</div>
+            </div>
+          )}
+
           <label className="text-[11px] text-text-muted mb-1 block">Страна</label>
           <select
             value={country}
@@ -224,9 +286,9 @@ export function SubscribeModal({
               className="flex-1 h-11 bg-bg-card hover:bg-bg-secondary text-text-primary rounded-full text-[14px] font-medium cursor-pointer transition-colors border border-border">
               Отмена
             </button>
-            <button type="submit" disabled={loading || !token.trim() || !stripeLoaded || !!result}
+            <button type="submit" disabled={loading || savedLoading || !token.trim() || !stripeLoaded || !!result}
               className="flex-1 h-11 bg-white hover:bg-white/90 text-black rounded-full text-[14px] font-medium cursor-pointer transition-colors border-none disabled:opacity-40 disabled:cursor-not-allowed">
-              {loading ? 'Обработка...' : 'Оплатить'}
+              {loading ? 'Обработка...' : 'Оплатить новой картой'}
             </button>
           </div>
         </form>

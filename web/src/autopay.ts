@@ -77,3 +77,35 @@ export async function runAutoPayNow(): Promise<{ started: boolean }> {
   if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
   return resp.json()
 }
+
+export interface PaySpaceInput {
+  token_v2: string
+  space_id: string
+  plan: string
+  country: string
+}
+
+export interface PaySpaceResult {
+  ok?: boolean
+  email?: string
+  plan?: string
+  error?: string
+}
+
+// Pay a single workspace using the card SAVED on the server (from the last
+// auto-pay setup). Lets the manual "Оплатить" modal charge a workspace without
+// re-typing the card — the server re-tokenizes the saved card freshly for
+// this space, exactly like auto-pay does.
+export async function paySpaceWithSavedCard(input: PaySpaceInput): Promise<PaySpaceResult> {
+  const resp = await fetch('/admin/autopay/pay-space', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify(input),
+  })
+  const text = await resp.text()
+  let data: PaySpaceResult = {}
+  try { data = text ? JSON.parse(text) : {} } catch { data = {} }
+  if (!resp.ok || data.error) return { error: data.error || `HTTP ${resp.status}` }
+  return data
+}
