@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { addAccount, discoverWorkspaces } from './api'
+import { addAccount, discoverWorkspaces, checkAuth, login as apiLogin, logout as apiLogout } from './api'
 import { WorkspacePool, type DiscoveredAccount } from './components/WorkspacePool'
 
 const IconPlus = () => (
@@ -17,10 +17,18 @@ const IconSpark = () => (
 // Hero band carrying the brand's signature mesh-gradient atmospheric glow over
 // the black canvas. Headline copy intentionally omitted — just the brand chip
 // and the primary action.
-function Hero({ onAdd, accountCount, spaceCount }: { onAdd: () => void; accountCount: number; spaceCount: number }) {
+function Hero({ onAdd, accountCount, spaceCount, onLogout }: { onAdd: () => void; accountCount: number; spaceCount: number; onLogout?: () => void }) {
   return (
     <header className="relative overflow-hidden border-b border-border">
       <div aria-hidden="true" className="mesh-hero pointer-events-none absolute -top-56 left-1/2 -translate-x-1/2 w-[150%] h-[520px] opacity-70" />
+      {onLogout && (
+        <button
+          onClick={onLogout}
+          className="absolute top-4 right-4 z-10 inline-flex items-center gap-1.5 h-8 px-3 bg-white/5 hover:bg-white/10 border border-border rounded-full text-[12px] text-text-secondary hover:text-text-primary cursor-pointer transition-colors"
+        >
+          Выйти
+        </button>
+      )}
       <div className="relative max-w-[1100px] mx-auto px-6 pt-16 pb-12 text-center">
         <span className="eyebrow inline-flex items-center gap-1.5 bg-white/5 backdrop-blur border border-border rounded-full px-3 py-1 shadow-card">
           <IconSpark /> Notion Auto Pay
@@ -50,6 +58,69 @@ function Stat({ value, label }: { value: number; label: string }) {
     <div className="flex flex-col items-center">
       <span className="text-[24px] font-semibold tracking-tight text-text-primary tabular-nums leading-none">{value}</span>
       <span className="text-[12px] text-text-muted mt-1.5">{label}</span>
+    </div>
+  )
+}
+
+// --- Login Screen ---
+// Shown when the server reports that a dashboard password is required and the
+// current browser session is not yet authenticated. The actual password never
+// leaves the browser in plaintext — api.login() salts + SHA-256-hashes it
+// before POSTing to /dashboard/auth/login.
+function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
+  const [password, setPassword] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => { inputRef.current?.focus() }, [])
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!password) return
+    setLoading(true)
+    setError('')
+    try {
+      const res = await apiLogin(password)
+      if (res.ok) { onSuccess(); return }
+      setError(res.error || 'Неверный пароль')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Ошибка входа')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center px-4">
+      <div className="w-full max-w-sm bg-bg-card border border-border rounded-2xl shadow-modal p-6">
+        <div className="flex items-center justify-center gap-1.5 mb-5">
+          <IconSpark /> <span className="text-[14px] font-medium text-text-primary">Notion Auto Pay</span>
+        </div>
+        <h2 className="text-[18px] font-semibold tracking-tight text-text-primary text-center mb-1">Вход в панель</h2>
+        <p className="text-[13px] text-text-muted text-center mb-5">Введите пароль для доступа к панели.</p>
+        <form onSubmit={handleSubmit}>
+          <input
+            ref={inputRef}
+            type="password"
+            value={password}
+            onChange={e => setPassword(e.target.value)}
+            placeholder="Пароль"
+            autoComplete="current-password"
+            className="w-full py-2.5 px-3 bg-bg-input border border-border rounded-lg text-[14px] text-text-primary outline-none focus:border-notion-blue focus:ring-2 focus:ring-notion-blue/20 transition-all placeholder:text-text-muted"
+          />
+          {error && (
+            <div className="text-err text-[12px] mt-2 px-1">{error}</div>
+          )}
+          <button
+            type="submit"
+            disabled={loading || !password}
+            className="w-full h-11 mt-4 bg-white hover:bg-white/90 text-black rounded-full text-[14px] font-medium cursor-pointer transition-colors border-none disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {loading ? 'Проверка...' : 'Войти'}
+          </button>
+        </form>
+      </div>
     </div>
   )
 }
@@ -168,7 +239,7 @@ function AddAccountModal({ onClose, onDiscovered }: { onClose: () => void; onDis
   )
 }
 
-export default function App() {
+function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const [showAddModal, setShowAddModal] = useState(false)
   // Обнаруженные рабочие пространства по каждому добавленному аккаунту.
   // Сохраняются локально, чтобы пул переживал перезагрузку.
@@ -202,7 +273,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen">
-      <Hero onAdd={() => setShowAddModal(true)} accountCount={accountCount} spaceCount={spaceCount} />
+      <Hero onAdd={() => setShowAddModal(true)} accountCount={accountCount} spaceCount={spaceCount} onLogout={onLogout} />
 
       <main className="max-w-[1100px] mx-auto px-6 py-10">
         {discovered.length === 0 ? (
@@ -229,4 +300,47 @@ export default function App() {
       {showAddModal && <AddAccountModal onClose={() => setShowAddModal(false)} onDiscovered={upsertDiscovered} />}
     </div>
   )
+}
+
+export default function App() {
+  // Auth gate: ask the server whether a dashboard password is required and
+  // whether this browser session is already authenticated. Only render the
+  // dashboard once we're past the login requirement.
+  const [authState, setAuthState] = useState<'loading' | 'login' | 'authed'>('loading')
+  const [requiresPassword, setRequiresPassword] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    checkAuth()
+      .then(res => {
+        if (cancelled) return
+        setRequiresPassword(res.required)
+        if (!res.required || res.authenticated) setAuthState('authed')
+        else setAuthState('login')
+      })
+      .catch(() => {
+        // If the auth check itself fails (e.g. transient network error), fail
+        // open to the dashboard — any protected /admin call will still 401 if a
+        // password is actually required.
+        if (!cancelled) setAuthState('authed')
+      })
+    return () => { cancelled = true }
+  }, [])
+
+  const handleLogout = useCallback(async () => {
+    try { await apiLogout() } catch { /* ignore */ }
+    setAuthState('login')
+  }, [])
+
+  if (authState === 'loading') {
+    return (
+      <div className="min-h-screen flex items-center justify-center text-text-muted text-[13px]">Загрузка...</div>
+    )
+  }
+
+  if (authState === 'login') {
+    return <LoginScreen onSuccess={() => setAuthState('authed')} />
+  }
+
+  return <Dashboard onLogout={requiresPassword ? handleLogout : undefined} />
 }
