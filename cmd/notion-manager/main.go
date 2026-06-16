@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -120,6 +120,11 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 }
 
 func main() {
+	// --password (or DASHBOARD_PASSWORD env) protects the web dashboard with a
+	// login prompt. When neither is set, the dashboard stays open.
+	passwordFlag := flag.String("password", "", "Dashboard login password. If set (or via DASHBOARD_PASSWORD env), the web panel requires this password to log in.")
+	flag.Parse()
+
 	cfg, err := proxy.LoadConfig("config.yaml")
 	if err != nil {
 		log.Fatalf("[config] %v", err)
@@ -127,20 +132,30 @@ func main() {
 
 	proxy.EnsureApiKey(cfg, "config.yaml")
 
-	if cfg.Server.AdminPassword == "" {
-		generated := proxy.GenerateAdminPassword()
-		cfg.Server.AdminPassword = generated
-		log.Printf("[config] no admin_password configured, generated: %s", generated)
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "  ========================================")
-		fmt.Fprintf(os.Stderr, "  Dashboard password: %s\n", generated)
-		fmt.Fprintln(os.Stderr, "  Please save this password. It will be")
-		fmt.Fprintln(os.Stderr, "  hashed and cannot be recovered later.")
-		fmt.Fprintln(os.Stderr, "  ========================================")
-		fmt.Fprintln(os.Stderr, "")
+	// Dashboard password resolution.
+	// Priority: --password CLI flag > DASHBOARD_PASSWORD env > config.yaml admin_password.
+	// A password supplied via flag/env is hashed in memory only and is never
+	// written back to config.yaml. A password set in config.yaml keeps the
+	// existing behavior of being hashed-in-place on first run. When no password
+	// is configured anywhere, the dashboard is served without a login prompt.
+	dashPassword := strings.TrimSpace(*passwordFlag)
+	if dashPassword == "" {
+		dashPassword = strings.TrimSpace(os.Getenv("DASHBOARD_PASSWORD"))
 	}
 
-	proxy.EnsureAdminPassword(cfg, "config.yaml")
+	var dashPasswordHash string
+	switch {
+	case dashPassword != "":
+		dashPasswordHash = proxy.HashAdminPassword(dashPassword)
+		log.Printf("[config] dashboard password set via command line/env — web panel is password-protected")
+	case cfg.Server.AdminPassword != "":
+		proxy.EnsureAdminPassword(cfg, "config.yaml")
+		dashPasswordHash = cfg.Server.AdminPassword
+		log.Printf("[config] dashboard password loaded from config.yaml — web panel is password-protected")
+	default:
+		log.Printf("[config] no dashboard password configured — web panel is OPEN (pass --password=<pw> to protect it)")
+	}
+
 	proxy.ApplyConfig(cfg)
 
 	port := cfg.Server.Port
@@ -202,7 +217,7 @@ func main() {
 	registry.Register(microsoft.New())
 
 	apiKey := cfg.Server.ApiKey
-	dashAuth := proxy.NewDashboardAuth(cfg.Server.AdminPassword, apiKey)
+	dashAuth := proxy.NewDashboardAuth(dashPasswordHash, apiKey)
 
 	regDeps := &proxy.RegisterJobsDeps{
 		Pool:        pool,
@@ -227,11 +242,16 @@ func main() {
 
 	mux := newMux(pool, accountsDir, apiKey, dashAuth, usageStats, regDeps, autoPay)
 
+	dashStatus := "OPEN (no password)"
+	if dashPasswordHash != "" {
+		dashStatus = "password protected"
+	}
+
 	log.Printf("=== notion-manager ===")
 	log.Printf("Listening on :%s", port)
 	log.Printf("Accounts: %d", pool.Count())
 	log.Printf("API Key: %s", apiKey)
-	log.Printf("Dashboard: password protected")
+	log.Printf("Dashboard: %s", dashStatus)
 	log.Printf("Endpoints:")
 	log.Printf("  GET  /dashboard/                  (Dashboard UI)")
 	log.Printf("  GET  /proxy/start                 (Open proxy for account)")
