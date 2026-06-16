@@ -24,6 +24,13 @@ type WorkspaceInfo struct {
 	Region       string `json:"region"`
 	Cell         string `json:"cell"`
 	IsSubscribed bool   `json:"is_subscribed"`
+	// AICreditsUsed / AICreditsLimit describe the workspace's premium AI credit
+	// budget for the current service period (e.g. 0 used out of 400). They are
+	// pulled from /api/v3/getAIUsageEligibilityV2 and drive the per-workspace
+	// progress bar in the UI. AICreditsLimit == 0 means the space has no premium
+	// AI budget, so the UI hides the bar.
+	AICreditsUsed  int `json:"ai_credits_used"`
+	AICreditsLimit int `json:"ai_credits_limit"`
 }
 
 // AccountWorkspaces holds a user's account info plus all their workspaces
@@ -195,7 +202,8 @@ func DiscoverWorkspacesFromToken(tokenV2 string) (*AccountWorkspaces, error) {
 		return nil, fmt.Errorf("no workspaces found for this account")
 	}
 
-	// Enrich each space with its REAL subscription tier (concurrently).
+	// Enrich each space with its REAL subscription tier + AI credit balance
+	// (concurrently).
 	var wg sync.WaitGroup
 	for i := range spaces {
 		wg.Add(1)
@@ -212,6 +220,11 @@ func DiscoverWorkspacesFromToken(tokenV2 string) (*AccountWorkspaces, error) {
 			// "team" alone is the workspace category, not a paid tier, so it does
 			// not count as subscribed unless getSubscriptionData said otherwise.
 			spaces[idx].IsSubscribed = pt != "" && pt != "free" && pt != "team" && pt != "personal"
+
+			// Per-workspace premium AI credit budget for the progress bar.
+			used, limit := fetchSpaceAIUsage(tokenV2, userID, spaces[idx].SpaceID)
+			spaces[idx].AICreditsUsed = used
+			spaces[idx].AICreditsLimit = limit
 		}(i)
 	}
 	wg.Wait()
@@ -316,6 +329,90 @@ func fetchSpaceSubscription(tokenV2, userID, spaceID string) (planType, planName
 
 	log.Printf("[workspace] %s subscription tier=%q name=%q", truncate(spaceID, 8), planType, planName)
 	return planType, planName
+}
+
+// fetchSpaceAIUsage queries /api/v3/getAIUsageEligibilityV2 for a single space
+// and returns how many premium AI credits have been used this service period
+// plus the total monthly limit (e.g. 0 used out of 400). Free spaces with no
+// premium budget report a limit of 0. Returns (0, 0) on any failure so the
+// caller can simply hide the progress bar.
+func fetchSpaceAIUsage(tokenV2, userID, spaceID string) (used, limit int) {
+	if spaceID == "" {
+		return 0, 0
+	}
+	client := getChromeHTTPClient(AppConfig.APITimeoutDuration())
+	reqBody, _ := json.Marshal(map[string]string{"spaceId": spaceID})
+	req, err := http.NewRequest("POST", NotionAPIBase+"/getAIUsageEligibilityV2", bytes.NewReader(reqBody))
+	if err != nil {
+		return 0, 0
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Cookie", "token_v2="+tokenV2)
+	req.Header.Set("User-Agent", AppConfig.Browser.UserAgent)
+	if userID != "" {
+		req.Header.Set("x-notion-active-user-header", userID)
+	}
+	req.Header.Set("x-notion-space-id", spaceID)
+	req.Header.Set("notion-client-version", DefaultClientVersion)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[workspace] getAIUsageEligibilityV2 %s failed: %v", truncate(spaceID, 8), err)
+		return 0, 0
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		log.Printf("[workspace] getAIUsageEligibilityV2 %s -> %d: %s", truncate(spaceID, 8), resp.StatusCode, truncate(string(body), 160))
+		return 0, 0
+	}
+
+	// Top-level usage/limits describe the PREMIUM AI credit budget (the "400").
+	// basicCredits/free in the same payload are the separate 75 basic-credit
+	// allowance and are intentionally ignored here.
+	var data struct {
+		Usage struct {
+			CurrentServicePeriod struct {
+				SpaceUsage float64 `json:"spaceUsage"`
+			} `json:"currentServicePeriod"`
+			TotalCreditBalance float64 `json:"totalCreditBalance"`
+		} `json:"usage"`
+		Limits struct {
+			Purchased struct {
+				TotalLimit float64 `json:"totalLimit"`
+				PerSource  struct {
+					MonthlyAllocated float64 `json:"monthlyAllocated"`
+				} `json:"perSource"`
+			} `json:"purchased"`
+		} `json:"limits"`
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return 0, 0
+	}
+
+	limit = int(data.Limits.Purchased.TotalLimit)
+	if limit == 0 {
+		limit = int(data.Limits.Purchased.PerSource.MonthlyAllocated)
+	}
+	used = int(data.Usage.CurrentServicePeriod.SpaceUsage)
+	// Fallback: if the period counter was empty but a remaining balance is
+	// reported below the limit, derive used from (limit - balance).
+	if used == 0 && limit > 0 {
+		bal := int(data.Usage.TotalCreditBalance)
+		if bal > 0 && bal < limit {
+			used = limit - bal
+		}
+	}
+	if used < 0 {
+		used = 0
+	}
+	if limit > 0 && used > limit {
+		used = limit
+	}
+
+	log.Printf("[workspace] %s ai credits used=%d limit=%d", truncate(spaceID, 8), used, limit)
+	return used, limit
 }
 
 // HandleDiscoverWorkspaces discovers all workspaces for a token_v2
