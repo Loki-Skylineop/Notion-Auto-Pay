@@ -8,10 +8,17 @@ import {
   clampIntervalSeconds, type ServerAutoPayConfig, type AutoPayPatch,
 } from '../autopay'
 
-// The backend forwards an optional space `icon` (emoji or image URL) and a
-// `plan_name` (marketed plan name from getSubscriptionData). They aren't part
-// of the base API type, so we widen it here without touching the shared def.
-export type WorkspaceInfo = BaseWorkspaceInfo & { icon?: string; plan_name?: string }
+// The backend forwards an optional space `icon` (emoji or image URL), a
+// `plan_name` (marketed plan name from getSubscriptionData), and the premium
+// AI credit budget (`ai_credits_used` / `ai_credits_limit`, e.g. 0 of 400).
+// They aren't part of the base API type, so we widen it here without touching
+// the shared def.
+export type WorkspaceInfo = BaseWorkspaceInfo & {
+  icon?: string
+  plan_name?: string
+  ai_credits_used?: number
+  ai_credits_limit?: number
+}
 
 export interface DiscoveredAccount {
   user_id?: string
@@ -49,22 +56,29 @@ function displayPlan(space: WorkspaceInfo): string {
   return planLabel(space.plan_type)
 }
 
-// Dark translucent fill + bright accent text + hairline border. One step per
-// tier, no sixth accent.
-function PlanBadge({ plan }: { plan?: string }) {
-  const p = (plan || 'free').toLowerCase()
-  const palette: Record<string, string> = {
-    free: 'bg-white/5 text-text-muted border-border',
-    plus: 'bg-[#4ade80]/10 text-[#4ade80] border-[#4ade80]/25',
-    team: 'bg-[#3291ff]/10 text-[#3291ff] border-[#3291ff]/25',
-    business: 'bg-[#f5a623]/10 text-[#f5a623] border-[#f5a623]/25',
-    enterprise: 'bg-[#a371f7]/12 text-[#a371f7] border-[#a371f7]/30',
-  }
-  const cls = palette[p] || palette.free
+// Per-workspace premium AI credit gauge. Shows how much of the monthly budget
+// is still available (e.g. "100% осталось · 0 из 400"). Hidden when the space
+// has no premium AI budget (limit 0).
+function AICreditsBar({ used, limit }: { used?: number; limit?: number }) {
+  if (!limit || limit <= 0) return null
+  const u = Math.max(0, Math.min(used ?? 0, limit))
+  const remaining = limit - u
+  const remainPct = Math.round((remaining / limit) * 100)
+  // Green when plenty left, amber in the middle, red when nearly exhausted.
+  const color = remainPct > 50 ? '#4ade80' : remainPct > 20 ? '#f5a623' : '#f5455c'
   return (
-    <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-medium border ${cls}`}>
-      {planLabel(plan)}
-    </span>
+    <div className="w-full mt-0.5">
+      <div className="flex items-center justify-between mb-1">
+        <span className="text-[10px] text-text-muted">AI‑токены</span>
+        <span className="text-[10px] text-text-secondary tabular-nums">осталось {remainPct}% · {remaining} из {limit}</span>
+      </div>
+      <div className="h-1.5 w-full rounded-full bg-white/8 overflow-hidden">
+        <div
+          className="h-full rounded-full transition-all duration-300"
+          style={{ width: `${remainPct}%`, backgroundColor: color }}
+        />
+      </div>
+    </div>
   )
 }
 
@@ -398,38 +412,41 @@ export function WorkspacePool({
                   return (
                     <div
                       key={space.space_id}
-                      className="flex items-center gap-3 bg-bg-secondary border border-border rounded-lg px-3 py-2.5 transition-colors hover:bg-bg-card-hover"
+                      className="flex flex-col gap-2 bg-bg-secondary border border-border rounded-lg px-3 py-2.5 transition-colors hover:bg-bg-card-hover"
                     >
-                      <SpaceIcon icon={space.icon} name={space.name} />
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2 mb-0.5">
-                          <span className="text-[13px] font-semibold text-text-primary truncate">
-                            {space.name || 'Workspace'}
-                          </span>
-                          <PlanBadge plan={space.plan_type} />
+                      <div className="flex items-center gap-3">
+                        <SpaceIcon icon={space.icon} name={space.name} />
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 mb-0.5">
+                            <span className="text-[13px] font-semibold text-text-primary truncate">
+                              {space.name || 'Workspace'}
+                            </span>
+                            <PlanBadge plan={space.plan_type} />
+                          </div>
+                          <div className="text-[11px] text-text-secondary truncate">
+                            {subscribed ? `Подписка: ${planText}` : 'Бесплатный план'}
+                            {space.domain ? ` · ${space.domain}` : ''}
+                          </div>
                         </div>
-                        <div className="text-[11px] text-text-secondary truncate">
-                          {subscribed ? `Подписка: ${planText}` : 'Бесплатный план'}
-                          {space.domain ? ` · ${space.domain}` : ''}
-                        </div>
+                        <label className="flex items-center gap-1 cursor-pointer select-none shrink-0" title="Автооплата этого пространства при Free тарифе">
+                          <input
+                            type="checkbox"
+                            checked={!!cfg?.spaces?.[space.space_id]}
+                            onChange={e => toggleSpace(space.space_id, e.target.checked)}
+                            className="accent-[#3291ff] w-3 h-3 cursor-pointer"
+                          />
+                          <span className="text-[11px] text-text-muted">Авто</span>
+                        </label>
+                        <button
+                          onClick={() =>
+                            setPayTarget({ token: acc.token_v2, spaceId: space.space_id, name: space.name || 'Workspace' })
+                          }
+                          className="shrink-0 px-3 h-7 bg-white hover:bg-white/90 text-black rounded-full text-[12px] font-medium cursor-pointer transition-colors border-none"
+                        >
+                          Оплатить
+                        </button>
                       </div>
-                      <label className="flex items-center gap-1 cursor-pointer select-none shrink-0" title="Автооплата этого пространства при Free тарифе">
-                        <input
-                          type="checkbox"
-                          checked={!!cfg?.spaces?.[space.space_id]}
-                          onChange={e => toggleSpace(space.space_id, e.target.checked)}
-                          className="accent-[#3291ff] w-3 h-3 cursor-pointer"
-                        />
-                        <span className="text-[11px] text-text-muted">Авто</span>
-                      </label>
-                      <button
-                        onClick={() =>
-                          setPayTarget({ token: acc.token_v2, spaceId: space.space_id, name: space.name || 'Workspace' })
-                        }
-                        className="shrink-0 px-3 h-7 bg-white hover:bg-white/90 text-black rounded-full text-[12px] font-medium cursor-pointer transition-colors border-none"
-                      >
-                        Оплатить
-                      </button>
+                      <AICreditsBar used={space.ai_credits_used} limit={space.ai_credits_limit} />
                     </div>
                   )
                 })}
@@ -459,5 +476,22 @@ export function WorkspacePool({
         />
       )}
     </div>
+  )
+}
+
+function PlanBadge({ plan }: { plan?: string }) {
+  const p = (plan || 'free').toLowerCase()
+  const palette: Record<string, string> = {
+    free: 'bg-white/5 text-text-muted border-border',
+    plus: 'bg-[#4ade80]/10 text-[#4ade80] border-[#4ade80]/25',
+    team: 'bg-[#3291ff]/10 text-[#3291ff] border-[#3291ff]/25',
+    business: 'bg-[#f5a623]/10 text-[#f5a623] border-[#f5a623]/25',
+    enterprise: 'bg-[#a371f7]/12 text-[#a371f7] border-[#a371f7]/30',
+  }
+  const cls = palette[p] || palette.free
+  return (
+    <span className={`inline-block px-2 py-0.5 rounded-full text-[10px] font-medium border ${cls}`}>
+      {planLabel(plan)}
+    </span>
   )
 }
