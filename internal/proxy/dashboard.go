@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +19,7 @@ type DashboardAuth struct {
 	adminPasswordHash string   // "$sha256$salt$hash" format
 	apiKey            string   // API key for /admin/* endpoints
 	sessions          sync.Map // sessionID → expiry time
+	loginLimiters     sync.Map // client IP → *loginLimiter (brute-force protection)
 }
 
 // NewDashboardAuth creates a new auth manager.
@@ -27,9 +30,90 @@ func NewDashboardAuth(adminPasswordHash, apiKey string) *DashboardAuth {
 	}
 }
 
-// HasAdminPassword returns false — auth is disabled.
+// --- Login rate limiting (brute-force protection) ---
+
+const (
+	// loginMaxFailures is how many failed logins are tolerated per window
+	// before the source IP is temporarily locked out.
+	loginMaxFailures = 5
+	// loginFailureWindow is the rolling window over which failures are counted.
+	loginFailureWindow = 1 * time.Minute
+	// loginLockDuration is how long an IP stays locked after too many failures.
+	loginLockDuration = 5 * time.Minute
+)
+
+type loginLimiter struct {
+	mu          sync.Mutex
+	failCount   int
+	windowStart time.Time
+	lockedUntil time.Time
+}
+
+// loginAllowed reports whether the given IP may attempt a login right now.
+// When locked, it also returns the remaining lock duration.
+func (da *DashboardAuth) loginAllowed(ip string) (bool, time.Duration) {
+	v, _ := da.loginLimiters.LoadOrStore(ip, &loginLimiter{})
+	ll := v.(*loginLimiter)
+	ll.mu.Lock()
+	defer ll.mu.Unlock()
+
+	now := time.Now()
+	if now.Before(ll.lockedUntil) {
+		return false, ll.lockedUntil.Sub(now)
+	}
+	if now.Sub(ll.windowStart) > loginFailureWindow {
+		ll.windowStart = now
+		ll.failCount = 0
+	}
+	return true, 0
+}
+
+// recordLoginFailure increments the failure counter for an IP and locks it
+// out once too many failures accumulate within the window.
+func (da *DashboardAuth) recordLoginFailure(ip string) {
+	v, _ := da.loginLimiters.LoadOrStore(ip, &loginLimiter{})
+	ll := v.(*loginLimiter)
+	ll.mu.Lock()
+	defer ll.mu.Unlock()
+
+	now := time.Now()
+	if now.Sub(ll.windowStart) > loginFailureWindow {
+		ll.windowStart = now
+		ll.failCount = 0
+	}
+	ll.failCount++
+	if ll.failCount >= loginMaxFailures {
+		ll.lockedUntil = now.Add(loginLockDuration)
+		ll.failCount = 0
+		ll.windowStart = now
+	}
+}
+
+// recordLoginSuccess clears any failure state for an IP after a good login.
+func (da *DashboardAuth) recordLoginSuccess(ip string) {
+	da.loginLimiters.Delete(ip)
+}
+
+// dashboardClientIP extracts the best-effort client IP for rate limiting,
+// honoring X-Forwarded-For when running behind a reverse proxy.
+func dashboardClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if i := strings.IndexByte(xff, ','); i >= 0 {
+			return strings.TrimSpace(xff[:i])
+		}
+		return strings.TrimSpace(xff)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// HasAdminPassword reports whether a dashboard password is configured. When
+// false, the dashboard is served without a login prompt.
 func (da *DashboardAuth) HasAdminPassword() bool {
-	return false
+	return da.adminPasswordHash != ""
 }
 
 // ValidateSession checks if a dashboard session cookie is valid.
@@ -124,12 +208,28 @@ func (da *DashboardAuth) HandleAuthSalt() http.HandlerFunc {
 }
 
 // HandleAuthLogin validates the client's hash and creates a session.
+// Failed attempts are rate limited per client IP to deter brute forcing.
 func (da *DashboardAuth) HandleAuthLogin() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != "POST" {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
+
+		ip := dashboardClientIP(r)
+		if ok, retryAfter := da.loginAllowed(ip); !ok {
+			secs := int(retryAfter.Seconds()) + 1
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", strconv.Itoa(secs))
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"error":       "too many attempts, try again later",
+				"retry_after": secs,
+			})
+			log.Printf("[dashboard] login rate-limited for %s (%ds left)", ip, secs)
+			return
+		}
+
 		var body struct {
 			Hash string `json:"hash"`
 		}
@@ -139,15 +239,17 @@ func (da *DashboardAuth) HandleAuthLogin() http.HandlerFunc {
 		}
 
 		if !VerifyAdminPassword(da.adminPasswordHash, body.Hash) {
-			log.Printf("[dashboard] failed login attempt")
+			da.recordLoginFailure(ip)
+			log.Printf("[dashboard] failed login attempt from %s", ip)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			json.NewEncoder(w).Encode(map[string]string{"error": "invalid password"})
 			return
 		}
 
+		da.recordLoginSuccess(ip)
 		da.CreateSession(w)
-		log.Printf("[dashboard] login success")
+		log.Printf("[dashboard] login success from %s", ip)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 	}
