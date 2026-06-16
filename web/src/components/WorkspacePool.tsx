@@ -4,11 +4,8 @@ import { discoverWorkspaces } from '../api'
 import { SubscribeModal, PLANS } from './SubscribeModal'
 import { AutoPaySettings } from './AutoPaySettings'
 import {
-  loadRefreshConfig, saveRefreshConfig, type RefreshConfig,
-  loadAutoPayConfig, saveAutoPayConfig, type AutoPayConfig,
-  loadSpaceFlags, saveSpaceFlags,
-  loadPaidSet, savePaidSet,
-  isFreeTier, clampInterval,
+  fetchAutoPayConfig, updateAutoPayConfig, runAutoPayNow,
+  clampIntervalSeconds, type ServerAutoPayConfig, type AutoPayPatch,
 } from '../autopay'
 
 // The backend forwards an optional space `icon` (emoji or image URL) and a
@@ -193,34 +190,6 @@ function Toggle({ on, onClick, disabled }: { on: boolean; onClick: () => void; d
   )
 }
 
-// Per-space checkout. Sends space_id so the right workspace is charged, reusing
-// the saved Stripe PaymentMethod id.
-async function checkoutSubscription(
-  tokenV2: string,
-  pmId: string,
-  plan: string,
-  country: string,
-  spaceId: string,
-): Promise<{ error?: string; plan?: string; email?: string }> {
-  const resp = await fetch('/admin/subscribe/checkout', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-    credentials: 'same-origin',
-    body: JSON.stringify({
-      token_v2: tokenV2,
-      payment_method_id: pmId,
-      plan,
-      country: country || 'DE',
-      space_id: spaceId || '',
-    }),
-  })
-  const text = await resp.text()
-  let data: { error?: string; plan?: string; email?: string } = {}
-  try { data = text ? JSON.parse(text) : {} } catch { data = {} }
-  if (!resp.ok || data.error) return { error: data.error || `HTTP ${resp.status}` }
-  return data
-}
-
 export function WorkspacePool({
   accounts,
   onRemoveAccount,
@@ -239,11 +208,24 @@ export function WorkspacePool({
   const [refreshing, setRefreshing] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [showCardModal, setShowCardModal] = useState(false)
-  const [refreshCfg, setRefreshCfg] = useState<RefreshConfig>(() => loadRefreshConfig())
-  const [autoPayCfg, setAutoPayCfg] = useState<AutoPayConfig>(() => loadAutoPayConfig())
-  const [spaceFlags, setSpaceFlags] = useState<Record<string, boolean>>(() => loadSpaceFlags())
   const [lastRun, setLastRun] = useState('')
-  const [log, setLog] = useState<string[]>([])
+
+  // Server-side auto-pay config is the single source of truth. The browser
+  // only reads/edits it — the Go scheduler does the actual paying, even with
+  // this tab closed.
+  const [cfg, setCfg] = useState<ServerAutoPayConfig | null>(null)
+
+  const reloadCfg = useCallback(async () => {
+    try { const c = await fetchAutoPayConfig(); setCfg(c) } catch { /* ignore */ }
+  }, [])
+
+  useEffect(() => { reloadCfg() }, [reloadCfg])
+
+  // Poll the server status (log + last run) so the panel stays fresh while open.
+  useEffect(() => {
+    const id = setInterval(() => { reloadCfg() }, 15000)
+    return () => clearInterval(id)
+  }, [reloadCfg])
 
   const popRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -259,38 +241,8 @@ export function WorkspacePool({
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)) } catch { /* ignore */ }
   }, [])
 
-  // Scan the pool and pay any eligible free workspace. The paid-set guard makes
-  // sure we never charge the same space twice before its tier propagates back.
-  const runAutoPay = useCallback(async (currentPool: DiscoveredAccount[]) => {
-    const cfg = loadAutoPayConfig()
-    if (!cfg.enabled || !cfg.pmId) return
-    const flags = loadSpaceFlags()
-    const paid = loadPaidSet()
-    const msgs: string[] = []
-    let didPay = false
-    for (const acc of currentPool) {
-      for (const space of acc.spaces || []) {
-        if (!flags[space.space_id]) continue
-        if (!isFreeTier(space.plan_type, space.is_subscribed)) continue
-        if (paid[space.space_id]) continue
-        const res = await checkoutSubscription(acc.token_v2, cfg.pmId, cfg.plan, cfg.country, space.space_id)
-        if (res.error) {
-          msgs.push(`✗ ${space.name || 'Workspace'}: ${res.error}`)
-        } else {
-          msgs.push(`✓ ${space.name || 'Workspace'}: ${res.plan || cfg.plan}`)
-          paid[space.space_id] = Date.now()
-          didPay = true
-        }
-      }
-    }
-    if (didPay) savePaidSet(paid)
-    if (msgs.length) {
-      const stamp = new Date().toLocaleTimeString('ru-RU')
-      setLog(prev => [`${stamp} · автооплата`, ...msgs, ...prev].slice(0, 30))
-    }
-    if (didPay) onPaid()
-  }, [onPaid])
-
+  // Manual list refresh: re-discovers plans + counts for display only. Paying
+  // is handled server-side, so this no longer charges anything.
   const refresh = useCallback(async () => {
     const current = poolRef.current
     if (!current.length) return
@@ -318,48 +270,26 @@ export function WorkspacePool({
       setPool(next)
       persistPool(next)
       setLastRun(new Date().toLocaleTimeString('ru-RU'))
-      await runAutoPay(next)
     } finally {
       setRefreshing(false)
     }
-  }, [persistPool, runAutoPay])
+  }, [persistPool])
 
-  // Auto-refresh timer: re-discovers plans + counts and runs the auto-pay scan.
-  useEffect(() => {
-    if (!refreshCfg.autoRefresh) return
-    const ms = clampInterval(refreshCfg.intervalMin) * 60 * 1000
-    const id = setInterval(() => { refresh() }, ms)
-    return () => clearInterval(id)
-  }, [refreshCfg.autoRefresh, refreshCfg.intervalMin, refresh])
+  const patchCfg = useCallback(async (patch: AutoPayPatch) => {
+    try { const c = await updateAutoPayConfig(patch); setCfg(c) } catch { /* ignore */ }
+  }, [])
 
-  const updateRefresh = (patch: Partial<RefreshConfig>) => {
-    setRefreshCfg(prev => {
-      const next = { ...prev, ...patch }
-      saveRefreshConfig(next)
-      return next
-    })
-  }
-  const toggleAutoPay = () => {
-    setAutoPayCfg(prev => {
-      const next = { ...prev, enabled: !prev.enabled }
-      saveAutoPayConfig(next)
-      return next
-    })
-  }
-  const reloadAutoPay = () => setAutoPayCfg(loadAutoPayConfig())
-  const toggleSpace = (id: string, on: boolean) => {
-    setSpaceFlags(prev => {
-      const next = { ...prev, [id]: on }
-      saveSpaceFlags(next)
-      return next
-    })
-  }
+  const toggleAutoPay = () => { if (cfg) patchCfg({ enabled: !cfg.enabled }) }
+  const setInterval2 = (v: string) => patchCfg({ interval_seconds: clampIntervalSeconds(v) })
+  const toggleSpace = (id: string, on: boolean) => patchCfg({ space: { id, on } })
+  const payNow = async () => { try { await runAutoPayNow(); setTimeout(reloadCfg, 1500) } catch { /* ignore */ } }
 
   if (!pool.length) return null
 
   const totalSpaces = pool.reduce((sum, acc) => sum + (acc.spaces?.length || 0), 0)
-  const targetPlan = PLANS.find(p => p.id === autoPayCfg.plan)
-  const targetPlanLabel = targetPlan ? `${targetPlan.name} ${targetPlan.price}${targetPlan.interval}` : autoPayCfg.plan
+  const targetPlan = PLANS.find(p => p.id === (cfg?.plan || ''))
+  const targetPlanLabel = targetPlan ? `${targetPlan.name} ${targetPlan.price}${targetPlan.interval}` : (cfg?.plan || '—')
+  const intervalSec = cfg?.interval_seconds ?? 60
 
   return (
     <div className="mb-8">
@@ -377,54 +307,55 @@ export function WorkspacePool({
         <div className="relative" ref={popRef}>
           <button
             onClick={() => setShowSettings(v => !v)}
-            title="Настройки автообновления и автооплаты"
+            title="Настройки автооплаты"
             className={`bg-transparent border-none cursor-pointer p-1 flex items-center ${showSettings ? 'text-text-primary' : 'text-text-muted hover:text-text-primary'}`}
           >
             <IconGear />
           </button>
           {showSettings && (
             <div className="absolute left-0 top-7 z-50 w-72 bg-bg-card border border-border rounded-xl shadow-modal p-3.5 text-left">
-              <div className="text-[12px] font-semibold text-text-primary mb-2.5">Автообновление</div>
+              <div className="text-[12px] font-semibold text-text-primary mb-1">Автооплата (на сервере)</div>
+              <div className="text-[10px] text-text-muted mb-2.5 leading-relaxed">Работает в фоне на сервере — браузер можно закрыть.</div>
               <div className="flex items-center justify-between mb-2">
-                <span className="text-[12px] text-text-secondary">Обновлять автоматически</span>
-                <Toggle on={refreshCfg.autoRefresh} onClick={() => updateRefresh({ autoRefresh: !refreshCfg.autoRefresh })} />
+                <span className="text-[12px] text-text-secondary">Платить при Free тарифе</span>
+                <Toggle on={!!cfg?.enabled} disabled={!cfg?.has_card} onClick={toggleAutoPay} />
               </div>
               <div className="flex items-center justify-between mb-1">
-                <span className="text-[12px] text-text-secondary">Интервал, мин</span>
+                <span className="text-[12px] text-text-secondary">Интервал проверки, сек</span>
                 <input
                   type="number"
-                  min={1}
-                  max={1440}
-                  value={refreshCfg.intervalMin}
-                  onChange={e => updateRefresh({ intervalMin: clampInterval(e.target.value) })}
+                  min={5}
+                  max={86400}
+                  value={intervalSec}
+                  onChange={e => setInterval2(e.target.value)}
                   className="w-16 py-1 px-2 bg-bg-input border border-border rounded text-[12px] text-text-primary outline-none focus:border-notion-blue text-right"
                 />
               </div>
-              <div className="text-[10px] text-text-muted mb-3 leading-relaxed">Обновляет тариф и количество пространств. В этот же момент проверяется тариф для автооплаты.</div>
+              <div className="text-[10px] text-text-muted mb-3 leading-relaxed">Минимум 5 секунд. Сервер проверяет отмеченные пространства и оплачивает Free.</div>
 
-              <div className="h-px bg-border my-2" />
-
-              <div className="text-[12px] font-semibold text-text-primary mb-2.5">Автооплата</div>
-              <div className="flex items-center justify-between mb-2">
-                <span className="text-[12px] text-text-secondary">Платить при Free тарифе</span>
-                <Toggle on={autoPayCfg.enabled} disabled={!autoPayCfg.pmId} onClick={toggleAutoPay} />
-              </div>
               <div className="text-[11px] text-text-secondary mb-1">План: <span className="text-text-primary font-medium">{targetPlanLabel}</span></div>
-              <div className="text-[11px] text-text-secondary mb-2.5">Карта: {autoPayCfg.pmId ? <span className="text-ok font-medium">{autoPayCfg.brand} •••• {autoPayCfg.last4}</span> : <span className="text-text-muted">не задана</span>}</div>
+              <div className="text-[11px] text-text-secondary mb-2.5">Карта: {cfg?.has_card ? <span className="text-ok font-medium">···· {cfg.card_last4}</span> : <span className="text-text-muted">не задана</span>}</div>
               <button
                 onClick={() => { setShowSettings(false); setShowCardModal(true) }}
                 className="w-full py-2 bg-bg-secondary hover:bg-bg-card-hover text-text-primary rounded-lg text-[12px] font-medium cursor-pointer border border-border transition-colors"
               >
                 Настроить карту и план
               </button>
+              <button
+                onClick={payNow}
+                disabled={!cfg?.enabled || !cfg?.has_card}
+                className="w-full mt-2 py-2 bg-transparent hover:bg-white/5 text-text-secondary rounded-lg text-[12px] font-medium cursor-pointer border border-border transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Проверить и оплатить сейчас
+              </button>
               <div className="text-[10px] text-text-muted mt-2.5 leading-relaxed">Включите «Авто» у нужных пространств. Каждое Free‑пространство оплачивается один раз. Списываются реальные деньги.</div>
 
-              {log.length > 0 && (
+              {cfg && cfg.log.length > 0 && (
                 <>
                   <div className="h-px bg-border my-2" />
                   <div className="text-[10px] text-text-muted mb-1">Последние автооплаты</div>
                   <div className="max-h-28 overflow-y-auto space-y-0.5">
-                    {log.map((line, i) => (
+                    {cfg.log.map((line, i) => (
                       <div key={i} className="text-[10px] text-text-secondary truncate">{line}</div>
                     ))}
                   </div>
@@ -433,8 +364,8 @@ export function WorkspacePool({
             </div>
           )}
         </div>
-        {refreshCfg.autoRefresh && (
-          <span className="font-normal text-text-muted text-[10px]">авто · {refreshCfg.intervalMin}м</span>
+        {cfg?.enabled && (
+          <span className="font-normal text-text-muted text-[10px]">авто · {intervalSec}с</span>
         )}
         {lastRun && (
           <span className="font-normal text-text-muted text-[10px]">обновлено {lastRun}</span>
@@ -485,7 +416,7 @@ export function WorkspacePool({
                       <label className="flex items-center gap-1 cursor-pointer select-none shrink-0" title="Автооплата этого пространства при Free тарифе">
                         <input
                           type="checkbox"
-                          checked={!!spaceFlags[space.space_id]}
+                          checked={!!cfg?.spaces?.[space.space_id]}
                           onChange={e => toggleSpace(space.space_id, e.target.checked)}
                           className="accent-[#3291ff] w-3 h-3 cursor-pointer"
                         />
@@ -523,8 +454,8 @@ export function WorkspacePool({
 
       {showCardModal && (
         <AutoPaySettings
-          onClose={() => { setShowCardModal(false); reloadAutoPay() }}
-          onSaved={reloadAutoPay}
+          onClose={() => { setShowCardModal(false); reloadCfg() }}
+          onSaved={reloadCfg}
         />
       )}
     </div>
