@@ -439,3 +439,77 @@ export async function discoverWorkspaces(tokenV2: string): Promise<DiscoverResul
   if (!resp.ok) return { error: data.error || `HTTP ${resp.status}` }
   return data
 }
+
+// --- Chat API ---
+// Proxies the private Notion AI chat protocol through the server (see
+// internal/proxy/chat.go). Every call carries the selected workspace's
+// token_v2 + ids so the server can act as that account.
+
+export interface ChatAgent {
+  id: string // "default" or a workflowId
+  name: string
+  icon?: string
+  kind: string // "default" | "custom"
+}
+
+export interface ChatThread {
+  id: string
+  title: string
+  created_at?: number
+  updated_at?: number
+  type?: string
+}
+
+export interface ChatAccountRef {
+  token_v2: string
+  user_id?: string
+  user_name?: string
+  user_email?: string
+  space_id: string
+  space_view_id?: string
+  space_name?: string
+}
+
+export async function chatAgents(ref: { token_v2: string; user_id?: string; space_id: string }): Promise<ChatAgent[]> {
+  const resp = await fetch('/admin/chat/agents', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify(ref),
+  })
+  const data = await jsonOrError(resp)
+  return Array.isArray(data?.agents) ? data.agents : []
+}
+
+export async function chatThreads(ref: { token_v2: string; user_id?: string; space_id: string }): Promise<ChatThread[]> {
+  const resp = await fetch('/admin/chat/threads', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify(ref),
+  })
+  const data = await jsonOrError(resp)
+  return Array.isArray(data?.threads) ? data.threads : []
+}
+
+export interface ChatSendResult {
+  thread_id: string
+  title?: string
+  text: string
+}
+
+export async function chatSend(params: ChatAccountRef & {
+  timezone?: string
+  agent: string // "default" or a workflowId
+  context_page_id?: string
+  thread_id?: string
+  message: string
+}): Promise<ChatSendResult> {
+  const resp = await fetch('/admin/chat/send', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify(params),
+  })
+  return jsonOrError(resp) as Promise<ChatSendResult>
+}
