@@ -134,6 +134,11 @@ func main() {
 	// --password (or DASHBOARD_PASSWORD env) protects the web dashboard with a
 	// login prompt. When neither is set, the dashboard stays open.
 	passwordFlag := flag.String("password", "", "Dashboard login password. If set (or via DASHBOARD_PASSWORD env), the web panel requires this password to log in.")
+	// --no-password forces the dashboard OPEN even when config.yaml still has
+	// a stale admin_password. build.bat passes this automatically whenever it
+	// is launched without --password, so "build.bat" (no args) always means an
+	// open panel — matching what the script prints.
+	noPasswordFlag := flag.Bool("no-password", false, "Force the dashboard OPEN, ignoring any admin_password stored in config.yaml.")
 	flag.Parse()
 
 	cfg, err := proxy.LoadConfig("config.yaml")
@@ -144,11 +149,11 @@ func main() {
 	proxy.EnsureApiKey(cfg, "config.yaml")
 
 	// Dashboard password resolution.
-	// Priority: --password CLI flag > DASHBOARD_PASSWORD env > config.yaml admin_password.
+	// Priority: --password CLI flag > DASHBOARD_PASSWORD env > --no-password > config.yaml admin_password.
 	// A password supplied via flag/env is hashed in memory only and is never
-	// written back to config.yaml. A password set in config.yaml keeps the
-	// existing behavior of being hashed-in-place on first run. When no password
-	// is configured anywhere, the dashboard is served without a login prompt.
+	// written back to config.yaml. --no-password wins over config.yaml so a
+	// forgotten/stale admin_password can't lock you out. When no password is
+	// configured anywhere, the dashboard is served without a login prompt.
 	dashPassword := strings.TrimSpace(*passwordFlag)
 	if dashPassword == "" {
 		dashPassword = strings.TrimSpace(os.Getenv("DASHBOARD_PASSWORD"))
@@ -159,6 +164,8 @@ func main() {
 	case dashPassword != "":
 		dashPasswordHash = proxy.HashAdminPassword(dashPassword)
 		log.Printf("[config] dashboard password set via command line/env — web panel is password-protected")
+	case *noPasswordFlag:
+		log.Printf("[config] --no-password set — web panel is OPEN (ignoring admin_password in config.yaml)")
 	case cfg.Server.AdminPassword != "":
 		proxy.EnsureAdminPassword(cfg, "config.yaml")
 		dashPasswordHash = cfg.Server.AdminPassword
