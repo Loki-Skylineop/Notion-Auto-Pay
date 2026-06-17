@@ -117,7 +117,7 @@ func HandleChatAgents(auth *DashboardAuth) http.HandlerFunc {
 			http.Error(w, `{"error":"token_v2 and space_id are required"}`, http.StatusBadRequest)
 			return
 		}
-		agents := []chatAgentID: "default", Name: "Обычный агент", Kind: "default"
+		agents := []chatAgent{ {ID: "default", Name: "Обычный агент", Kind: "default"} }
 		if custom, err := fetchCustomAgents(body.TokenV2, body.UserID, body.SpaceID); err != nil {
 			log.Printf("[chat] fetch custom agents failed: %v", err)
 		} else {
@@ -273,7 +273,7 @@ func buildChatConfig(isCustom bool, workflowID string) map[string]interface{} {
 		"enableMailAgentMultiProviderSupport": false,
 		"useRulePrioritization":               true,
 		"availableConnectors":                 []interface{}{},
-		"searchScopes":                        []map[string]string"type": "everything",
+		"searchScopes":                        []map[string]string{ {"type": "everything"} },
 		"useWebSearch":                        true,
 		"isHipaa":                             false,
 		"internetAccess":                      false,
@@ -379,7 +379,7 @@ func HandleChatSend(auth *DashboardAuth) http.HandlerFunc {
 		userMsg := map[string]interface{}{
 			"id":        generateUUIDv4(),
 			"type":      "user",
-			"value":     [][]stringbody.Message,
+			"value":     [][]string{ {body.Message} },
 			"userId":    body.UserID,
 			"createdAt": time.Now().UnixMilli(),
 		}
