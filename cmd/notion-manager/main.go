@@ -96,6 +96,13 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	// empty localStorage cache) instead of relying only on the browser cache.
 	mux.HandleFunc("/admin/workspaces", proxy.HandleListWorkspaces(pool, dashAuth))
 
+	// Chat tab. Proxies the private Notion AI chat protocol per workspace so
+	// the dashboard can list agents, list threads and run chat turns using
+	// each account's token_v2. See internal/proxy/chat.go.
+	mux.HandleFunc("/admin/chat/agents", proxy.HandleChatAgents(dashAuth))
+	mux.HandleFunc("/admin/chat/threads", proxy.HandleChatThreads(dashAuth))
+	mux.HandleFunc("/admin/chat/send", proxy.HandleChatSend(dashAuth))
+
 	// Server-side auto-pay config + manual trigger. The actual paying is done
 	// by the background scheduler (AutoPayManager.Start) so it keeps running
 	// even with the dashboard/browser closed.
@@ -270,6 +277,9 @@ func main() {
 	log.Printf("  GET  /admin/settings              (search/proxy/ASK settings)")
 	log.Printf("  GET  /admin/stats                 (token usage stats)")
 	log.Printf("  GET  /admin/workspaces            (all-accounts workspace list)")
+	log.Printf("  POST /admin/chat/agents           (list chat agents for a space)")
+	log.Printf("  POST /admin/chat/threads          (list chat threads for a space)")
+	log.Printf("  POST /admin/chat/send             (run one chat turn)")
 	log.Printf("  GET  /admin/autopay               (server auto-pay config)")
 	log.Printf("  POST /admin/autopay/run           (trigger auto-pay scan now)")
 	log.Printf("  POST /admin/autopay/pay-space     (pay one workspace with saved card)")
