@@ -100,9 +100,12 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	// the dashboard can list agents, list threads, load a thread's history and
 	// run chat turns using each account's token_v2. See internal/proxy/chat.go.
 	mux.HandleFunc("/admin/chat/agents", proxy.HandleChatAgents(dashAuth))
+	mux.HandleFunc("/admin/chat/models", proxy.HandleChatModels(dashAuth))
 	mux.HandleFunc("/admin/chat/threads", proxy.HandleChatThreads(dashAuth))
 	mux.HandleFunc("/admin/chat/history", proxy.HandleChatHistory(dashAuth))
+	mux.HandleFunc("/admin/chat/delete", proxy.HandleChatDelete(dashAuth))
 	mux.HandleFunc("/admin/chat/send", proxy.HandleChatSend(dashAuth))
+	mux.HandleFunc("/admin/chat/stream", proxy.HandleChatStream(dashAuth))
 
 	// Server-side auto-pay config + manual trigger. The actual paying is done
 	// by the background scheduler (AutoPayManager.Start) so it keeps running
@@ -286,9 +289,12 @@ func main() {
 	log.Printf("  GET  /admin/stats                 (token usage stats)")
 	log.Printf("  GET  /admin/workspaces            (all-accounts workspace list)")
 	log.Printf("  POST /admin/chat/agents           (list chat agents for a space)")
+	log.Printf("  POST /admin/chat/models           (list available models for a space)")
 	log.Printf("  POST /admin/chat/threads          (list chat threads for a space)")
 	log.Printf("  POST /admin/chat/history          (load one thread's history)")
+	log.Printf("  POST /admin/chat/delete           (soft-delete a chat thread)")
 	log.Printf("  POST /admin/chat/send             (run one chat turn)")
+	log.Printf("  POST /admin/chat/stream           (run one chat turn, live status)")
 	log.Printf("  GET  /admin/autopay               (server auto-pay config)")
 	log.Printf("  POST /admin/autopay/run           (trigger auto-pay scan now)")
 	log.Printf("  POST /admin/autopay/pay-space     (pay one workspace with saved card)")
