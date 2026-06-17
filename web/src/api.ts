@@ -452,6 +452,15 @@ export interface ChatAgent {
   kind: string // "default" | "custom"
 }
 
+// One model available to the built-in assistant (from getAvailableModels).
+export interface ChatModel {
+  id: string // codename, e.g. "ambrosia-tart-high"
+  label: string // human label, e.g. "Opus 4.8"
+  family: string
+  group: string // "fast" | "intelligent"
+  disabled: boolean
+}
+
 export interface ChatThread {
   id: string
   title: string
@@ -496,6 +505,19 @@ export async function chatAgents(ref: { token_v2: string; user_id?: string; spac
   return Array.isArray(data?.agents) ? data.agents : []
 }
 
+// chatModels lists the models the built-in assistant can use in this space so
+// the UI can offer a picker (e.g. "Opus 4.8").
+export async function chatModels(ref: { token_v2: string; user_id?: string; space_id: string }): Promise<ChatModel[]> {
+  const resp = await fetch('/admin/chat/models', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify(ref),
+  })
+  const data = await jsonOrError(resp)
+  return Array.isArray(data?.models) ? data.models : []
+}
+
 export async function chatThreads(ref: { token_v2: string; user_id?: string; space_id: string }): Promise<ChatThread[]> {
   const resp = await fetch('/admin/chat/threads', {
     method: 'POST',
@@ -505,6 +527,17 @@ export async function chatThreads(ref: { token_v2: string; user_id?: string; spa
   })
   const data = await jsonOrError(resp)
   return Array.isArray(data?.threads) ? data.threads : []
+}
+
+// chatDelete soft-deletes (archives) a chat thread for this account.
+export async function chatDelete(ref: { token_v2: string; user_id?: string; space_id: string; thread_id: string }): Promise<void> {
+  const resp = await fetch('/admin/chat/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify(ref),
+  })
+  await jsonOrError(resp)
 }
 
 // chatHistory loads a single thread's full message history (user turns +
@@ -528,13 +561,23 @@ export interface ChatSendResult {
   steps?: ChatStep[]
 }
 
-export async function chatSend(params: ChatAccountRef & {
+// Live status emitted while the agent is working (e.g. "Размышляю" + the
+// current thought/tool detail).
+export interface ChatStatus {
+  label: string
+  detail: string
+}
+
+export type ChatSendParams = ChatAccountRef & {
   timezone?: string
   agent: string // "default" or a workflowId
+  model?: string // codename, only honoured for the built-in assistant
   context_page_id?: string
   thread_id?: string
   message: string
-}): Promise<ChatSendResult> {
+}
+
+export async function chatSend(params: ChatSendParams): Promise<ChatSendResult> {
   const resp = await fetch('/admin/chat/send', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -542,4 +585,53 @@ export async function chatSend(params: ChatAccountRef & {
     body: JSON.stringify(params),
   })
   return jsonOrError(resp) as Promise<ChatSendResult>
+}
+
+// chatStream runs one chat turn and streams live agent status. The server
+// emits newline-delimited JSON events: {event:"status",label,detail} while the
+// agent works, then a final {event:"done",...} with the full answer. onStatus
+// is called for every status event so the UI can show what the agent is doing
+// right now.
+export async function chatStream(params: ChatSendParams, onStatus: (s: ChatStatus) => void): Promise<ChatSendResult> {
+  const resp = await fetch('/admin/chat/stream', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
+    credentials: 'same-origin',
+    body: JSON.stringify(params),
+  })
+  if (!resp.ok || !resp.body) {
+    // Fall back to the synchronous endpoint if streaming is unavailable.
+    return chatSend(params)
+  }
+  const reader = resp.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let result: ChatSendResult | null = null
+  let streamError = ''
+  for (;;) {
+    const { value, done } = await reader.read()
+    if (value) buffer += decoder.decode(value, { stream: true })
+    let nl = buffer.indexOf('\n')
+    while (nl >= 0) {
+      const line = buffer.slice(0, nl).trim()
+      buffer = buffer.slice(nl + 1)
+      if (line) {
+        try {
+          const ev = JSON.parse(line)
+          if (ev.event === 'status') {
+            onStatus({ label: ev.label || '', detail: ev.detail || '' })
+          } else if (ev.event === 'done') {
+            result = { thread_id: ev.thread_id, title: ev.title, text: ev.text, steps: ev.steps }
+          } else if (ev.event === 'error') {
+            streamError = ev.error || 'Ошибка потока'
+          }
+        } catch { /* ignore malformed line */ }
+      }
+      nl = buffer.indexOf('\n')
+    }
+    if (done) break
+  }
+  if (streamError && !result) throw new Error(streamError)
+  if (!result) throw new Error('Пустой ответ от сервера')
+  return result
 }
