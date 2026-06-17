@@ -17,7 +17,9 @@ REM    build.bat run --password=МойПароль    - то же самое
 REM    build.bat --password МойПароль        - пробел вместо = тоже поддерживается
 REM    set DASHBOARD_PASSWORD=МойПароль       - либо задать пароль через переменную окружения
 REM
-REM  Если пароль не задан, панель остаётся открытой.
+REM  Если пароль не задан, панель остаётся открытой: build.bat передаёт серверу
+REM  --no-password, поэтому даже оставшийся admin_password в config.yaml не
+REM  заблокирует вход.
 REM ============================================================
 
 cd /d "%~dp0"
@@ -43,8 +45,15 @@ goto parse_args
 REM --- Пароль: приоритет у --password, иначе переменная окружения DASHBOARD_PASSWORD ---
 if not defined DASH_PASSWORD if defined DASHBOARD_PASSWORD set "DASH_PASSWORD=!DASHBOARD_PASSWORD!"
 
+REM --- Аргументы запуска. Без пароля передаём --no-password, чтобы сервер
+REM     игнорировал любой admin_password из config.yaml и панель была реально
+REM     открыта (иначе старый/забытый пароль из config.yaml блокирует вход). ---
 set "RUN_ARGS="
-if defined DASH_PASSWORD set "RUN_ARGS=--password=!DASH_PASSWORD!"
+if defined DASH_PASSWORD (
+  set "RUN_ARGS=--password=!DASH_PASSWORD!"
+) else (
+  set "RUN_ARGS=--no-password"
+)
 
 echo ============================================
 echo  Notion Auto Pay: сборка и запуск
@@ -108,7 +117,7 @@ if /i "%MODE%"=="exe" (
   go build -o %BINARY% %CMD_PATH%
   if errorlevel 1 ( echo [ОШИБКА] go build не удался & pause & exit /b 1 )
   echo Готово: %BINARY% собран.
-  echo Запуск без пароля:  %BINARY%
+  echo Запуск без пароля:  %BINARY% --no-password
   echo Запуск с паролем: %BINARY% --password=ВашПароль
   pause
   exit /b 0
@@ -120,7 +129,7 @@ if defined DASH_PASSWORD (
   echo Веб-панель защищена паролем. Включён лимит попыток входа.
   echo Текущий пароль: !DASH_PASSWORD!
 ) else (
-  echo Веб-панель открыта без пароля. Чтобы включить: build.bat --password=ВашПароль
+  echo Веб-панель открыта без пароля (--no-password). Чтобы включить: build.bat --password=ВашПароль
 )
 echo Дашборд будет доступен на http://localhost:8081/dashboard/
 echo Для остановки нажмите Ctrl+C
