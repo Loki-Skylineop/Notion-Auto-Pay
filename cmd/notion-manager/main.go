@@ -91,6 +91,10 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 
 	// Workspace discovery endpoint
 	mux.HandleFunc("/admin/discover", proxy.HandleDiscoverWorkspaces(dashAuth))
+	// All-accounts workspace list. Lets the dashboard hydrate its workspace
+	// pool straight from the server (e.g. a fresh incognito window with an
+	// empty localStorage cache) instead of relying only on the browser cache.
+	mux.HandleFunc("/admin/workspaces", proxy.HandleListWorkspaces(pool, dashAuth))
 
 	// Server-side auto-pay config + manual trigger. The actual paying is done
 	// by the background scheduler (AutoPayManager.Start) so it keeps running
@@ -265,6 +269,7 @@ func main() {
 	log.Printf("  GET  /admin/models")
 	log.Printf("  GET  /admin/settings              (search/proxy/ASK settings)")
 	log.Printf("  GET  /admin/stats                 (token usage stats)")
+	log.Printf("  GET  /admin/workspaces            (all-accounts workspace list)")
 	log.Printf("  GET  /admin/autopay               (server auto-pay config)")
 	log.Printf("  POST /admin/autopay/run           (trigger auto-pay scan now)")
 	log.Printf("  POST /admin/autopay/pay-space     (pay one workspace with saved card)")
