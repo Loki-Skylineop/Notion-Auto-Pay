@@ -44,33 +44,67 @@ const IconSpark = () => (
   </svg>
 )
 
+// Top-level tab switcher between the payment pool (Оплата) and the AI chat
+// surface (Чат). Rendered centered inside the hero band.
+function TabBar({ tab, onChange }: { tab: 'pay' | 'chat'; onChange: (t: 'pay' | 'chat') => void }) {
+  const base = 'h-9 px-5 rounded-full text-[13px] font-medium cursor-pointer transition-colors border-none'
+  const active = 'bg-white text-black'
+  const idle = 'bg-transparent text-text-secondary hover:text-text-primary'
+  return (
+    <div className="flex items-center gap-1 bg-bg-secondary border border-border rounded-full p-1 w-fit mx-auto">
+      <button onClick={() => onChange('pay')} className={`${base} ${tab === 'pay' ? active : idle}`}>Оплата</button>
+      <button onClick={() => onChange('chat')} className={`${base} ${tab === 'chat' ? active : idle}`}>Чат</button>
+    </div>
+  )
+}
+
 // Hero band carrying the brand's signature mesh-gradient atmospheric glow over
-// the black canvas. Headline copy intentionally omitted — just the brand chip
-// and the primary action.
-function Hero({ onAdd, accountCount, spaceCount, onLogout }: { onAdd: () => void; accountCount: number; spaceCount: number; onLogout?: () => void }) {
+// the black canvas. The primary "Добавить аккаунт" action and the logout
+// button live in the top-right corner; the Оплата / Чат tab switcher sits
+// centered in the band.
+function Hero({
+  onAdd,
+  accountCount,
+  spaceCount,
+  onLogout,
+  tab,
+  onTab,
+}: {
+  onAdd: () => void
+  accountCount: number
+  spaceCount: number
+  onLogout?: () => void
+  tab?: 'pay' | 'chat'
+  onTab?: (t: 'pay' | 'chat') => void
+}) {
   return (
     <header className="relative overflow-hidden border-b border-border">
       <div aria-hidden="true" className="mesh-hero pointer-events-none absolute -top-56 left-1/2 -translate-x-1/2 w-[150%] h-[520px] opacity-70" />
-      {onLogout && (
+      <div className="absolute top-4 right-4 z-10 flex items-center gap-2">
         <button
-          onClick={onLogout}
-          className="absolute top-4 right-4 z-10 inline-flex items-center gap-1.5 h-8 px-3 bg-white/5 hover:bg-white/10 border border-border rounded-full text-[12px] text-text-secondary hover:text-text-primary cursor-pointer transition-colors"
+          onClick={onAdd}
+          className="inline-flex items-center gap-1.5 h-9 px-4 bg-white hover:bg-white/90 text-black rounded-full text-[13px] font-medium cursor-pointer transition-colors border-none"
         >
-          Выйти
+          <IconPlus /> Добавить аккаунт
         </button>
-      )}
+        {onLogout && (
+          <button
+            onClick={onLogout}
+            className="inline-flex items-center gap-1.5 h-9 px-3 bg-white/5 hover:bg-white/10 border border-border rounded-full text-[12px] text-text-secondary hover:text-text-primary cursor-pointer transition-colors"
+          >
+            Выйти
+          </button>
+        )}
+      </div>
       <div className="relative max-w-[1100px] mx-auto px-6 pt-16 pb-12 text-center">
         <span className="eyebrow inline-flex items-center gap-1.5 bg-white/5 backdrop-blur border border-border rounded-full px-3 py-1 shadow-card">
           <IconSpark /> Notion Auto Pay
         </span>
-        <div className="flex items-center justify-center gap-3 mt-7">
-          <button
-            onClick={onAdd}
-            className="inline-flex items-center gap-2 h-11 px-5 bg-white hover:bg-white/90 text-black rounded-full text-[15px] font-medium cursor-pointer transition-colors border-none"
-          >
-            <IconPlus /> Добавить аккаунт
-          </button>
-        </div>
+        {tab && onTab && (
+          <div className="flex items-center justify-center gap-3 mt-7">
+            <TabBar tab={tab} onChange={onTab} />
+          </div>
+        )}
         {(accountCount > 0 || spaceCount > 0) && (
           <div className="flex items-center justify-center gap-6 mt-9">
             <Stat value={accountCount} label="аккаунтов" />
@@ -88,20 +122,6 @@ function Stat({ value, label }: { value: number; label: string }) {
     <div className="flex flex-col items-center">
       <span className="text-[24px] font-semibold tracking-tight text-text-primary tabular-nums leading-none">{value}</span>
       <span className="text-[12px] text-text-muted mt-1.5">{label}</span>
-    </div>
-  )
-}
-
-// Top-level tab switcher between the payment pool (Оплата) and the AI chat
-// surface (Чат). Kept as a small pill bar centered under the hero.
-function TabBar({ tab, onChange }: { tab: 'pay' | 'chat'; onChange: (t: 'pay' | 'chat') => void }) {
-  const base = 'h-9 px-5 rounded-full text-[13px] font-medium cursor-pointer transition-colors border-none'
-  const active = 'bg-white text-black'
-  const idle = 'bg-transparent text-text-secondary hover:text-text-primary'
-  return (
-    <div className="flex items-center gap-1 mb-8 bg-bg-secondary border border-border rounded-full p-1 w-fit mx-auto">
-      <button onClick={() => onChange('pay')} className={`${base} ${tab === 'pay' ? active : idle}`}>Оплата</button>
-      <button onClick={() => onChange('chat')} className={`${base} ${tab === 'chat' ? active : idle}`}>Чат</button>
     </div>
   )
 }
@@ -339,11 +359,16 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
 
   return (
     <div className="min-h-screen">
-      <Hero onAdd={() => setShowAddModal(true)} accountCount={accountCount} spaceCount={spaceCount} onLogout={onLogout} />
+      <Hero
+        onAdd={() => setShowAddModal(true)}
+        accountCount={accountCount}
+        spaceCount={spaceCount}
+        onLogout={onLogout}
+        tab={tab}
+        onTab={setTab}
+      />
 
       <main className="max-w-[1100px] mx-auto px-6 py-10">
-        <TabBar tab={tab} onChange={setTab} />
-
         {tab === 'pay' ? (
           discovered.length === 0 ? (
             hydrating ? (
