@@ -118,6 +118,7 @@ echo.
 echo [4/4] Запуск сервера...
 if defined DASH_PASSWORD (
   echo Веб-панель защищена паролем. Включён лимит попыток входа.
+  echo Текущий пароль: !DASH_PASSWORD!
 ) else (
   echo Веб-панель открыта без пароля. Чтобы включить: build.bat --password=ВашПароль
 )
