@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -17,25 +19,6 @@ import (
 // cookie. It powers the dashboard "Чат" tab: pick a workspace, pick an agent
 // (the built-in assistant or a custom agent), start a new chat or continue an
 // existing thread, and stream the assistant reply.
-//
-// The request/response shapes were reverse-engineered from the real web client
-// (chat.com.har / 123chat.com.har). Key facts:
-//   - runInferenceTranscript returns an application/x-ndjson patch stream. The
-//     final assistant text lives in the closing record-map under
-//     thread_message -> step(type="agent-inference") -> value[] where each part
-//     is {type:"thinking"|"text"|"tool_use", content/name}. We keep "text" as
-//     the answer and surface "thinking"/"tool_use" parts as visible steps.
-//   - A thread record (table:"thread") carries an ordered messages[] array of
-//     thread_message ids. The message bodies are NOT in the transcript-list
-//     responses; they are fetched by id via syncRecordValuesSpaceInitial. That
-//     is how HandleChatHistory rebuilds a past conversation.
-//   - A custom agent uses threadParentPointer{table:"workflow",id:workflowId}
-//     with config.isCustomAgent=true and surface="custom_agent". The built-in
-//     assistant uses threadParentPointer{table:"space",id:spaceId},
-//     config.isCustomAgent=false, modelFromUser=true and surface="ai_module".
-//   - Continuing a thread re-sends config+context+the new user turn with
-//     createThread=false, isPartialTranscript=true and no threadParentPointer;
-//     the server already holds the prior turns for threadId.
 
 // notionChatRequest issues a POST to a private Notion API endpoint authenticated
 // with the account's token_v2 cookie, mirroring the headers the real web client
@@ -99,9 +82,7 @@ type chatAgent struct {
 }
 
 // HandleChatAgents returns the built-in assistant plus every custom agent the
-// account can see in the given space. Custom agents are read from the workflow
-// records embedded in getInferenceTranscriptsForUser's recordMap (the only
-// place the HAR exposes them without a dedicated listing endpoint).
+// account can see in the given space.
 func HandleChatAgents(auth *DashboardAuth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -135,7 +116,7 @@ func HandleChatAgents(auth *DashboardAuth) http.HandlerFunc {
 
 func transcriptsRequestBody(spaceID string) []byte {
 	b, _ := json.Marshal(map[string]interface{}{
-		"threadParentPointer": map[string]string{"table": "space", "id": spaceID, "spaceId": spaceID},
+		"threadParentPointer":   map[string]string{"table": "space", "id": spaceID, "spaceId": spaceID},
 		"includeWorkflowThreads": true,
 		"includeWriterChats":     false,
 	})
@@ -185,6 +166,78 @@ func fetchCustomAgents(tokenV2, userID, spaceID string) ([]chatAgent, error) {
 	return out, nil
 }
 
+// ---- Models ----
+
+// HandleChatModels proxies getAvailableModels for the built-in assistant model
+// picker. It returns the codename, the human label and the display group so the
+// dashboard can show e.g. "Opus 4.8" and send the codename ambrosia-tart-high.
+func HandleChatModels(auth *DashboardAuth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !chatAuthOK(auth, w, r) {
+			return
+		}
+		var body struct {
+			TokenV2 string `json:"token_v2"`
+			UserID  string `json:"user_id"`
+			SpaceID string `json:"space_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+		body.TokenV2 = strings.TrimSpace(body.TokenV2)
+		body.SpaceID = strings.TrimSpace(body.SpaceID)
+		if body.TokenV2 == "" || body.SpaceID == "" {
+			http.Error(w, `{"error":"token_v2 and space_id are required"}`, http.StatusBadRequest)
+			return
+		}
+		reqBody, _ := json.Marshal(map[string]string{"spaceId": body.SpaceID})
+		resp, err := notionChatRequest(body.TokenV2, body.UserID, body.SpaceID, "getAvailableModels", reqBody, "application/json", chatAPITimeout())
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+		data, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("notion %d", resp.StatusCode)})
+			return
+		}
+		var parsed struct {
+			Models []struct {
+				Model        string `json:"model"`
+				ModelMessage string `json:"modelMessage"`
+				ModelFamily  string `json:"modelFamily"`
+				DisplayGroup string `json:"displayGroup"`
+				IsDisabled   bool   `json:"isDisabled"`
+			} `json:"models"`
+		}
+		json.Unmarshal(data, &parsed)
+		type outModel struct {
+			ID       string `json:"id"`
+			Label    string `json:"label"`
+			Family   string `json:"family"`
+			Group    string `json:"group"`
+			Disabled bool   `json:"disabled"`
+		}
+		out := make([]outModel, 0, len(parsed.Models))
+		for _, m := range parsed.Models {
+			if m.Model == "" {
+				continue
+			}
+			label := m.ModelMessage
+			if label == "" {
+				label = m.Model
+			}
+			out = append(out, outModel{ID: m.Model, Label: label, Family: m.ModelFamily, Group: m.DisplayGroup, Disabled: m.IsDisabled})
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"models": out})
+	}
+}
+
 // ---- Threads ----
 
 type chatThread struct {
@@ -195,8 +248,7 @@ type chatThread struct {
 	Type      string `json:"type"`
 }
 
-// HandleChatThreads lists the account's recent chat threads in a space so the
-// UI can show history and let the user continue an existing conversation.
+// HandleChatThreads lists the account's recent chat threads in a space.
 func HandleChatThreads(auth *DashboardAuth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -239,6 +291,69 @@ func HandleChatThreads(auth *DashboardAuth) http.HandlerFunc {
 	}
 }
 
+// HandleChatDelete soft-deletes a chat thread (sets thread.alive=false) using the
+// same saveTransactionsFanout transaction the web client sends for
+// "assistantChatHistoryItem.deleteInferenceChatTranscript".
+func HandleChatDelete(auth *DashboardAuth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !chatAuthOK(auth, w, r) {
+			return
+		}
+		var body struct {
+			TokenV2  string `json:"token_v2"`
+			UserID   string `json:"user_id"`
+			SpaceID  string `json:"space_id"`
+			ThreadID string `json:"thread_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+		body.TokenV2 = strings.TrimSpace(body.TokenV2)
+		body.SpaceID = strings.TrimSpace(body.SpaceID)
+		body.ThreadID = strings.TrimSpace(body.ThreadID)
+		if body.TokenV2 == "" || body.SpaceID == "" || body.ThreadID == "" {
+			http.Error(w, `{"error":"token_v2, space_id and thread_id are required"}`, http.StatusBadRequest)
+			return
+		}
+		op := map[string]interface{}{
+			"pointer": map[string]string{"table": "thread", "id": body.ThreadID, "spaceId": body.SpaceID},
+			"path":    []string{},
+			"command": "update",
+			"args": map[string]interface{}{
+				"alive":                              false,
+				"current_inference_id":               nil,
+				"current_inference_lease_expiration": nil,
+			},
+		}
+		tx := map[string]interface{}{
+			"id":         generateUUIDv4(),
+			"spaceId":    body.SpaceID,
+			"debug":      map[string]string{"userAction": "assistantChatHistoryItem.deleteInferenceChatTranscript"},
+			"operations": []interface{}{op},
+		}
+		reqBody, _ := json.Marshal(map[string]interface{}{
+			"requestId":    generateUUIDv4(),
+			"transactions": []interface{}{tx},
+		})
+		resp, err := notionChatRequest(body.TokenV2, body.UserID, body.SpaceID, "saveTransactionsFanout", reqBody, "application/json", chatAPITimeout())
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+		io.ReadAll(resp.Body)
+		if resp.StatusCode != 200 {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("notion %d", resp.StatusCode)})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"ok": true})
+	}
+}
+
 // ---- History ----
 
 // chatStep is a single visible reasoning/tool step of an assistant turn.
@@ -256,9 +371,7 @@ type chatHistMsg struct {
 }
 
 // syncRecordValues fetches one or more records by pointer through the private
-// syncRecordValuesSpaceInitial endpoint (the same one the web client uses to
-// hydrate thread/thread_message records by id). version -1 forces the server
-// to return the full record regardless of any client-known version.
+// syncRecordValuesSpaceInitial endpoint. version -1 forces the full record.
 func syncRecordValues(tokenV2, userID, spaceID string, pointers []map[string]string) ([]byte, error) {
 	reqs := make([]map[string]interface{}, 0, len(pointers))
 	for _, p := range pointers {
@@ -280,10 +393,7 @@ func syncRecordValues(tokenV2, userID, spaceID string, pointers []map[string]str
 	return data, nil
 }
 
-// HandleChatHistory rebuilds the full message history of a single thread so the
-// UI can show it when the user clicks an existing chat. It first loads the
-// thread record to get its ordered messages[] ids, then batch-fetches those
-// thread_message records and folds them into user/assistant turns.
+// HandleChatHistory rebuilds the full message history of a single thread.
 func HandleChatHistory(auth *DashboardAuth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -308,7 +418,6 @@ func HandleChatHistory(auth *DashboardAuth) http.HandlerFunc {
 			return
 		}
 
-		// 1. Load the thread record to discover its ordered message ids.
 		threadData, err := syncRecordValues(body.TokenV2, body.UserID, body.SpaceID, []map[string]string{
 			{"table": "thread", "id": body.ThreadID, "spaceId": body.SpaceID},
 		})
@@ -338,7 +447,6 @@ func HandleChatHistory(auth *DashboardAuth) http.HandlerFunc {
 			return
 		}
 
-		// 2. Batch-fetch the thread_message records by id.
 		pointers := make([]map[string]string, 0, len(order))
 		for _, id := range order {
 			pointers = append(pointers, map[string]string{"table": "thread_message", "id": id, "spaceId": body.SpaceID})
@@ -354,15 +462,12 @@ func HandleChatHistory(auth *DashboardAuth) http.HandlerFunc {
 		}
 		json.Unmarshal(msgData, &wrap)
 
-		// 3. Fold the ordered messages into user/assistant turns.
 		messages := buildHistory(wrap.RecordMap, order)
 		json.NewEncoder(w).Encode(map[string]interface{}{"messages": messages})
 	}
 }
 
-// buildHistory walks the thread's messages[] in canonical order, emitting a
-// user message per "user" step and grouping the agent-inference steps that
-// follow it into a single assistant turn (steps + concatenated answer text).
+// buildHistory walks the thread's messages[] in canonical order.
 func buildHistory(rm recordMapShape, order []string) []chatHistMsg {
 	out := []chatHistMsg{}
 	var cur *chatHistMsg
@@ -397,10 +502,27 @@ func buildHistory(rm recordMapShape, order []string) []chatHistMsg {
 
 // ---- Send ----
 
-// buildChatConfig returns the transcript config block. The flag set is copied
-// verbatim from the real web client; only the agent-type-dependent fields
-// (isCustomAgent / useCustomAgentDraft / modelFromUser / workflowId) vary.
-func buildChatConfig(isCustom bool, workflowID string) map[string]interface{} {
+// chatSendBody is the shared request shape for both the synchronous send and
+// the streaming send. Model is only honoured for the built-in assistant.
+type chatSendBody struct {
+	TokenV2       string `json:"token_v2"`
+	UserID        string `json:"user_id"`
+	UserName      string `json:"user_name"`
+	UserEmail     string `json:"user_email"`
+	SpaceID       string `json:"space_id"`
+	SpaceViewID   string `json:"space_view_id"`
+	SpaceName     string `json:"space_name"`
+	Timezone      string `json:"timezone"`
+	Agent         string `json:"agent"`
+	Model         string `json:"model"`
+	ContextPageID string `json:"context_page_id"`
+	ThreadID      string `json:"thread_id"`
+	Message       string `json:"message"`
+}
+
+// buildChatConfig returns the transcript config block. model is set only for the
+// built-in assistant (modelFromUser=true); custom agents carry their own model.
+func buildChatConfig(isCustom bool, workflowID string, model string) map[string]interface{} {
 	cfg := map[string]interface{}{
 		"type":                                 "workflow",
 		"enableAgentAutomations":               true,
@@ -458,36 +580,112 @@ func buildChatConfig(isCustom bool, workflowID string) map[string]interface{} {
 		"isOnboardingAgent":                   false,
 		"isMobile":                            false,
 	}
+	if !isCustom && strings.TrimSpace(model) != "" {
+		cfg["model"] = model
+	}
 	if isCustom && workflowID != "" {
 		cfg["workflowId"] = workflowID
 	}
 	return cfg
 }
 
-// HandleChatSend runs one chat turn: it builds the transcript (config + context
-// + user message), POSTs runInferenceTranscript, parses the ndjson reply and
-// returns the assistant text, the agent steps, the thread id and the
-// (auto-generated) title.
+// buildSendPayload constructs the runInferenceTranscript request body for a chat
+// turn and returns it together with the (possibly newly minted) thread id.
+func buildSendPayload(body chatSendBody) (map[string]interface{}, string) {
+	isCustom := body.Agent != "" && body.Agent != "default"
+	workflowID := ""
+	if isCustom {
+		workflowID = body.Agent
+	}
+	tz := body.Timezone
+	if tz == "" {
+		tz = "UTC"
+	}
+	configMsg := map[string]interface{}{
+		"id":    generateUUIDv4(),
+		"type":  "config",
+		"value": buildChatConfig(isCustom, workflowID, body.Model),
+	}
+	ctxVal := map[string]interface{}{
+		"timezone":        tz,
+		"userName":        body.UserName,
+		"userId":          body.UserID,
+		"userEmail":       body.UserEmail,
+		"spaceName":       body.SpaceName,
+		"spaceId":         body.SpaceID,
+		"spaceViewId":     body.SpaceViewID,
+		"currentDatetime": time.Now().Format("2006-01-02T15:04:05.000-07:00"),
+	}
+	if isCustom {
+		ctxVal["surface"] = "custom_agent"
+		ctxVal["workflowId"] = workflowID
+		if body.ContextPageID != "" {
+			ctxVal["context_page_id"] = body.ContextPageID
+		}
+	} else {
+		ctxVal["surface"] = "ai_module"
+	}
+	contextMsg := map[string]interface{}{
+		"id":    generateUUIDv4(),
+		"type":  "context",
+		"value": ctxVal,
+	}
+	userMsg := map[string]interface{}{
+		"id":        generateUUIDv4(),
+		"type":      "user",
+		"value":     [][]string{ {body.Message} },
+		"userId":    body.UserID,
+		"createdAt": time.Now().UnixMilli(),
+	}
+	newThread := strings.TrimSpace(body.ThreadID) == ""
+	threadID := strings.TrimSpace(body.ThreadID)
+	if newThread {
+		threadID = generateUUIDv4()
+	}
+	createdSource := "ai_module"
+	if isCustom {
+		createdSource = "custom_agent"
+	}
+	payload := map[string]interface{}{
+		"traceId":                       generateUUIDv4(),
+		"spaceId":                       body.SpaceID,
+		"transcript":                    []interface{}{configMsg, contextMsg, userMsg},
+		"threadId":                      threadID,
+		"createThread":                  newThread,
+		"debugOverrides":                map[string]interface{}{},
+		"generateTitle":                 true,
+		"saveAllThreadOperations":       true,
+		"setUnreadState":                true,
+		"createdSource":                 createdSource,
+		"threadType":                    "workflow",
+		"isPartialTranscript":           !newThread,
+		"asPatchResponse":               true,
+		"patchResponseVersion":          2,
+		"isUserInAnySalesAssistedSpace": false,
+		"isSpaceSalesAssisted":          false,
+	}
+	if newThread {
+		tp := map[string]string{"spaceId": body.SpaceID}
+		if isCustom {
+			tp["table"] = "workflow"
+			tp["id"] = workflowID
+		} else {
+			tp["table"] = "space"
+			tp["id"] = body.SpaceID
+		}
+		payload["threadParentPointer"] = tp
+	}
+	return payload, threadID
+}
+
+// HandleChatSend runs one chat turn synchronously (no live status).
 func HandleChatSend(auth *DashboardAuth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if !chatAuthOK(auth, w, r) {
 			return
 		}
-		var body struct {
-			TokenV2       string `json:"token_v2"`
-			UserID        string `json:"user_id"`
-			UserName      string `json:"user_name"`
-			UserEmail     string `json:"user_email"`
-			SpaceID       string `json:"space_id"`
-			SpaceViewID   string `json:"space_view_id"`
-			SpaceName     string `json:"space_name"`
-			Timezone      string `json:"timezone"`
-			Agent         string `json:"agent"`
-			ContextPageID string `json:"context_page_id"`
-			ThreadID      string `json:"thread_id"`
-			Message       string `json:"message"`
-		}
+		var body chatSendBody
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
 			return
@@ -499,94 +697,7 @@ func HandleChatSend(auth *DashboardAuth) http.HandlerFunc {
 			http.Error(w, `{"error":"token_v2, space_id and message are required"}`, http.StatusBadRequest)
 			return
 		}
-
-		isCustom := body.Agent != "" && body.Agent != "default"
-		workflowID := ""
-		if isCustom {
-			workflowID = body.Agent
-		}
-		tz := body.Timezone
-		if tz == "" {
-			tz = "UTC"
-		}
-
-		configMsg := map[string]interface{}{
-			"id":    generateUUIDv4(),
-			"type":  "config",
-			"value": buildChatConfig(isCustom, workflowID),
-		}
-		ctxVal := map[string]interface{}{
-			"timezone":        tz,
-			"userName":        body.UserName,
-			"userId":          body.UserID,
-			"userEmail":       body.UserEmail,
-			"spaceName":       body.SpaceName,
-			"spaceId":         body.SpaceID,
-			"spaceViewId":     body.SpaceViewID,
-			"currentDatetime": time.Now().Format("2006-01-02T15:04:05.000-07:00"),
-		}
-		if isCustom {
-			ctxVal["surface"] = "custom_agent"
-			ctxVal["workflowId"] = workflowID
-			if body.ContextPageID != "" {
-				ctxVal["context_page_id"] = body.ContextPageID
-			}
-		} else {
-			ctxVal["surface"] = "ai_module"
-		}
-		contextMsg := map[string]interface{}{
-			"id":    generateUUIDv4(),
-			"type":  "context",
-			"value": ctxVal,
-		}
-		userMsg := map[string]interface{}{
-			"id":        generateUUIDv4(),
-			"type":      "user",
-			"value":     [][]string{ {body.Message} },
-			"userId":    body.UserID,
-			"createdAt": time.Now().UnixMilli(),
-		}
-
-		newThread := strings.TrimSpace(body.ThreadID) == ""
-		threadID := strings.TrimSpace(body.ThreadID)
-		if newThread {
-			threadID = generateUUIDv4()
-		}
-		createdSource := "ai_module"
-		if isCustom {
-			createdSource = "custom_agent"
-		}
-
-		payload := map[string]interface{}{
-			"traceId":                       generateUUIDv4(),
-			"spaceId":                       body.SpaceID,
-			"transcript":                    []interface{}{configMsg, contextMsg, userMsg},
-			"threadId":                      threadID,
-			"createThread":                  newThread,
-			"debugOverrides":                map[string]interface{}{},
-			"generateTitle":                 true,
-			"saveAllThreadOperations":       true,
-			"setUnreadState":                true,
-			"createdSource":                 createdSource,
-			"threadType":                    "workflow",
-			"isPartialTranscript":           !newThread,
-			"asPatchResponse":               true,
-			"patchResponseVersion":          2,
-			"isUserInAnySalesAssistedSpace": false,
-			"isSpaceSalesAssisted":          false,
-		}
-		if newThread {
-			tp := map[string]string{"spaceId": body.SpaceID}
-			if isCustom {
-				tp["table"] = "workflow"
-				tp["id"] = workflowID
-			} else {
-				tp["table"] = "space"
-				tp["id"] = body.SpaceID
-			}
-			payload["threadParentPointer"] = tp
-		}
-
+		payload, threadID := buildSendPayload(body)
 		reqBody, _ := json.Marshal(payload)
 		resp, err := notionChatRequest(body.TokenV2, body.UserID, body.SpaceID, "runInferenceTranscript", reqBody, "application/x-ndjson", 180*time.Second)
 		if err != nil {
@@ -607,6 +718,206 @@ func HandleChatSend(auth *DashboardAuth) http.HandlerFunc {
 			text = "(агент не вернул текстового ответа)"
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
+			"thread_id": threadID,
+			"title":     title,
+			"text":      text,
+			"steps":     steps,
+		})
+	}
+}
+
+// ---- Streaming send (live agent state) ----
+
+// sMeta tracks the type of each entry in the patch stream's state array ("s")
+// so content deltas (op "x") can be attributed to the right kind of step.
+type sMeta struct {
+	typ       string
+	tool      string
+	thinking  string
+	partTypes []string
+}
+
+func metaFromItem(raw json.RawMessage) sMeta {
+	var it struct {
+		Type     string `json:"type"`
+		ToolName string `json:"toolName"`
+		Input    struct {
+			Function string `json:"function"`
+		} `json:"input"`
+		Value []struct {
+			Type    string `json:"type"`
+			Content string `json:"content"`
+		} `json:"value"`
+	}
+	m := sMeta{}
+	if json.Unmarshal(raw, &it) != nil {
+		return m
+	}
+	m.typ = it.Type
+	if it.Input.Function != "" {
+		m.tool = it.Input.Function
+	} else {
+		m.tool = it.ToolName
+	}
+	for _, p := range it.Value {
+		m.partTypes = append(m.partTypes, p.Type)
+		if p.Type == "thinking" && m.thinking == "" {
+			m.thinking = p.Content
+		}
+	}
+	return m
+}
+
+// parseContentPath parses "/s/<idx>/value/<part>/content" into idx + part.
+func parseContentPath(p string) (int, int, bool) {
+	if !strings.HasPrefix(p, "/s/") || !strings.HasSuffix(p, "/content") {
+		return 0, 0, false
+	}
+	parts := strings.Split(strings.Trim(p, "/"), "/")
+	if len(parts) < 5 || parts[2] != "value" {
+		return 0, 0, false
+	}
+	idx, e1 := strconv.Atoi(parts[1])
+	pt, e2 := strconv.Atoi(parts[3])
+	if e1 != nil || e2 != nil {
+		return 0, 0, false
+	}
+	return idx, pt, true
+}
+
+// processStreamLine parses one ndjson line of the patch stream and emits a
+// best-effort "status" event describing what the agent is doing right now.
+func processStreamLine(line []byte, sItems *[]sMeta, emit func(map[string]interface{})) {
+	var probe struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal(line, &probe) != nil {
+		return
+	}
+	switch probe.Type {
+	case "patch-start":
+		var ps struct {
+			Data struct {
+				S []json.RawMessage `json:"s"`
+			} `json:"data"`
+		}
+		if json.Unmarshal(line, &ps) == nil {
+			for _, raw := range ps.Data.S {
+				*sItems = append(*sItems, metaFromItem(raw))
+			}
+		}
+	case "patch":
+		var p struct {
+			V []struct {
+				O string          `json:"o"`
+				P string          `json:"p"`
+				V json.RawMessage `json:"v"`
+			} `json:"v"`
+		}
+		if json.Unmarshal(line, &p) != nil {
+			return
+		}
+		for _, op := range p.V {
+			if op.O == "a" && strings.HasSuffix(op.P, "/s/-") {
+				m := metaFromItem(op.V)
+				*sItems = append(*sItems, m)
+				switch m.typ {
+				case "agent-tool-result":
+					emit(map[string]interface{}{"event": "status", "label": "Использую инструмент", "detail": m.tool})
+				case "agent-inference":
+					emit(map[string]interface{}{"event": "status", "label": "Размышляю", "detail": m.thinking})
+				case "text":
+					emit(map[string]interface{}{"event": "status", "label": "Отвечаю", "detail": ""})
+				}
+			} else if op.O == "x" {
+				idx, part, ok := parseContentPath(op.P)
+				if !ok || idx >= len(*sItems) {
+					continue
+				}
+				meta := &(*sItems)[idx]
+				if meta.typ == "agent-inference" && part < len(meta.partTypes) {
+					var delta string
+					if json.Unmarshal(op.V, &delta) != nil {
+						continue
+					}
+					if meta.partTypes[part] == "thinking" {
+						meta.thinking += delta
+						emit(map[string]interface{}{"event": "status", "label": "Размышляю", "detail": meta.thinking})
+					} else if meta.partTypes[part] == "text" {
+						emit(map[string]interface{}{"event": "status", "label": "Отвечаю", "detail": ""})
+					}
+				}
+			}
+		}
+	}
+}
+
+// HandleChatStream is the streaming counterpart of HandleChatSend. It forwards
+// the live agent state (thinking / tool calls) to the browser as newline-
+// delimited JSON events, then a final "done" event with the full answer.
+func HandleChatStream(auth *DashboardAuth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !chatAuthOK(auth, w, r) {
+			return
+		}
+		var body chatSendBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+		body.TokenV2 = strings.TrimSpace(body.TokenV2)
+		body.SpaceID = strings.TrimSpace(body.SpaceID)
+		body.Message = strings.TrimSpace(body.Message)
+		if body.TokenV2 == "" || body.SpaceID == "" || body.Message == "" {
+			http.Error(w, `{"error":"token_v2, space_id and message are required"}`, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+		flusher, _ := w.(http.Flusher)
+		emit := func(obj map[string]interface{}) {
+			b, _ := json.Marshal(obj)
+			w.Write(b)
+			w.Write([]byte("\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+
+		payload, threadID := buildSendPayload(body)
+		reqBody, _ := json.Marshal(payload)
+		resp, err := notionChatRequest(body.TokenV2, body.UserID, body.SpaceID, "runInferenceTranscript", reqBody, "application/x-ndjson", 600*time.Second)
+		if err != nil {
+			emit(map[string]interface{}{"event": "error", "error": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			raw, _ := io.ReadAll(resp.Body)
+			log.Printf("[chat] stream %d: %s", resp.StatusCode, truncate(string(raw), 300))
+			emit(map[string]interface{}{"event": "error", "error": fmt.Sprintf("notion error %d", resp.StatusCode)})
+			return
+		}
+
+		var acc bytes.Buffer
+		var sItems []sMeta
+		sc := bufio.NewScanner(resp.Body)
+		sc.Buffer(make([]byte, 1024*1024), 32*1024*1024)
+		for sc.Scan() {
+			line := sc.Bytes()
+			acc.Write(line)
+			acc.WriteByte('\n')
+			lineCopy := make([]byte, len(line))
+			copy(lineCopy, line)
+			processStreamLine(lineCopy, &sItems, emit)
+		}
+		text, title, steps := parseInferenceStream(acc.Bytes())
+		if strings.TrimSpace(text) == "" {
+			text = "(агент не вернул текстового ответа)"
+		}
+		emit(map[string]interface{}{
+			"event":     "done",
 			"thread_id": threadID,
 			"title":     title,
 			"text":      text,
@@ -644,8 +955,7 @@ type orderedTM struct {
 }
 
 // sortedThreadMessages returns the record-map's thread_message steps ordered by
-// created_time (used when no explicit messages[] order is available, e.g. the
-// live send record-map).
+// created_time.
 func sortedThreadMessages(rm recordMapShape) []orderedTM {
 	out := make([]orderedTM, 0, len(rm.ThreadMessage))
 	for _, m := range rm.ThreadMessage {
@@ -723,9 +1033,8 @@ func extractTurn(rm recordMapShape) (text, title string, steps []chatStep) {
 }
 
 // parseInferenceStream walks the ndjson patch stream. It prefers the final,
-// authoritative record-map (which carries the complete agent-inference text +
-// steps); if no record-map is present it falls back to concatenating the
-// streamed "content" deltas.
+// authoritative record-map; if none is present it falls back to concatenating
+// the streamed "content" deltas.
 func parseInferenceStream(raw []byte) (text, title string, steps []chatStep) {
 	var fallback strings.Builder
 	for _, line := range strings.Split(string(raw), "\n") {
