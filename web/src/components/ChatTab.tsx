@@ -215,7 +215,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   }
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-[280px_1fr] gap-4" style= height: 'calc(100vh - 220px)', minHeight: '460px' >
+    <div className="grid grid-cols-1 md:grid-cols-[280px_1fr] gap-4" style= minHeight: 'calc(100vh - 260px)' >
       {/* Sidebar: space + agent pickers, thread history */}
       <aside className="flex flex-col gap-3 bg-bg-secondary border border-border rounded-2xl p-3 overflow-hidden">
         <div>
