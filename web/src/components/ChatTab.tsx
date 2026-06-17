@@ -16,8 +16,8 @@ interface ChatMessage {
   text: string
 }
 
-// Flattened (account, space) pair so the user can pick “which workspace to sit
-// in” regardless of which account owns it.
+// Flattened (account, space) pair so the user can pick a workspace to sit in
+// regardless of which account owns it.
 interface SpaceOption {
   key: string
   account: DiscoveredAccount
@@ -26,6 +26,9 @@ interface SpaceOption {
   spaceName: string
   accountLabel: string
 }
+
+// Defined once so the grid uses single-brace JSX (style={gridStyle}).
+const gridStyle: React.CSSProperties = { minHeight: 'calc(100vh - 260px)' }
 
 function browserTimezone(): string {
   try {
@@ -215,7 +218,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   }
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-[280px_1fr] gap-4" style= minHeight: 'calc(100vh - 260px)' >
+    <div className="grid grid-cols-1 md:grid-cols-[280px_1fr] gap-4" style={gridStyle}>
       {/* Sidebar: space + agent pickers, thread history */}
       <aside className="flex flex-col gap-3 bg-bg-secondary border border-border rounded-2xl p-3 overflow-hidden">
         <div>
