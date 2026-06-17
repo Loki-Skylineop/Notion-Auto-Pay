@@ -460,6 +460,21 @@ export interface ChatThread {
   type?: string
 }
 
+// A single visible reasoning/tool step of an assistant turn (mirrors the
+// chatStep the Go backend extracts from agent-inference parts).
+export interface ChatStep {
+  kind: string // "thought" | "tool"
+  text: string
+  tool?: string
+}
+
+// One rendered message of a thread's history.
+export interface ChatHistoryMessage {
+  role: 'user' | 'assistant'
+  text: string
+  steps?: ChatStep[]
+}
+
 export interface ChatAccountRef {
   token_v2: string
   user_id?: string
@@ -492,10 +507,25 @@ export async function chatThreads(ref: { token_v2: string; user_id?: string; spa
   return Array.isArray(data?.threads) ? data.threads : []
 }
 
+// chatHistory loads a single thread's full message history (user turns +
+// assistant turns with their visible steps) so the UI can show it when the
+// user clicks a chat instead of starting from a blank view.
+export async function chatHistory(ref: { token_v2: string; user_id?: string; space_id: string; thread_id: string }): Promise<ChatHistoryMessage[]> {
+  const resp = await fetch('/admin/chat/history', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify(ref),
+  })
+  const data = await jsonOrError(resp)
+  return Array.isArray(data?.messages) ? data.messages : []
+}
+
 export interface ChatSendResult {
   thread_id: string
   title?: string
   text: string
+  steps?: ChatStep[]
 }
 
 export async function chatSend(params: ChatAccountRef & {
