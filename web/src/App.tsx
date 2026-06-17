@@ -2,6 +2,35 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { addAccount, discoverWorkspaces, checkAuth, login as apiLogin, logout as apiLogout } from './api'
 import { WorkspacePool, type DiscoveredAccount } from './components/WorkspacePool'
 
+// Pull the persisted accounts + their workspaces straight from the server so
+// the pool shows up even in a fresh browser / incognito window where the
+// localStorage cache (nmp_discovered_workspaces) is empty. The /admin/workspaces
+// endpoint returns the same shape we cache locally, so the two merge cleanly.
+async function fetchServerWorkspaces(): Promise<DiscoveredAccount[]> {
+  const resp = await fetch('/admin/workspaces', {
+    headers: { Accept: 'application/json' },
+    credentials: 'same-origin',
+  })
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+  const data = await resp.json()
+  if (!Array.isArray(data)) return []
+  return (data as Array<{
+    user_id?: string
+    user_name?: string
+    user_email?: string
+    token_v2?: string
+    spaces?: DiscoveredAccount['spaces']
+  }>)
+    .filter(a => a.token_v2 && a.spaces && a.spaces.length > 0)
+    .map(a => ({
+      user_id: a.user_id,
+      user_name: a.user_name,
+      user_email: a.user_email,
+      token_v2: a.token_v2 as string,
+      spaces: a.spaces as DiscoveredAccount['spaces'],
+    }))
+}
+
 const IconPlus = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
     <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
@@ -257,6 +286,27 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
     } catch { /* ignore */ }
   }, [discovered])
 
+  // При загрузке подтягиваем пул с сервера, чтобы пространства появлялись
+  // даже когда локальный кэш пуст (например, в режиме инкогнито).
+  // Данные сервера приоритетнее — они накладываются поверх кэша.
+  const [hydrating, setHydrating] = useState(true)
+  useEffect(() => {
+    let cancelled = false
+    fetchServerWorkspaces()
+      .then(serverAccounts => {
+        if (cancelled || serverAccounts.length === 0) return
+        setDiscovered(prev => {
+          const byKey = new Map<string, DiscoveredAccount>()
+          for (const a of prev) byKey.set(a.user_email || a.token_v2, a)
+          for (const a of serverAccounts) byKey.set(a.user_email || a.token_v2, a)
+          return Array.from(byKey.values())
+        })
+      })
+      .catch(() => { /* server hydration is best-effort */ })
+      .finally(() => { if (!cancelled) setHydrating(false) })
+    return () => { cancelled = true }
+  }, [])
+
   const upsertDiscovered = useCallback((acc: DiscoveredAccount) => {
     setDiscovered(prev => {
       const key = acc.user_email || acc.token_v2
@@ -277,21 +327,25 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
 
       <main className="max-w-[1100px] mx-auto px-6 py-10">
         {discovered.length === 0 ? (
-          <div className="text-center py-16 px-6 bg-bg-secondary border border-border rounded-2xl">
-            <div className="w-12 h-12 mx-auto mb-4 rounded-xl bg-bg-card border border-border flex items-center justify-center text-text-muted shadow-card">
-              <IconPlus />
+          hydrating ? (
+            <div className="text-center py-16 px-6 text-text-muted text-[13px]">Загрузка рабочих пространств...</div>
+          ) : (
+            <div className="text-center py-16 px-6 bg-bg-secondary border border-border rounded-2xl">
+              <div className="w-12 h-12 mx-auto mb-4 rounded-xl bg-bg-card border border-border flex items-center justify-center text-text-muted shadow-card">
+                <IconPlus />
+              </div>
+              <div className="text-[16px] font-medium text-text-primary mb-1">Пока нет рабочих пространств</div>
+              <p className="text-[13px] text-text-muted max-w-sm mx-auto mb-5">
+                Нажмите «Добавить аккаунт» — все пространства токена появятся здесь автоматически.
+              </p>
+              <button
+                onClick={() => setShowAddModal(true)}
+                className="inline-flex items-center gap-2 h-9 px-4 bg-white hover:bg-white/90 text-black rounded-full text-[13px] font-medium cursor-pointer transition-colors border-none"
+              >
+                <IconPlus /> Добавить аккаунт
+              </button>
             </div>
-            <div className="text-[16px] font-medium text-text-primary mb-1">Пока нет рабочих пространств</div>
-            <p className="text-[13px] text-text-muted max-w-sm mx-auto mb-5">
-              Нажмите «Добавить аккаунт» — все пространства токена появятся здесь автоматически.
-            </p>
-            <button
-              onClick={() => setShowAddModal(true)}
-              className="inline-flex items-center gap-2 h-9 px-4 bg-white hover:bg-white/90 text-black rounded-full text-[13px] font-medium cursor-pointer transition-colors border-none"
-            >
-              <IconPlus /> Добавить аккаунт
-            </button>
-          </div>
+          )
         ) : (
           <WorkspacePool accounts={discovered} onRemoveAccount={removeDiscovered} onPaid={() => {}} />
         )}
