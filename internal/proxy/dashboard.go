@@ -24,6 +24,16 @@ type DashboardAuth struct {
 
 // NewDashboardAuth creates a new auth manager.
 func NewDashboardAuth(adminPasswordHash, apiKey string) *DashboardAuth {
+	if adminPasswordHash != "" {
+		// One-time diagnostic line. Lets the operator independently verify the
+		// expected login hash: it must equal SHA256(salt + password) where the
+		// password is exactly the bytes you intend to type in the browser. If
+		// your password is non-ASCII (e.g. Cyrillic) and these don't match what
+		// the browser computes, the password got mangled by the console code
+		// page — set it in config.yaml (UTF-8) instead of via --password.
+		log.Printf("[dashboard] auth configured — salt=%q expectedHash=%s",
+			AdminPasswordSalt(adminPasswordHash), AdminPasswordHash(adminPasswordHash))
+	}
 	return &DashboardAuth{
 		adminPasswordHash: adminPasswordHash,
 		apiKey:            apiKey,
@@ -200,6 +210,8 @@ func (da *DashboardAuth) HandleAuthSalt() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		salt := AdminPasswordSalt(da.adminPasswordHash)
+		log.Printf("[dashboard] auth/salt from %s — required=%v salt=%q (expectedHash=%s)",
+			dashboardClientIP(r), da.HasAdminPassword(), salt, AdminPasswordHash(da.adminPasswordHash))
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"salt":     salt,
 			"required": da.HasAdminPassword(),
@@ -234,13 +246,29 @@ func (da *DashboardAuth) HandleAuthLogin() http.HandlerFunc {
 			Hash string `json:"hash"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			log.Printf("[dashboard] login from %s — bad request body: %v", ip, err)
 			http.Error(w, `{"error":"invalid body"}`, http.StatusBadRequest)
 			return
 		}
 
-		if !VerifyAdminPassword(da.adminPasswordHash, body.Hash) {
+		// Verbose diagnostics: print the salt, the hash the browser sent, and
+		// the hash we expect. If clientHash != expectedHash the password bytes
+		// differ between the server (set at startup) and the browser — almost
+		// always a non-ASCII password mangled by the Windows console code page
+		// when passed via --password. Compare expectedHash here with the
+		// startup "auth configured" line and with SHA256(salt+yourPassword).
+		expectedHash := AdminPasswordHash(da.adminPasswordHash)
+		salt := AdminPasswordSalt(da.adminPasswordHash)
+		match := VerifyAdminPassword(da.adminPasswordHash, body.Hash)
+		log.Printf("[dashboard] login attempt from %s — salt=%q clientHashLen=%d clientHash=%s expectedHash=%s match=%v",
+			ip, salt, len(body.Hash), body.Hash, expectedHash, match)
+
+		if !match {
 			da.recordLoginFailure(ip)
-			log.Printf("[dashboard] failed login attempt from %s", ip)
+			log.Printf("[dashboard] FAILED login from %s — client hash did not match stored hash. "+
+				"Likely a wrong password, or (for non-ASCII passwords) a character-encoding "+
+				"mismatch between the console that launched the server and the browser. "+
+				"Try an ASCII-only password, or set admin_password in config.yaml (read as UTF-8).", ip)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			json.NewEncoder(w).Encode(map[string]string{"error": "invalid password"})
