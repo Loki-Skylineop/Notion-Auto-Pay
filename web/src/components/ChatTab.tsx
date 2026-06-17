@@ -5,6 +5,7 @@ import {
   chatHistory,
   chatModels,
   chatStream,
+  chatThreads,
   type ChatAgent,
   type ChatModel,
   type ChatStatus,
