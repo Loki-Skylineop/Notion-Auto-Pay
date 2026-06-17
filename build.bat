@@ -47,7 +47,7 @@ if not defined DASH_PASSWORD if defined DASHBOARD_PASSWORD set "DASH_PASSWORD=!D
 
 REM --- Аргументы запуска. Без пароля передаём --no-password, чтобы сервер
 REM     игнорировал любой admin_password из config.yaml и панель была реально
-REM     открыта (иначе старый/забытый пароль из config.yaml блокирует вход). ---
+REM     открыта, иначе старый пароль из config.yaml блокирует вход. ---
 set "RUN_ARGS="
 if defined DASH_PASSWORD (
   set "RUN_ARGS=--password=!DASH_PASSWORD!"
@@ -129,7 +129,7 @@ if defined DASH_PASSWORD (
   echo Веб-панель защищена паролем. Включён лимит попыток входа.
   echo Текущий пароль: !DASH_PASSWORD!
 ) else (
-  echo Веб-панель открыта без пароля (--no-password). Чтобы включить: build.bat --password=ВашПароль
+  echo Веб-панель открыта без пароля [--no-password]. Чтобы включить: build.bat --password=ВашПароль
 )
 echo Дашборд будет доступен на http://localhost:8081/dashboard/
 echo Для остановки нажмите Ctrl+C
