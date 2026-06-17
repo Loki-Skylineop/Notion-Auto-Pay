@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   chatAgents,
+  chatDelete,
   chatHistory,
-  chatSend,
-  chatThreads,
+  chatModels,
+  chatStream,
   type ChatAgent,
+  type ChatModel,
+  type ChatStatus,
   type ChatStep,
   type ChatThread,
 } from '../api'
@@ -15,6 +18,11 @@ import type { DiscoveredAccount } from './WorkspacePool'
 // left can never push the message composer below the fold — instead each pane
 // (thread list / message log) scrolls independently. See the min-h-0 children.
 const gridStyle: React.CSSProperties = { height: 'calc(100vh - 190px)' }
+
+// How many messages to render initially, and how many more to reveal each time
+// the user scrolls to the top of the log. Keeping the rendered set small keeps
+// very long threads snappy (lazy loading).
+const PAGE_SIZE = 30
 
 interface SpaceOption {
   key: string
@@ -79,6 +87,15 @@ function CopyIcon() {
     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
       <rect x="9" y="9" width="13" height="13" rx="2" />
       <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </svg>
+  )
+}
+
+function TrashIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="3 6 5 6 21 6" />
+      <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
     </svg>
   )
 }
@@ -339,14 +356,21 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const [spaceKey, setSpaceKey] = useState('')
   const [agents, setAgents] = useState<ChatAgent[]>([])
   const [agentId, setAgentId] = useState('default')
+  const [models, setModels] = useState<ChatModel[]>([])
+  const [selectedModel, setSelectedModel] = useState('')
   const [threads, setThreads] = useState<ChatThread[]>([])
   const [activeThreadId, setActiveThreadId] = useState('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
+  const [status, setStatus] = useState<ChatStatus | null>(null)
   const [historyLoading, setHistoryLoading] = useState(false)
   const [error, setError] = useState('')
+  // Lazy loading: only the last `visibleCount` messages are rendered; scrolling
+  // to the top reveals more.
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  const logRef = useRef<HTMLDivElement>(null)
 
   // Load server auto-pay config once — used to keep auto-pay-armed spaces in
   // the picker even when they are still on the free tier.
@@ -426,13 +450,68 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     }
   }, [activeSpace])
 
+  // Load the model list for the built-in assistant whenever the space changes,
+  // defaulting to Opus 4.8 (ambrosia-tart-high) when available.
+  useEffect(() => {
+    if (!activeSpace) {
+      setModels([])
+      return
+    }
+    let cancelled = false
+    chatModels({
+      token_v2: activeSpace.account.token_v2,
+      user_id: activeSpace.account.user_id,
+      space_id: activeSpace.spaceId,
+    })
+      .then((m) => {
+        if (cancelled) return
+        setModels(m)
+        const enabled = m.filter((x) => !x.disabled)
+        setSelectedModel((prev) => {
+          if (prev && enabled.some((x) => x.id === prev)) return prev
+          const opus = enabled.find((x) => x.id === 'ambrosia-tart-high')
+          return opus ? opus.id : enabled[0]?.id || ''
+        })
+      })
+      .catch(() => {
+        if (!cancelled) setModels([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [activeSpace])
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, sending, historyLoading])
 
+  // Only the tail of the conversation is rendered (lazy loading). Older
+  // messages are revealed PAGE_SIZE at a time when the user scrolls up.
+  const visibleMessages = useMemo(
+    () => messages.slice(Math.max(0, messages.length - visibleCount)),
+    [messages, visibleCount],
+  )
+  const hiddenCount = messages.length - visibleMessages.length
+
+  const onLogScroll = useCallback(() => {
+    const el = logRef.current
+    if (!el || el.scrollTop >= 40) return
+    setVisibleCount((c) => {
+      if (c >= messages.length) return c
+      const prevHeight = el.scrollHeight
+      // Preserve the scroll position after the taller list renders so the view
+      // doesn't jump when older messages are prepended.
+      requestAnimationFrame(() => {
+        if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight - prevHeight
+      })
+      return Math.min(messages.length, c + PAGE_SIZE)
+    })
+  }, [messages.length])
+
   const startNewChat = useCallback(() => {
     setActiveThreadId('')
     setMessages([])
+    setVisibleCount(PAGE_SIZE)
     setError('')
   }, [])
 
@@ -443,6 +522,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       setActiveThreadId(t.id)
       setError('')
       setMessages([])
+      setVisibleCount(PAGE_SIZE)
       setHistoryLoading(true)
       try {
         const hist = await chatHistory({
@@ -461,6 +541,28 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     [activeSpace],
   )
 
+  // Delete (archive) a thread from the sidebar. Optimistically removes it from
+  // the list; if it was the open thread, reset to a fresh chat.
+  const deleteThread = useCallback(
+    async (t: ChatThread, e: React.MouseEvent) => {
+      e.stopPropagation()
+      if (!activeSpace) return
+      setThreads((prev) => prev.filter((x) => x.id !== t.id))
+      if (t.id === activeThreadId) startNewChat()
+      try {
+        await chatDelete({
+          token_v2: activeSpace.account.token_v2,
+          user_id: activeSpace.account.user_id,
+          space_id: activeSpace.spaceId,
+          thread_id: t.id,
+        })
+      } catch {
+        // Already removed from the UI; ignore backend failures.
+      }
+    },
+    [activeSpace, activeThreadId, startNewChat],
+  )
+
   const handleSend = useCallback(async () => {
     const msg = input.trim()
     if (!msg || !activeSpace || sending) return
@@ -468,20 +570,25 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     setInput('')
     setMessages((prev) => [...prev, { role: 'user', text: msg }])
     setSending(true)
+    setStatus(null)
     try {
-      const res = await chatSend({
-        token_v2: activeSpace.account.token_v2,
-        user_id: activeSpace.account.user_id,
-        user_name: activeSpace.account.user_name,
-        user_email: activeSpace.account.user_email,
-        space_id: activeSpace.spaceId,
-        space_view_id: activeSpace.spaceViewId,
-        space_name: activeSpace.spaceName,
-        timezone: browserTimezone(),
-        agent: agentId,
-        thread_id: activeThreadId || undefined,
-        message: msg,
-      })
+      const res = await chatStream(
+        {
+          token_v2: activeSpace.account.token_v2,
+          user_id: activeSpace.account.user_id,
+          user_name: activeSpace.account.user_name,
+          user_email: activeSpace.account.user_email,
+          space_id: activeSpace.spaceId,
+          space_view_id: activeSpace.spaceViewId,
+          space_name: activeSpace.spaceName,
+          timezone: browserTimezone(),
+          agent: agentId,
+          model: agentId === 'default' ? selectedModel || undefined : undefined,
+          thread_id: activeThreadId || undefined,
+          message: msg,
+        },
+        (s) => setStatus(s),
+      )
       if (res.thread_id && res.thread_id !== activeThreadId) {
         setActiveThreadId(res.thread_id)
         setThreads((prev) => {
@@ -498,8 +605,9 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       setMessages((prev) => [...prev, { role: 'assistant', text: '⚠️ Не удалось получить ответ. Попробуйте ещё раз.' }])
     } finally {
       setSending(false)
+      setStatus(null)
     }
-  }, [input, activeSpace, sending, agentId, activeThreadId])
+  }, [input, activeSpace, sending, agentId, selectedModel, activeThreadId])
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -518,6 +626,8 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       </div>
     )
   }
+
+  const showModelPicker = agentId === 'default' && models.filter((m) => !m.disabled).length > 0
 
   return (
     <div className="grid grid-cols-1 md:grid-cols-[280px_1fr] gap-4 overflow-hidden" style={gridStyle}>
@@ -571,19 +681,31 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
             <div className="text-xs text-text-muted py-2">Пока нет чатов</div>
           ) : (
             threads.map((t) => (
-              <button
+              <div
                 key={t.id}
-                type="button"
-                onClick={() => openThread(t)}
-                className={`w-full text-left px-2.5 py-2 rounded-lg text-sm truncate transition-colors border-none cursor-pointer ${
-                  t.id === activeThreadId
-                    ? 'bg-bg-card text-text-primary'
-                    : 'bg-transparent text-text-secondary hover:bg-bg-secondary'
+                className={`group flex items-center rounded-lg transition-colors ${
+                  t.id === activeThreadId ? 'bg-bg-card' : 'hover:bg-bg-secondary'
                 }`}
-                title={t.title || 'Без названия'}
               >
-                {t.title || 'Без названия'}
-              </button>
+                <button
+                  type="button"
+                  onClick={() => openThread(t)}
+                  className={`flex-1 min-w-0 text-left px-2.5 py-2 rounded-lg text-sm truncate bg-transparent border-none cursor-pointer ${
+                    t.id === activeThreadId ? 'text-text-primary' : 'text-text-secondary'
+                  }`}
+                  title={t.title || 'Без названия'}
+                >
+                  {t.title || 'Без названия'}
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => deleteThread(t, e)}
+                  title="Удалить чат"
+                  className="shrink-0 mr-1 w-7 h-7 flex items-center justify-center rounded-md text-text-muted hover:text-err hover:bg-bg-secondary bg-transparent border-none cursor-pointer opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
+                >
+                  <TrashIcon />
+                </button>
+              </div>
             ))
           )}
         </div>
@@ -591,12 +713,18 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
 
       {/* Conversation pane: scrollable message log + pinned composer */}
       <section className="flex flex-col min-h-0 overflow-hidden rounded-xl border border-border bg-bg-secondary">
-        <div className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
+        <div ref={logRef} onScroll={onLogScroll} className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
           {messages.length === 0 && !historyLoading && !sending ? (
             <div className="h-full flex items-center justify-center text-center text-text-muted text-sm px-6">
               {activeSpace
                 ? 'Напишите сообщение, чтобы начать диалог с агентом.'
                 : 'Выберите пространство с платным планом или включённой автооплатой.'}
+            </div>
+          ) : null}
+
+          {hiddenCount > 0 ? (
+            <div className="text-center text-[11px] text-text-muted py-1">
+              Прокрутите вверх, чтобы загрузить ещё · {hiddenCount}
             </div>
           ) : null}
 
@@ -607,29 +735,37 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
             </div>
           ) : null}
 
-          {messages.map((msg, idx) => (
-            <div key={idx} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
-              <div
-                className={`max-w-[85%] px-3.5 py-2.5 rounded-2xl text-[14px] leading-relaxed ${
-                  msg.role === 'user'
-                    ? 'bg-white text-black rounded-br-sm'
-                    : 'bg-bg-card border border-border text-text-primary rounded-bl-sm'
-                }`}
-              >
-                {msg.role === 'assistant' && msg.steps && msg.steps.length > 0 ? <StepsBlock steps={msg.steps} /> : null}
-                <MessageBody text={msg.text} />
+          {visibleMessages.map((msg, idx) => {
+            const gi = hiddenCount + idx
+            return (
+              <div key={gi} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
+                <div
+                  className={`max-w-[85%] px-3.5 py-2.5 rounded-2xl text-[14px] leading-relaxed ${
+                    msg.role === 'user'
+                      ? 'bg-white text-black rounded-br-sm'
+                      : 'bg-bg-card border border-border text-text-primary rounded-bl-sm'
+                  }`}
+                >
+                  {msg.role === 'assistant' && msg.steps && msg.steps.length > 0 ? <StepsBlock steps={msg.steps} /> : null}
+                  <MessageBody text={msg.text} />
+                </div>
+                <CopyButton text={msg.text} />
               </div>
-              <CopyButton text={msg.text} />
-            </div>
-          ))}
+            )
+          })}
 
           {sending ? (
-            <div className="flex flex-col items-start">
-              <div className="max-w-[85%] px-3.5 py-2.5 rounded-2xl rounded-bl-sm bg-bg-card border border-border">
-                <div className="flex items-center gap-2 text-text-muted text-[13px]">
+            <div className="flex flex-col items-start w-full">
+              <div className="max-w-[85%] w-full px-3.5 py-2.5 rounded-2xl rounded-bl-sm bg-bg-card border border-border">
+                <div className="flex items-center gap-2 text-text-primary text-[13px] font-medium">
                   <span className="inline-block w-3 h-3 rounded-full border-2 border-text-muted border-t-transparent animate-spin" />
-                  Агент работает…
+                  {status?.label || 'Агент работает…'}
                 </div>
+                {status?.detail ? (
+                  <div className="mt-1.5 text-[12px] leading-snug text-text-muted whitespace-pre-wrap max-h-40 overflow-y-auto">
+                    {status.detail}
+                  </div>
+                ) : null}
               </div>
             </div>
           ) : null}
@@ -652,6 +788,23 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
               disabled={!activeSpace || sending}
               className="flex-1 resize-none max-h-32 px-3 py-2 rounded-lg bg-bg-input border border-border text-text-primary text-sm focus:outline-none focus:border-notion-blue disabled:opacity-50"
             />
+            {showModelPicker ? (
+              <select
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value)}
+                disabled={sending}
+                title="Модель агента"
+                className="shrink-0 max-w-[150px] px-2 py-2 rounded-lg bg-bg-input border border-border text-text-primary text-[13px] focus:outline-none focus:border-notion-blue disabled:opacity-50 cursor-pointer"
+              >
+                {models
+                  .filter((m) => !m.disabled)
+                  .map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label}
+                    </option>
+                  ))}
+              </select>
+            ) : null}
             <button
               type="button"
               onClick={handleSend}
