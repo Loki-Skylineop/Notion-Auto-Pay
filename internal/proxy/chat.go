@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
@@ -18,11 +18,16 @@ import (
 // existing thread, and stream the assistant reply.
 //
 // The request/response shapes were reverse-engineered from the real web client
-// (chat.com.har). Key facts:
+// (chat.com.har / 123chat.com.har). Key facts:
 //   - runInferenceTranscript returns an application/x-ndjson patch stream. The
 //     final assistant text lives in the closing record-map under
 //     thread_message -> step(type="agent-inference") -> value[] where each part
-//     is {type:"thinking"|"text", content}. We keep only the "text" parts.
+//     is {type:"thinking"|"text"|"tool_use", content/name}. We keep "text" as
+//     the answer and surface "thinking"/"tool_use" parts as visible steps.
+//   - A thread record (table:"thread") carries an ordered messages[] array of
+//     thread_message ids. The message bodies are NOT in the transcript-list
+//     responses; they are fetched by id via syncRecordValuesSpaceInitial. That
+//     is how HandleChatHistory rebuilds a past conversation.
 //   - A custom agent uses threadParentPointer{table:"workflow",id:workflowId}
 //     with config.isCustomAgent=true and surface="custom_agent". The built-in
 //     assistant uses threadParentPointer{table:"space",id:spaceId},
@@ -233,6 +238,162 @@ func HandleChatThreads(auth *DashboardAuth) http.HandlerFunc {
 	}
 }
 
+// ---- History ----
+
+// chatStep is a single visible reasoning/tool step of an assistant turn.
+type chatStep struct {
+	Kind string `json:"kind"` // "thought" | "tool"
+	Text string `json:"text"`
+	Tool string `json:"tool,omitempty"`
+}
+
+// chatHistMsg is one rendered message of a past conversation.
+type chatHistMsg struct {
+	Role  string     `json:"role"` // "user" | "assistant"
+	Text  string     `json:"text"`
+	Steps []chatStep `json:"steps,omitempty"`
+}
+
+// syncRecordValues fetches one or more records by pointer through the private
+// syncRecordValuesSpaceInitial endpoint (the same one the web client uses to
+// hydrate thread/thread_message records by id). version -1 forces the server
+// to return the full record regardless of any client-known version.
+func syncRecordValues(tokenV2, userID, spaceID string, pointers []map[string]string) ([]byte, error) {
+	reqs := make([]map[string]interface{}, 0, len(pointers))
+	for _, p := range pointers {
+		reqs = append(reqs, map[string]interface{}{"pointer": p, "version": -1})
+	}
+	body, _ := json.Marshal(map[string]interface{}{
+		"requests":     reqs,
+		"spacePointer": map[string]string{"table": "space", "id": spaceID},
+	})
+	resp, err := notionChatRequest(tokenV2, userID, spaceID, "syncRecordValuesSpaceInitial", body, "application/json", chatAPITimeout())
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("syncRecordValues %d: %s", resp.StatusCode, truncate(string(data), 200))
+	}
+	return data, nil
+}
+
+// HandleChatHistory rebuilds the full message history of a single thread so the
+// UI can show it when the user clicks an existing chat. It first loads the
+// thread record to get its ordered messages[] ids, then batch-fetches those
+// thread_message records and folds them into user/assistant turns.
+func HandleChatHistory(auth *DashboardAuth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !chatAuthOK(auth, w, r) {
+			return
+		}
+		var body struct {
+			TokenV2  string `json:"token_v2"`
+			UserID   string `json:"user_id"`
+			SpaceID  string `json:"space_id"`
+			ThreadID string `json:"thread_id"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+		body.TokenV2 = strings.TrimSpace(body.TokenV2)
+		body.SpaceID = strings.TrimSpace(body.SpaceID)
+		body.ThreadID = strings.TrimSpace(body.ThreadID)
+		if body.TokenV2 == "" || body.SpaceID == "" || body.ThreadID == "" {
+			http.Error(w, `{"error":"token_v2, space_id and thread_id are required"}`, http.StatusBadRequest)
+			return
+		}
+
+		// 1. Load the thread record to discover its ordered message ids.
+		threadData, err := syncRecordValues(body.TokenV2, body.UserID, body.SpaceID, []map[string]string{
+			{"table": "thread", "id": body.ThreadID, "spaceId": body.SpaceID},
+		})
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		var tr struct {
+			RecordMap struct {
+				Thread map[string]struct {
+					Value struct {
+						Value struct {
+							Messages []string `json:"messages"`
+						} `json:"value"`
+					} `json:"value"`
+				} `json:"thread"`
+			} `json:"recordMap"`
+		}
+		json.Unmarshal(threadData, &tr)
+		var order []string
+		if t, ok := tr.RecordMap.Thread[body.ThreadID]; ok {
+			order = t.Value.Value.Messages
+		}
+		if len(order) == 0 {
+			json.NewEncoder(w).Encode(map[string]interface{}{"messages": []chatHistMsg{}})
+			return
+		}
+
+		// 2. Batch-fetch the thread_message records by id.
+		pointers := make([]map[string]string, 0, len(order))
+		for _, id := range order {
+			pointers = append(pointers, map[string]string{"table": "thread_message", "id": id, "spaceId": body.SpaceID})
+		}
+		msgData, err := syncRecordValues(body.TokenV2, body.UserID, body.SpaceID, pointers)
+		if err != nil {
+			w.WriteHeader(http.StatusBadGateway)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			return
+		}
+		var wrap struct {
+			RecordMap recordMapShape `json:"recordMap"`
+		}
+		json.Unmarshal(msgData, &wrap)
+
+		// 3. Fold the ordered messages into user/assistant turns.
+		messages := buildHistory(wrap.RecordMap, order)
+		json.NewEncoder(w).Encode(map[string]interface{}{"messages": messages})
+	}
+}
+
+// buildHistory walks the thread's messages[] in canonical order, emitting a
+// user message per "user" step and grouping the agent-inference steps that
+// follow it into a single assistant turn (steps + concatenated answer text).
+func buildHistory(rm recordMapShape, order []string) []chatHistMsg {
+	out := []chatHistMsg{}
+	var cur *chatHistMsg
+	flush := func() {
+		if cur != nil {
+			out = append(out, *cur)
+			cur = nil
+		}
+	}
+	for _, id := range order {
+		rec, ok := rm.ThreadMessage[id]
+		if !ok {
+			continue
+		}
+		step := rec.Value.Value.Step
+		switch step.Type {
+		case "user":
+			flush()
+			out = append(out, chatHistMsg{Role: "user", Text: parseUserText(step.Value)})
+		case "agent-inference":
+			st, t := parseInferenceParts(step.Value)
+			if cur == nil {
+				cur = &chatHistMsg{Role: "assistant"}
+			}
+			cur.Steps = append(cur.Steps, st...)
+			cur.Text += t
+		}
+	}
+	flush()
+	return out
+}
+
 // ---- Send ----
 
 // buildChatConfig returns the transcript config block. The flag set is copied
@@ -304,7 +465,8 @@ func buildChatConfig(isCustom bool, workflowID string) map[string]interface{} {
 
 // HandleChatSend runs one chat turn: it builds the transcript (config + context
 // + user message), POSTs runInferenceTranscript, parses the ndjson reply and
-// returns the assistant text, the thread id and the (auto-generated) title.
+// returns the assistant text, the agent steps, the thread id and the
+// (auto-generated) title.
 func HandleChatSend(auth *DashboardAuth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -439,7 +601,7 @@ func HandleChatSend(auth *DashboardAuth) http.HandlerFunc {
 			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("notion error %d: %s", resp.StatusCode, truncate(string(raw), 200))})
 			return
 		}
-		text, title := parseInferenceStream(raw)
+		text, title, steps := parseInferenceStream(raw)
 		if strings.TrimSpace(text) == "" {
 			text = "(агент не вернул текстового ответа)"
 		}
@@ -447,6 +609,7 @@ func HandleChatSend(auth *DashboardAuth) http.HandlerFunc {
 			"thread_id": threadID,
 			"title":     title,
 			"text":      text,
+			"steps":     steps,
 		})
 	}
 }
@@ -458,11 +621,15 @@ type tmStep struct {
 	Value json.RawMessage `json:"value"`
 }
 
+type tmInner struct {
+	ID          string `json:"id"`
+	CreatedTime int64  `json:"created_time"`
+	Step        tmStep `json:"step"`
+}
+
 type tmRecord struct {
 	Value struct {
-		Value struct {
-			Step tmStep `json:"step"`
-		} `json:"value"`
+		Value tmInner `json:"value"`
 	} `json:"value"`
 }
 
@@ -470,43 +637,95 @@ type recordMapShape struct {
 	ThreadMessage map[string]tmRecord `json:"thread_message"`
 }
 
-func extractTM(rm recordMapShape) (text, title string) {
-	bestLen := -1
-	for _, msg := range rm.ThreadMessage {
-		step := msg.Value.Value.Step
-		switch step.Type {
-		case "title":
-			var s string
-			if json.Unmarshal(step.Value, &s) == nil && s != "" {
-				title = s
+type orderedTM struct {
+	created int64
+	step    tmStep
+}
+
+// sortedThreadMessages returns the record-map's thread_message steps ordered by
+// created_time (used when no explicit messages[] order is available, e.g. the
+// live send record-map).
+func sortedThreadMessages(rm recordMapShape) []orderedTM {
+	out := make([]orderedTM, 0, len(rm.ThreadMessage))
+	for _, m := range rm.ThreadMessage {
+		out = append(out, orderedTM{created: m.Value.Value.CreatedTime, step: m.Value.Value.Step})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].created < out[j].created })
+	return out
+}
+
+// parseInferenceParts splits one agent-inference step.value[] into visible
+// steps (thinking + tool_use) and the concatenated answer text.
+func parseInferenceParts(raw json.RawMessage) (steps []chatStep, text string) {
+	var parts []struct {
+		Type    string `json:"type"`
+		Content string `json:"content"`
+		Name    string `json:"name"`
+	}
+	if json.Unmarshal(raw, &parts) != nil {
+		return nil, ""
+	}
+	var b strings.Builder
+	for _, p := range parts {
+		switch p.Type {
+		case "thinking":
+			if strings.TrimSpace(p.Content) != "" {
+				steps = append(steps, chatStep{Kind: "thought", Text: p.Content})
 			}
-		case "agent-inference":
-			var parts []struct {
-				Type    string `json:"type"`
-				Content string `json:"content"`
+		case "tool_use":
+			name := p.Name
+			if name == "" {
+				name = "tool"
 			}
-			if json.Unmarshal(step.Value, &parts) == nil {
-				var b strings.Builder
-				for _, p := range parts {
-					if p.Type == "text" {
-						b.WriteString(p.Content)
-					}
-				}
-				if b.Len() > bestLen {
-					text = b.String()
-					bestLen = b.Len()
-				}
+			steps = append(steps, chatStep{Kind: "tool", Tool: name, Text: name})
+		case "text":
+			b.WriteString(p.Content)
+		}
+	}
+	return steps, b.String()
+}
+
+// parseUserText extracts the plain text of a "user" step value ([["text"]]).
+func parseUserText(raw json.RawMessage) string {
+	var v [][]interface{}
+	if json.Unmarshal(raw, &v) != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, seg := range v {
+		if len(seg) > 0 {
+			if s, ok := seg[0].(string); ok {
+				b.WriteString(s)
 			}
 		}
 	}
-	return text, title
+	return b.String()
+}
+
+// extractTurn folds a record-map (ordered by created_time) into the latest
+// assistant turn: its concatenated text, the title and the visible steps.
+func extractTurn(rm recordMapShape) (text, title string, steps []chatStep) {
+	for _, m := range sortedThreadMessages(rm) {
+		switch m.step.Type {
+		case "title":
+			var s string
+			if json.Unmarshal(m.step.Value, &s) == nil && s != "" {
+				title = s
+			}
+		case "agent-inference":
+			st, t := parseInferenceParts(m.step.Value)
+			steps = append(steps, st...)
+			text += t
+		}
+	}
+	return text, title, steps
 }
 
 // parseInferenceStream walks the ndjson patch stream. It prefers the final,
-// authoritative record-map (which carries the complete agent-inference text);
-// if no record-map is present it falls back to concatenating the streamed
-// "content" deltas.
-func parseInferenceStream(raw []byte) (text, title string) {
+// authoritative record-map (which carries the complete agent-inference text +
+// steps); if no record-map is present it falls back to concatenating the
+// streamed "content" deltas.
+func parseInferenceStream(raw []byte) (text, title string, steps []chatStep) {
 	var fallback strings.Builder
 	for _, line := range strings.Split(string(raw), "\n") {
 		line = strings.TrimSpace(line)
@@ -546,13 +765,15 @@ func parseInferenceStream(raw []byte) (text, title string) {
 				if len(c.ThreadMessage) == 0 {
 					continue
 				}
-				if t, ti := extractTM(c); true {
-					if t != "" {
-						text = t
-					}
-					if ti != "" {
-						title = ti
-					}
+				t, ti, st := extractTurn(c)
+				if t != "" {
+					text = t
+				}
+				if ti != "" {
+					title = ti
+				}
+				if len(st) > 0 {
+					steps = st
 				}
 			}
 		case "patch":
@@ -587,5 +808,5 @@ func parseInferenceStream(raw []byte) (text, title string) {
 	if strings.TrimSpace(text) == "" {
 		text = strings.TrimSpace(fallback.String())
 	}
-	return text, title
+	return text, title, steps
 }
