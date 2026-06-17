@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { addAccount, discoverWorkspaces, checkAuth, login as apiLogin, logout as apiLogout } from './api'
 import { WorkspacePool, type DiscoveredAccount } from './components/WorkspacePool'
+import { ChatTab } from './components/ChatTab'
 
 // Pull the persisted accounts + their workspaces straight from the server so
 // the pool shows up even in a fresh browser / incognito window where the
@@ -87,6 +88,20 @@ function Stat({ value, label }: { value: number; label: string }) {
     <div className="flex flex-col items-center">
       <span className="text-[24px] font-semibold tracking-tight text-text-primary tabular-nums leading-none">{value}</span>
       <span className="text-[12px] text-text-muted mt-1.5">{label}</span>
+    </div>
+  )
+}
+
+// Top-level tab switcher between the payment pool (Оплата) and the AI chat
+// surface (Чат). Kept as a small pill bar centered under the hero.
+function TabBar({ tab, onChange }: { tab: 'pay' | 'chat'; onChange: (t: 'pay' | 'chat') => void }) {
+  const base = 'h-9 px-5 rounded-full text-[13px] font-medium cursor-pointer transition-colors border-none'
+  const active = 'bg-white text-black'
+  const idle = 'bg-transparent text-text-secondary hover:text-text-primary'
+  return (
+    <div className="flex items-center gap-1 mb-8 bg-bg-secondary border border-border rounded-full p-1 w-fit mx-auto">
+      <button onClick={() => onChange('pay')} className={`${base} ${tab === 'pay' ? active : idle}`}>Оплата</button>
+      <button onClick={() => onChange('chat')} className={`${base} ${tab === 'chat' ? active : idle}`}>Чат</button>
     </div>
   )
 }
@@ -270,6 +285,7 @@ function AddAccountModal({ onClose, onDiscovered }: { onClose: () => void; onDis
 
 function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const [showAddModal, setShowAddModal] = useState(false)
+  const [tab, setTab] = useState<'pay' | 'chat'>('pay')
   // Обнаруженные рабочие пространства по каждому добавленному аккаунту.
   // Сохраняются локально, чтобы пул переживал перезагрузку.
   const [discovered, setDiscovered] = useState<DiscoveredAccount[]>(() => {
@@ -326,28 +342,34 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
       <Hero onAdd={() => setShowAddModal(true)} accountCount={accountCount} spaceCount={spaceCount} onLogout={onLogout} />
 
       <main className="max-w-[1100px] mx-auto px-6 py-10">
-        {discovered.length === 0 ? (
-          hydrating ? (
-            <div className="text-center py-16 px-6 text-text-muted text-[13px]">Загрузка рабочих пространств...</div>
-          ) : (
-            <div className="text-center py-16 px-6 bg-bg-secondary border border-border rounded-2xl">
-              <div className="w-12 h-12 mx-auto mb-4 rounded-xl bg-bg-card border border-border flex items-center justify-center text-text-muted shadow-card">
-                <IconPlus />
+        <TabBar tab={tab} onChange={setTab} />
+
+        {tab === 'pay' ? (
+          discovered.length === 0 ? (
+            hydrating ? (
+              <div className="text-center py-16 px-6 text-text-muted text-[13px]">Загрузка рабочих пространств...</div>
+            ) : (
+              <div className="text-center py-16 px-6 bg-bg-secondary border border-border rounded-2xl">
+                <div className="w-12 h-12 mx-auto mb-4 rounded-xl bg-bg-card border border-border flex items-center justify-center text-text-muted shadow-card">
+                  <IconPlus />
+                </div>
+                <div className="text-[16px] font-medium text-text-primary mb-1">Пока нет рабочих пространств</div>
+                <p className="text-[13px] text-text-muted max-w-sm mx-auto mb-5">
+                  Нажмите «Добавить аккаунт» — все пространства токена появятся здесь автоматически.
+                </p>
+                <button
+                  onClick={() => setShowAddModal(true)}
+                  className="inline-flex items-center gap-2 h-9 px-4 bg-white hover:bg-white/90 text-black rounded-full text-[13px] font-medium cursor-pointer transition-colors border-none"
+                >
+                  <IconPlus /> Добавить аккаунт
+                </button>
               </div>
-              <div className="text-[16px] font-medium text-text-primary mb-1">Пока нет рабочих пространств</div>
-              <p className="text-[13px] text-text-muted max-w-sm mx-auto mb-5">
-                Нажмите «Добавить аккаунт» — все пространства токена появятся здесь автоматически.
-              </p>
-              <button
-                onClick={() => setShowAddModal(true)}
-                className="inline-flex items-center gap-2 h-9 px-4 bg-white hover:bg-white/90 text-black rounded-full text-[13px] font-medium cursor-pointer transition-colors border-none"
-              >
-                <IconPlus /> Добавить аккаунт
-              </button>
-            </div>
+            )
+          ) : (
+            <WorkspacePool accounts={discovered} onRemoveAccount={removeDiscovered} onPaid={() => {}} />
           )
         ) : (
-          <WorkspacePool accounts={discovered} onRemoveAccount={removeDiscovered} onPaid={() => {}} />
+          <ChatTab accounts={discovered} />
         )}
       </main>
 
