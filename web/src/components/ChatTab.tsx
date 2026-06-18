@@ -36,9 +36,6 @@ function loadThreadAgents(): Record<string, string> {
   }
 }
 
-const TOOL_LABEL = 'Использую инструмент'
-const THINK_LABEL = 'Размышляю'
-
 interface SpaceOption {
   key: string
   account: DiscoveredAccount
@@ -139,7 +136,9 @@ function ToolWrench() {
 }
 
 // parseTool turns a raw tool id (e.g. "connections.mcpServer_github.get_me")
-// into a friendly label plus connector hints used to pick the icon.
+// into a friendly label plus connector hints used to pick the icon. The Go
+// backend now sends a ready-made label + server, but this stays as a fallback
+// for older payloads and for the live status events.
 function parseTool(tool?: string): { label: string; server?: string; isMcp: boolean } {
   const raw = (tool || '').trim()
   if (!raw) return { label: 'Инструмент', isMcp: false }
@@ -154,7 +153,7 @@ function parseTool(tool?: string): { label: string; server?: string; isMcp: bool
   if (mcp) {
     server = mcp[1].toLowerCase()
     const nice = server.charAt(0).toUpperCase() + server.slice(1)
-    label = `${nice} · ${mcp[2]}`
+    label = `${nice} / ${mcp[2]}`
   } else {
     const seg = t.split('.')
     label = seg.length >= 2 ? seg.slice(-2).join('.') : t
@@ -164,10 +163,12 @@ function parseTool(tool?: string): { label: string; server?: string; isMcp: bool
   return { label, server, isMcp }
 }
 
-function ToolIcon({ tool }: { tool?: string }) {
-  const info = parseTool(tool)
-  if (info.server === 'github') return <GithubMark />
-  if (info.isMcp) return <McpIcon />
+// ToolIcon picks the connector glyph. It prefers the explicit server hint from
+// the backend (e.g. "github"), falling back to parsing the raw tool id.
+function ToolIcon({ tool, server }: { tool?: string; server?: string }) {
+  const srv = (server || parseTool(tool).server || '').toLowerCase()
+  if (srv === 'github') return <GithubMark />
+  if (srv) return <McpIcon />
   return <ToolWrench />
 }
 
@@ -196,22 +197,67 @@ function CopyButton({ text }: { text: string }) {
 
 // --- agent steps (tree view) ---
 
+// DetailBox renders the pretty-printed Input or Response payload of a tool call
+// inside an expanded step row.
+function DetailBox({ title, text }: { title: string; text: string }) {
+  return (
+    <div className="rounded-md border border-border bg-bg-secondary overflow-hidden">
+      <div className="px-2 py-1 border-b border-border text-[10px] uppercase tracking-wide text-text-muted">{title}</div>
+      <pre className="px-2 py-1.5 overflow-x-auto text-[11.5px] font-mono leading-relaxed text-text-secondary whitespace-pre-wrap max-h-72 overflow-y-auto">{text}</pre>
+    </div>
+  )
+}
+
+// StepRow renders a single agent step. Tool steps show a connector icon + label
+// (e.g. "GitHub / get_me") and, when input/result are present, expand on click
+// to reveal the request and response. Thought steps collapse to a one-line
+// preview and expand to the full reasoning text.
 function StepRow({ step }: { step: ChatStep }) {
+  const [open, setOpen] = useState(false)
+
   if (step.kind === 'tool') {
-    const info = parseTool(step.tool || step.text)
+    const label = (step.tool || step.text || 'Инструмент').trim()
+    const hasDetail = !!(step.input || step.result)
     return (
-      <div className="flex items-center gap-2 py-1">
-        <span className="shrink-0 w-4 h-4 flex items-center justify-center text-text-secondary">
-          <ToolIcon tool={step.tool || step.text} />
-        </span>
-        <span className="text-[12.5px] text-text-secondary truncate">{info.label}</span>
+      <div className="py-0.5">
+        <button
+          type="button"
+          onClick={() => hasDetail && setOpen((v) => !v)}
+          className={`w-full flex items-center gap-1.5 text-left bg-transparent border-none p-0 ${hasDetail ? 'cursor-pointer' : 'cursor-default'}`}
+        >
+          <span className="shrink-0 w-3 text-[10px] text-text-muted">{hasDetail ? (open ? '▾' : '▸') : ''}</span>
+          <span className="shrink-0 w-4 h-4 flex items-center justify-center text-text-secondary">
+            <ToolIcon tool={step.tool || step.text} server={step.server} />
+          </span>
+          <span className="text-[12.5px] text-text-secondary truncate">{label}</span>
+        </button>
+        {open && hasDetail ? (
+          <div className="ml-[34px] mt-1 mb-1 space-y-1.5">
+            {step.input ? <DetailBox title="Input" text={step.input} /> : null}
+            {step.result ? <DetailBox title="Response" text={step.result} /> : null}
+          </div>
+        ) : null}
       </div>
     )
   }
+
+  const thought = step.text || ''
+  const oneLine = thought.replace(/\s+/g, ' ').trim()
+  const preview = oneLine.length > 90 ? `${oneLine.slice(0, 90)}…` : oneLine
   return (
-    <div className="flex gap-2 py-1">
-      <span className="shrink-0 mt-0.5">💡</span>
-      <span className="text-[12.5px] text-text-muted whitespace-pre-wrap leading-snug">{step.text}</span>
+    <div className="py-0.5">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="w-full flex items-center gap-1.5 text-left bg-transparent border-none p-0 cursor-pointer"
+      >
+        <span className="shrink-0 w-3 text-[10px] text-text-muted">{open ? '▾' : '▸'}</span>
+        <span className="shrink-0 w-4 h-4 flex items-center justify-center">💭</span>
+        <span className="text-[12.5px] text-text-muted truncate italic">{open ? 'Размышление' : preview || 'Размышление'}</span>
+      </button>
+      {open ? (
+        <div className="ml-[34px] mt-1 mb-1 text-[12px] text-text-muted whitespace-pre-wrap leading-snug">{thought}</div>
+      ) : null}
     </div>
   )
 }
@@ -795,17 +841,40 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       setStatus(null)
       setLiveSteps([])
 
+      // Live status reducer. The backend tags every event with a kind:
+      // "tool" (a connector call, carrying label/server/input/result),
+      // "thought" (streamed reasoning) or "text" (the answer is being written).
+      // We fold tool + thought events into liveSteps so the live tree mirrors
+      // the finished message exactly.
       const onStatus = (s: ChatStatus) => {
         setStatus(s)
         setLiveSteps((prev) => {
-          if (s.label === TOOL_LABEL) {
-            const tool = (s.detail || '').trim()
-            if (!tool) return prev
+          if (s.kind === 'tool') {
+            const label = (s.tool || s.detail || '').trim()
+            if (!label) return prev
+            const next: ChatStep = {
+              kind: 'tool',
+              text: label,
+              tool: label,
+              server: s.server || '',
+              input: s.input || '',
+              result: s.result || '',
+            }
             const last = prev[prev.length - 1]
-            if (last && last.kind === 'tool' && last.tool === tool) return prev
-            return [...prev, { kind: 'tool', text: tool, tool }]
+            if (last && last.kind === 'tool' && last.tool === label) {
+              return [
+                ...prev.slice(0, -1),
+                {
+                  ...last,
+                  server: next.server || last.server,
+                  input: next.input || last.input,
+                  result: next.result || last.result,
+                },
+              ]
+            }
+            return [...prev, next]
           }
-          if (s.label === THINK_LABEL) {
+          if (s.kind === 'thought') {
             const thought = s.detail || ''
             const last = prev[prev.length - 1]
             if (last && last.kind === 'thought') {
@@ -999,10 +1068,6 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
                 {liveSteps.length > 0 ? (
                   <div className="mt-2">
                     <StepsTree steps={liveSteps} />
-                  </div>
-                ) : status?.detail ? (
-                  <div className="mt-1.5 text-[12px] leading-snug text-text-muted whitespace-pre-wrap max-h-40 overflow-y-auto">
-                    {status.detail}
                   </div>
                 ) : null}
               </div>
