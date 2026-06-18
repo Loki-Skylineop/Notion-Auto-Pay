@@ -358,9 +358,12 @@ func HandleChatDelete(auth *DashboardAuth) http.HandlerFunc {
 
 // chatStep is a single visible reasoning/tool step of an assistant turn.
 type chatStep struct {
-	Kind string `json:"kind"` // "thought" | "tool"
-	Text string `json:"text"`
-	Tool string `json:"tool,omitempty"`
+	Kind   string `json:"kind"`             // "thought" | "tool"
+	Text   string `json:"text"`             // thought text, or tool label
+	Tool   string `json:"tool,omitempty"`   // display label, e.g. "GitHub / get_me"
+	Server string `json:"server,omitempty"` // icon hint, e.g. "github"
+	Input  string `json:"input,omitempty"`  // pretty-printed input arguments
+	Result string `json:"result,omitempty"` // pretty-printed tool result
 }
 
 // chatHistMsg is one rendered message of a past conversation.
@@ -368,6 +371,162 @@ type chatHistMsg struct {
 	Role  string     `json:"role"` // "user" | "assistant"
 	Text  string     `json:"text"`
 	Steps []chatStep `json:"steps,omitempty"`
+}
+
+// ---- tool-call presentation helpers ----
+
+// serverLabel turns an MCP connector key into a display name ("github" -> "GitHub").
+func serverLabel(s string) string {
+	switch strings.ToLower(s) {
+	case "github":
+		return "GitHub"
+	case "":
+		return "MCP"
+	default:
+		return strings.ToUpper(s[:1]) + s[1:]
+	}
+}
+
+func isMeaningful(raw json.RawMessage) bool {
+	s := strings.TrimSpace(string(raw))
+	return s != "" && s != "null" && s != "{}" && s != "[]"
+}
+
+func clip(s string, n int) string {
+	if len(s) > n {
+		return s[:n] + "\n… (обрезано)"
+	}
+	return s
+}
+
+func prettyJSON(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var v interface{}
+	if json.Unmarshal(raw, &v) != nil {
+		return clip(strings.TrimSpace(string(raw)), 4000)
+	}
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return clip(strings.TrimSpace(string(raw)), 4000)
+	}
+	return clip(string(b), 4000)
+}
+
+func prettyMaybeJSON(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	var v interface{}
+	if json.Unmarshal([]byte(s), &v) == nil {
+		if b, err := json.MarshalIndent(v, "", "  "); err == nil {
+			return clip(string(b), 4000)
+		}
+	}
+	return clip(s, 4000)
+}
+
+// describeToolCall turns a callFunction input ({function, args}) into a human
+// label, an icon hint (connector key) and the pretty-printed input arguments.
+// For MCP connectors it digs into args.toolName / args.toolArguments so the
+// label reads e.g. "GitHub / get_me" instead of the wrapper "runTool".
+func describeToolCall(fn string, args json.RawMessage) (label, server, input string) {
+	fn = strings.TrimSpace(fn)
+	short := fn
+	for _, p := range []string{"connections.", "adminUserConnections.", "userConnections."} {
+		if strings.HasPrefix(short, p) {
+			short = strings.TrimPrefix(short, p)
+			break
+		}
+	}
+	module := short
+	method := ""
+	if i := strings.Index(short, "."); i >= 0 {
+		module = short[:i]
+		method = short[i+1:]
+	}
+	if strings.HasPrefix(module, "mcpServer") {
+		srv := strings.TrimPrefix(module, "mcpServer")
+		srv = strings.TrimPrefix(srv, "_")
+		server = strings.ToLower(srv)
+		var a struct {
+			ToolName      string          `json:"toolName"`
+			ToolArguments json.RawMessage `json:"toolArguments"`
+		}
+		_ = json.Unmarshal(args, &a)
+		if method == "listTools" {
+			return serverLabel(server) + ": список инструментов", server, ""
+		}
+		tn := a.ToolName
+		if tn == "" {
+			tn = method
+		}
+		label = serverLabel(server) + " / " + tn
+		if isMeaningful(a.ToolArguments) {
+			input = prettyJSON(a.ToolArguments)
+		}
+		return label, server, input
+	}
+	label = short
+	if isMeaningful(args) {
+		input = prettyJSON(args)
+	}
+	return label, "", input
+}
+
+// resultString prefers the structured result object, falling back to the raw
+// output string (which is itself often JSON).
+func resultString(output, result json.RawMessage) string {
+	if isMeaningful(result) {
+		return prettyJSON(result)
+	}
+	if len(output) > 0 && strings.TrimSpace(string(output)) != "null" {
+		var s string
+		if json.Unmarshal(output, &s) == nil {
+			return prettyMaybeJSON(s)
+		}
+		return prettyJSON(output)
+	}
+	return ""
+}
+
+// parseToolResultStep folds one agent-tool-result step into a tool chatStep,
+// pulling label/input from step.input.function and result from output/result.
+func parseToolResultStep(s tmStep) chatStep {
+	inputRaw := s.Input
+	outputRaw := s.Output
+	resultRaw := s.Result
+	toolName := s.ToolName
+	if len(inputRaw) == 0 && len(s.Value) > 0 {
+		var v struct {
+			ToolName string          `json:"toolName"`
+			Input    json.RawMessage `json:"input"`
+			Output   json.RawMessage `json:"output"`
+			Result   json.RawMessage `json:"result"`
+		}
+		if json.Unmarshal(s.Value, &v) == nil {
+			inputRaw = v.Input
+			outputRaw = v.Output
+			resultRaw = v.Result
+			toolName = v.ToolName
+		}
+	}
+	var in struct {
+		Function string          `json:"function"`
+		Args     json.RawMessage `json:"args"`
+	}
+	_ = json.Unmarshal(inputRaw, &in)
+	label, server, input := describeToolCall(in.Function, in.Args)
+	if label == "" {
+		if toolName != "" {
+			label = toolName
+		} else {
+			label = "Инструмент"
+		}
+	}
+	return chatStep{Kind: "tool", Tool: label, Text: label, Server: server, Input: input, Result: resultString(outputRaw, resultRaw)}
 }
 
 // syncRecordValues fetches one or more records by pointer through the private
@@ -494,6 +653,11 @@ func buildHistory(rm recordMapShape, order []string) []chatHistMsg {
 			}
 			cur.Steps = append(cur.Steps, st...)
 			cur.Text += t
+		case "agent-tool-result":
+			if cur == nil {
+				cur = &chatHistMsg{Role: "assistant"}
+			}
+			cur.Steps = append(cur.Steps, parseToolResultStep(step))
 		}
 	}
 	flush()
@@ -733,18 +897,22 @@ func HandleChatSend(auth *DashboardAuth) http.HandlerFunc {
 type sMeta struct {
 	typ       string
 	tool      string
+	server    string
+	label     string
+	input     string
+	result    string
 	thinking  string
 	partTypes []string
 }
 
 func metaFromItem(raw json.RawMessage) sMeta {
 	var it struct {
-		Type     string `json:"type"`
-		ToolName string `json:"toolName"`
-		Input    struct {
-			Function string `json:"function"`
-		} `json:"input"`
-		Value []struct {
+		Type     string          `json:"type"`
+		ToolName string          `json:"toolName"`
+		Input    json.RawMessage `json:"input"`
+		Output   json.RawMessage `json:"output"`
+		Result   json.RawMessage `json:"result"`
+		Value    []struct {
 			Type    string `json:"type"`
 			Content string `json:"content"`
 		} `json:"value"`
@@ -754,11 +922,22 @@ func metaFromItem(raw json.RawMessage) sMeta {
 		return m
 	}
 	m.typ = it.Type
-	if it.Input.Function != "" {
-		m.tool = it.Input.Function
-	} else {
-		m.tool = it.ToolName
+	if len(it.Input) > 0 || it.ToolName != "" {
+		var in struct {
+			Function string          `json:"function"`
+			Args     json.RawMessage `json:"args"`
+		}
+		_ = json.Unmarshal(it.Input, &in)
+		label, server, input := describeToolCall(in.Function, in.Args)
+		if label == "" {
+			label = it.ToolName
+		}
+		m.tool = in.Function
+		m.label = label
+		m.server = server
+		m.input = input
 	}
+	m.result = resultString(it.Output, it.Result)
 	for _, p := range it.Value {
 		m.partTypes = append(m.partTypes, p.Type)
 		if p.Type == "thinking" && m.thinking == "" {
@@ -818,305 +997,3 @@ func processStreamLine(line []byte, sItems *[]sMeta, emit func(map[string]interf
 			return
 		}
 		for _, op := range p.V {
-			if op.O == "a" && strings.HasSuffix(op.P, "/s/-") {
-				m := metaFromItem(op.V)
-				*sItems = append(*sItems, m)
-				switch m.typ {
-				case "agent-tool-result":
-					emit(map[string]interface{}{"event": "status", "label": "Использую инструмент", "detail": m.tool})
-				case "agent-inference":
-					emit(map[string]interface{}{"event": "status", "label": "Размышляю", "detail": m.thinking})
-				case "text":
-					emit(map[string]interface{}{"event": "status", "label": "Отвечаю", "detail": ""})
-				}
-			} else if op.O == "x" {
-				idx, part, ok := parseContentPath(op.P)
-				if !ok || idx >= len(*sItems) {
-					continue
-				}
-				meta := &(*sItems)[idx]
-				if meta.typ == "agent-inference" && part < len(meta.partTypes) {
-					var delta string
-					if json.Unmarshal(op.V, &delta) != nil {
-						continue
-					}
-					if meta.partTypes[part] == "thinking" {
-						meta.thinking += delta
-						emit(map[string]interface{}{"event": "status", "label": "Размышляю", "detail": meta.thinking})
-					} else if meta.partTypes[part] == "text" {
-						emit(map[string]interface{}{"event": "status", "label": "Отвечаю", "detail": ""})
-					}
-				}
-			}
-		}
-	}
-}
-
-// HandleChatStream is the streaming counterpart of HandleChatSend. It forwards
-// the live agent state (thinking / tool calls) to the browser as newline-
-// delimited JSON events, then a final "done" event with the full answer.
-func HandleChatStream(auth *DashboardAuth) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if !chatAuthOK(auth, w, r) {
-			return
-		}
-		var body chatSendBody
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
-			return
-		}
-		body.TokenV2 = strings.TrimSpace(body.TokenV2)
-		body.SpaceID = strings.TrimSpace(body.SpaceID)
-		body.Message = strings.TrimSpace(body.Message)
-		if body.TokenV2 == "" || body.SpaceID == "" || body.Message == "" {
-			http.Error(w, `{"error":"token_v2, space_id and message are required"}`, http.StatusBadRequest)
-			return
-		}
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("X-Accel-Buffering", "no")
-		flusher, _ := w.(http.Flusher)
-		emit := func(obj map[string]interface{}) {
-			b, _ := json.Marshal(obj)
-			w.Write(b)
-			w.Write([]byte("\n"))
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-
-		payload, threadID := buildSendPayload(body)
-		reqBody, _ := json.Marshal(payload)
-		resp, err := notionChatRequest(body.TokenV2, body.UserID, body.SpaceID, "runInferenceTranscript", reqBody, "application/x-ndjson", 600*time.Second)
-		if err != nil {
-			emit(map[string]interface{}{"event": "error", "error": err.Error()})
-			return
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			raw, _ := io.ReadAll(resp.Body)
-			log.Printf("[chat] stream %d: %s", resp.StatusCode, truncate(string(raw), 300))
-			emit(map[string]interface{}{"event": "error", "error": fmt.Sprintf("notion error %d", resp.StatusCode)})
-			return
-		}
-
-		var acc bytes.Buffer
-		var sItems []sMeta
-		sc := bufio.NewScanner(resp.Body)
-		sc.Buffer(make([]byte, 1024*1024), 32*1024*1024)
-		for sc.Scan() {
-			line := sc.Bytes()
-			acc.Write(line)
-			acc.WriteByte('\n')
-			lineCopy := make([]byte, len(line))
-			copy(lineCopy, line)
-			processStreamLine(lineCopy, &sItems, emit)
-		}
-		text, title, steps := parseInferenceStream(acc.Bytes())
-		if strings.TrimSpace(text) == "" {
-			text = "(агент не вернул текстового ответа)"
-		}
-		emit(map[string]interface{}{
-			"event":     "done",
-			"thread_id": threadID,
-			"title":     title,
-			"text":      text,
-			"steps":     steps,
-		})
-	}
-}
-
-// ---- ndjson parsing ----
-
-type tmStep struct {
-	Type  string          `json:"type"`
-	Value json.RawMessage `json:"value"`
-}
-
-type tmInner struct {
-	ID          string `json:"id"`
-	CreatedTime int64  `json:"created_time"`
-	Step        tmStep `json:"step"`
-}
-
-type tmRecord struct {
-	Value struct {
-		Value tmInner `json:"value"`
-	} `json:"value"`
-}
-
-type recordMapShape struct {
-	ThreadMessage map[string]tmRecord `json:"thread_message"`
-}
-
-type orderedTM struct {
-	created int64
-	step    tmStep
-}
-
-// sortedThreadMessages returns the record-map's thread_message steps ordered by
-// created_time.
-func sortedThreadMessages(rm recordMapShape) []orderedTM {
-	out := make([]orderedTM, 0, len(rm.ThreadMessage))
-	for _, m := range rm.ThreadMessage {
-		out = append(out, orderedTM{created: m.Value.Value.CreatedTime, step: m.Value.Value.Step})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].created < out[j].created })
-	return out
-}
-
-// parseInferenceParts splits one agent-inference step.value[] into visible
-// steps (thinking + tool_use) and the concatenated answer text.
-func parseInferenceParts(raw json.RawMessage) (steps []chatStep, text string) {
-	var parts []struct {
-		Type    string `json:"type"`
-		Content string `json:"content"`
-		Name    string `json:"name"`
-	}
-	if json.Unmarshal(raw, &parts) != nil {
-		return nil, ""
-	}
-	var b strings.Builder
-	for _, p := range parts {
-		switch p.Type {
-		case "thinking":
-			if strings.TrimSpace(p.Content) != "" {
-				steps = append(steps, chatStep{Kind: "thought", Text: p.Content})
-			}
-		case "tool_use":
-			name := p.Name
-			if name == "" {
-				name = "tool"
-			}
-			steps = append(steps, chatStep{Kind: "tool", Tool: name, Text: name})
-		case "text":
-			b.WriteString(p.Content)
-		}
-	}
-	return steps, b.String()
-}
-
-// parseUserText extracts the plain text of a "user" step value ([["text"]]).
-func parseUserText(raw json.RawMessage) string {
-	var v [][]interface{}
-	if json.Unmarshal(raw, &v) != nil {
-		return ""
-	}
-	var b strings.Builder
-	for _, seg := range v {
-		if len(seg) > 0 {
-			if s, ok := seg[0].(string); ok {
-				b.WriteString(s)
-			}
-		}
-	}
-	return b.String()
-}
-
-// extractTurn folds a record-map (ordered by created_time) into the latest
-// assistant turn: its concatenated text, the title and the visible steps.
-func extractTurn(rm recordMapShape) (text, title string, steps []chatStep) {
-	for _, m := range sortedThreadMessages(rm) {
-		switch m.step.Type {
-		case "title":
-			var s string
-			if json.Unmarshal(m.step.Value, &s) == nil && s != "" {
-				title = s
-			}
-		case "agent-inference":
-			st, t := parseInferenceParts(m.step.Value)
-			steps = append(steps, st...)
-			text += t
-		}
-	}
-	return text, title, steps
-}
-
-// parseInferenceStream walks the ndjson patch stream. It prefers the final,
-// authoritative record-map; if none is present it falls back to concatenating
-// the streamed "content" deltas.
-func parseInferenceStream(raw []byte) (text, title string, steps []chatStep) {
-	var fallback strings.Builder
-	for _, line := range strings.Split(string(raw), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		var probe struct {
-			Type string `json:"type"`
-		}
-		if err := json.Unmarshal([]byte(line), &probe); err != nil {
-			continue
-		}
-		switch probe.Type {
-		case "record-map":
-			var rmLine struct {
-				RecordMap recordMapShape `json:"recordMap"`
-				V         struct {
-					RecordMap     recordMapShape      `json:"recordMap"`
-					ThreadMessage map[string]tmRecord `json:"thread_message"`
-				} `json:"v"`
-				Value struct {
-					RecordMap     recordMapShape      `json:"recordMap"`
-					ThreadMessage map[string]tmRecord `json:"thread_message"`
-				} `json:"value"`
-			}
-			if json.Unmarshal([]byte(line), &rmLine) != nil {
-				continue
-			}
-			candidates := []recordMapShape{
-				rmLine.RecordMap,
-				rmLine.V.RecordMap,
-				{ThreadMessage: rmLine.V.ThreadMessage},
-				rmLine.Value.RecordMap,
-				{ThreadMessage: rmLine.Value.ThreadMessage},
-			}
-			for _, c := range candidates {
-				if len(c.ThreadMessage) == 0 {
-					continue
-				}
-				t, ti, st := extractTurn(c)
-				if t != "" {
-					text = t
-				}
-				if ti != "" {
-					title = ti
-				}
-				if len(st) > 0 {
-					steps = st
-				}
-			}
-		case "patch":
-			var patch struct {
-				V []struct {
-					O string          `json:"o"`
-					P string          `json:"p"`
-					V json.RawMessage `json:"v"`
-				} `json:"v"`
-			}
-			if json.Unmarshal([]byte(line), &patch) != nil {
-				continue
-			}
-			for _, op := range patch.V {
-				if op.O == "x" && strings.HasSuffix(op.P, "/content") {
-					var s string
-					if json.Unmarshal(op.V, &s) == nil {
-						fallback.WriteString(s)
-					}
-				} else if op.O == "a" {
-					var rec struct {
-						Type  string `json:"type"`
-						Value string `json:"value"`
-					}
-					if json.Unmarshal(op.V, &rec) == nil && rec.Type == "title" && rec.Value != "" && title == "" {
-						title = rec.Value
-					}
-				}
-			}
-		}
-	}
-	if strings.TrimSpace(text) == "" {
-		text = strings.TrimSpace(fallback.String())
-	}
-	return text, title, steps
-}
