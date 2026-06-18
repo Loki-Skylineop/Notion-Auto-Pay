@@ -153,6 +153,19 @@ body {
   word-break: break-word;
 }
 
+/* Hairline borders: Tailwind's raw `border-white/[N]` utilities mix toward
+   solid black (#000000), which makes edges nearly disappear on nested
+   near-black surfaces. Re-map the ones we use to true translucent white so the
+   layout reads cleanly — a touch stronger than the literal value. Unlayered
+   rules win over Tailwind's @layer utilities, so build-hash changes are moot. */
+.border-white\/\[0\.06\] { border-color: color-mix(in oklab, #ffffff 9%, transparent); }
+.border-white\/\[0\.07\] { border-color: color-mix(in oklab, #ffffff 11%, transparent); }
+.border-white\/\[0\.08\] { border-color: color-mix(in oklab, #ffffff 13%, transparent); }
+.border-white\/\[0\.09\] { border-color: color-mix(in oklab, #ffffff 14%, transparent); }
+.border-white\/\[0\.10\] { border-color: color-mix(in oklab, #ffffff 15%, transparent); }
+.border-white\/\[0\.12\] { border-color: color-mix(in oklab, #ffffff 18%, transparent); }
+.border-white\/\[0\.14\] { border-color: color-mix(in oklab, #ffffff 20%, transparent); }
+
 @media (prefers-reduced-motion: reduce) {
   .mesh-hero { animation: none; }
   .stream-caret { animation: none; }
