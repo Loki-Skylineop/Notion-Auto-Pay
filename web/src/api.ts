@@ -470,11 +470,16 @@ export interface ChatThread {
 }
 
 // A single visible reasoning/tool step of an assistant turn (mirrors the
-// chatStep the Go backend extracts from agent-inference parts).
+// chatStep the Go backend extracts). For tool steps, `tool` is the friendly
+// label (e.g. "GitHub / get_me"), `server` is the connector icon hint, and
+// `input`/`result` are the pretty-printed request + response (shown on expand).
 export interface ChatStep {
   kind: string // "thought" | "tool"
   text: string
   tool?: string
+  server?: string
+  input?: string
+  result?: string
 }
 
 // One rendered message of a thread's history.
@@ -561,11 +566,18 @@ export interface ChatSendResult {
   steps?: ChatStep[]
 }
 
-// Live status emitted while the agent is working (e.g. "Размышляю" + the
-// current thought/tool detail).
+// Live status emitted while the agent is working. `kind` distinguishes
+// thought / tool / text events; tool events also carry the friendly label,
+// connector hint and (when available) the pretty-printed input + result so the
+// live tree can render the same rows as the finished message.
 export interface ChatStatus {
   label: string
   detail: string
+  kind?: string
+  tool?: string
+  server?: string
+  input?: string
+  result?: string
 }
 
 export type ChatSendParams = ChatAccountRef & {
@@ -588,9 +600,9 @@ export async function chatSend(params: ChatSendParams): Promise<ChatSendResult> 
 }
 
 // chatStream runs one chat turn and streams live agent status. The server
-// emits newline-delimited JSON events: {event:"status",label,detail} while the
-// agent works, then a final {event:"done",...} with the full answer. onStatus
-// is called for every status event so the UI can show what the agent is doing
+// emits newline-delimited JSON events: {event:"status",…} while the agent
+// works, then a final {event:"done",…} with the full answer. onStatus is
+// called for every status event so the UI can show what the agent is doing
 // right now.
 export async function chatStream(params: ChatSendParams, onStatus: (s: ChatStatus) => void): Promise<ChatSendResult> {
   const resp = await fetch('/admin/chat/stream', {
@@ -619,7 +631,15 @@ export async function chatStream(params: ChatSendParams, onStatus: (s: ChatStatu
         try {
           const ev = JSON.parse(line)
           if (ev.event === 'status') {
-            onStatus({ label: ev.label || '', detail: ev.detail || '' })
+            onStatus({
+              label: ev.label || '',
+              detail: ev.detail || '',
+              kind: ev.kind || '',
+              tool: ev.tool || '',
+              server: ev.server || '',
+              input: ev.input || '',
+              result: ev.result || '',
+            })
           } else if (ev.event === 'done') {
             result = { thread_id: ev.thread_id, title: ev.title, text: ev.text, steps: ev.steps }
           } else if (ev.event === 'error') {
