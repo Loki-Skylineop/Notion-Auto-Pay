@@ -14,6 +14,7 @@ import {
 } from '../api'
 import { fetchAutoPayConfig, type ServerAutoPayConfig } from '../autopay'
 import type { DiscoveredAccount } from './WorkspacePool'
+import { ParticleField } from './ParticleField'
 
 // The chat shell fills the viewport below the dashboard header. dvh keeps it
 // honest on mobile where the browser chrome shrinks the visible area.
@@ -132,7 +133,7 @@ function PlusIcon() {
 
 function SendIcon() {
   return (
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
       <path d="M22 2 11 13" />
       <path d="M22 2 15 22l-4-9-9-4 20-7Z" />
     </svg>
@@ -226,9 +227,9 @@ function CopyButton({ text }: { text: string }) {
       type="button"
       onClick={onCopy}
       title="Скопировать сообщение"
-      className="mt-1.5 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-text-muted hover:text-text-secondary hover:bg-bg-secondary transition-colors bg-transparent border-none cursor-pointer"
+      className="mt-2 inline-flex items-center gap-1.5 rounded-md text-[11px] text-[#454545] hover:text-[#888] transition-colors bg-transparent border-none cursor-pointer p-0"
     >
-      {copied ? <span className="text-ok">✓</span> : <CopyIcon />}
+      {copied ? <span className="text-emerald-400">✓</span> : <CopyIcon />}
       <span>{copied ? 'Скопировано' : 'Копировать'}</span>
     </button>
   )
@@ -240,9 +241,9 @@ function CopyButton({ text }: { text: string }) {
 // inside an expanded step row.
 function DetailBox({ title, text }: { title: string; text: string }) {
   return (
-    <div className="rounded-md border border-border bg-bg-secondary overflow-hidden">
-      <div className="px-2 py-1 border-b border-border text-[10px] uppercase tracking-wide text-text-muted">{title}</div>
-      <pre className="px-2 py-1.5 text-[11.5px] font-mono leading-relaxed text-text-secondary whitespace-pre-wrap wrap-anywhere max-h-72 overflow-y-auto">{text}</pre>
+    <div className="rounded-md border border-white/[0.07] bg-white/[0.02] overflow-hidden">
+      <div className="px-2 py-1 border-b border-white/[0.06] text-[10px] uppercase tracking-wide text-text-muted">{title}</div>
+      <pre className="px-2 py-1.5 text-[11.5px] font-mono leading-relaxed text-[#8a8a8a] whitespace-pre-wrap wrap-anywhere max-h-72 overflow-y-auto">{text}</pre>
     </div>
   )
 }
@@ -265,10 +266,10 @@ function StepRow({ step }: { step: ChatStep }) {
           className={`w-full min-w-0 flex items-center gap-1.5 text-left bg-transparent border-none p-0 ${hasDetail ? 'cursor-pointer' : 'cursor-default'}`}
         >
           <span className="shrink-0 w-3 text-[10px] text-text-muted">{hasDetail ? (open ? '▾' : '▸') : ''}</span>
-          <span className="shrink-0 w-4 h-4 flex items-center justify-center text-text-secondary">
+          <span className="shrink-0 w-4 h-4 flex items-center justify-center text-[#888]">
             <ToolIcon tool={step.tool || step.text} server={step.server} />
           </span>
-          <span className="text-[12.5px] text-text-secondary truncate">{label}</span>
+          <span className="text-[12.5px] text-[#888] truncate">{label}</span>
         </button>
         {open && hasDetail ? (
           <div className="ml-[34px] mt-1 mb-1 space-y-1.5 min-w-0">
@@ -304,7 +305,7 @@ function StepRow({ step }: { step: ChatStep }) {
 function StepsTree({ steps }: { steps: ChatStep[] }) {
   if (!steps || steps.length === 0) return null
   return (
-    <div className="border-l border-border pl-3 ml-1 space-y-0.5 min-w-0">
+    <div className="border-l border-white/[0.08] pl-3 ml-1 space-y-0.5 min-w-0">
       {steps.map((s, i) => (
         <StepRow key={i} step={s} />
       ))}
@@ -317,7 +318,7 @@ function StepsBlock({ steps }: { steps: ChatStep[] }) {
   const [open, setOpen] = useState(false)
   if (!steps || steps.length === 0) return null
   return (
-    <div className="mb-2 rounded-lg border border-border bg-bg-secondary overflow-hidden min-w-0">
+    <div className="mb-2 rounded-lg border border-white/[0.07] bg-white/[0.02] overflow-hidden min-w-0">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -346,12 +347,12 @@ function renderInline(text: string, keyPrefix: string): React.ReactNode[] {
   while ((m = regex.exec(text)) !== null) {
     if (m.index > last) nodes.push(text.slice(last, m.index))
     if (m[1] !== undefined) {
-      nodes.push(<strong key={`${keyPrefix}-b${i}`}>{m[1]}</strong>)
+      nodes.push(<strong key={`${keyPrefix}-b${i}`} className="text-[#e8e8e8] font-medium">{m[1]}</strong>)
     } else if (m[2] !== undefined) {
       nodes.push(<em key={`${keyPrefix}-i${i}`}>{m[2]}</em>)
     } else if (m[3] !== undefined) {
       nodes.push(
-        <code key={`${keyPrefix}-c${i}`} className="px-1 py-0.5 rounded bg-bg-secondary text-[0.85em] font-mono wrap-anywhere">
+        <code key={`${keyPrefix}-c${i}`} className="px-1 py-0.5 rounded bg-white/[0.06] text-[#aaa] text-[0.85em] font-mono wrap-anywhere">
           {m[3]}
         </code>,
       )
@@ -397,11 +398,11 @@ function CodeBlock({ code, lang }: { code: string; lang?: string }) {
         type="button"
         onClick={onCopy}
         title="Скопировать код"
-        className="absolute top-1.5 right-1.5 z-10 inline-flex items-center justify-center w-6 h-6 rounded-md text-text-muted hover:text-text-primary bg-bg-card border border-border cursor-pointer opacity-60 hover:opacity-100 transition-opacity"
+        className="absolute top-1.5 right-1.5 z-10 inline-flex items-center justify-center w-6 h-6 rounded-md text-text-muted hover:text-text-primary bg-black border border-white/[0.08] cursor-pointer opacity-60 hover:opacity-100 transition-opacity"
       >
         {copied ? <span className="text-ok text-[11px]">✓</span> : <CopyIcon />}
       </button>
-      <pre className="p-3 pr-9 rounded-lg bg-bg-secondary overflow-x-auto max-w-full text-[12.5px] font-mono leading-relaxed">
+      <pre className="p-3 pr-9 rounded-lg bg-white/[0.03] border border-white/[0.06] overflow-x-auto max-w-full text-[12.5px] font-mono leading-relaxed text-[#cfcfcf]">
         {lang ? <div className="mb-1 text-[10px] uppercase tracking-wide text-text-muted">{lang}</div> : null}
         <code>{code}</code>
       </pre>
@@ -444,7 +445,7 @@ function renderBlocks(text: string): React.ReactNode[] {
             <thead>
               <tr>
                 {header.map((c, ci) => (
-                  <th key={ci} className="border border-border bg-bg-secondary px-2.5 py-1.5 text-left font-semibold">
+                  <th key={ci} className="border border-white/[0.08] bg-white/[0.03] px-2.5 py-1.5 text-left font-semibold text-[#cfcfcf]">
                     {renderInline(c, `th${key}-${ci}`)}
                   </th>
                 ))}
@@ -454,7 +455,7 @@ function renderBlocks(text: string): React.ReactNode[] {
               {rows.map((r, ri) => (
                 <tr key={ri}>
                   {header.map((_, ci) => (
-                    <td key={ci} className="border border-border px-2.5 py-1.5 align-top">
+                    <td key={ci} className="border border-white/[0.08] px-2.5 py-1.5 align-top">
                       {renderInline(r[ci] || '', `td${key}-${ri}-${ci}`)}
                     </td>
                   ))}
@@ -472,7 +473,7 @@ function renderBlocks(text: string): React.ReactNode[] {
       const level = h[1].length
       const cls = level <= 1 ? 'text-lg font-semibold' : level === 2 ? 'text-base font-semibold' : 'text-sm font-semibold'
       blocks.push(
-        <div key={key++} className={`mt-2 mb-1 ${cls}`}>
+        <div key={key++} className={`mt-2 mb-1 text-[#d4d4d4] ${cls}`}>
           {renderInline(h[2], `h${key}`)}
         </div>,
       )
@@ -481,7 +482,7 @@ function renderBlocks(text: string): React.ReactNode[] {
     }
 
     if (/^\s*---+\s*$/.test(line)) {
-      blocks.push(<hr key={key++} className="my-2 border-border" />)
+      blocks.push(<hr key={key++} className="my-2 border-white/[0.08]" />)
       i += 1
       continue
     }
@@ -540,25 +541,26 @@ function MessageBody({ text }: { text: string }) {
 
 // A single rendered message. Memoised so typing in the composer (which lives in
 // its own component) never re-runs the markdown renderer for the whole log.
-// DeepSeek-style layout: user turns sit in a compact right-aligned bubble,
-// assistant turns are full-width with an avatar and no heavy bubble so long
-// answers, code and tables read comfortably.
+// Mockup layout: user turns sit in a compact right-aligned bubble, assistant
+// turns are full-width with a small ✦ avatar and dimmed body text.
 const MessageRow = memo(function MessageRow({ role, text, steps }: { role: 'user' | 'assistant'; text: string; steps?: ChatStep[] }) {
   if (role === 'user') {
     return (
       <div className="flex justify-end min-w-0">
-        <div className="max-w-[85%] min-w-0 px-3.5 py-2.5 rounded-2xl rounded-br-md bg-bg-card border border-border text-text-primary text-[14.5px] leading-relaxed wrap-anywhere">
+        <div className="max-w-[80%] min-w-0 px-3.5 py-2.5 rounded-2xl rounded-tr-sm bg-[#141414] border border-white/[0.07] text-[#e8e8e8] text-[13.5px] leading-relaxed wrap-anywhere">
           <MessageBody text={text} />
         </div>
       </div>
     )
   }
   return (
-    <div className="flex gap-2.5 min-w-0">
-      <div className="shrink-0 mt-0.5 w-7 h-7 rounded-full bg-bg-card border border-border flex items-center justify-center text-[13px] text-notion-blue">✦</div>
+    <div className="flex gap-3 min-w-0">
+      <div className="shrink-0 mt-0.5 w-5 h-5 rounded-full bg-white/[0.05] border border-white/[0.09] flex items-center justify-center">
+        <span className="text-[9px] text-white/60">✦</span>
+      </div>
       <div className="min-w-0 flex-1">
         {steps && steps.length > 0 ? <StepsBlock steps={steps} /> : null}
-        <div className="text-[14.5px] leading-relaxed text-text-primary">
+        <div className="text-[13.5px] leading-relaxed text-[#8a8a8a]">
           <MessageBody text={text} />
         </div>
         <CopyButton text={text} />
@@ -574,23 +576,23 @@ const MessageRow = memo(function MessageRow({ role, text, steps }: { role: 'user
 function StreamingRow({ status, steps, liveText }: { status: ChatStatus | null; steps: ChatStep[]; liveText: string }) {
   const phase = liveText ? 'Печатает…' : status?.label || 'Думаю…'
   return (
-    <div className="flex gap-2.5 min-w-0">
-      <div className="shrink-0 mt-0.5 w-7 h-7 rounded-full bg-bg-card border border-border flex items-center justify-center">
-        <span className="inline-block w-3.5 h-3.5 rounded-full border-2 border-notion-blue border-t-transparent animate-spin" />
+    <div className="flex gap-3 min-w-0">
+      <div className="shrink-0 mt-0.5 w-5 h-5 rounded-full bg-white/[0.05] border border-white/[0.09] flex items-center justify-center">
+        <span className="inline-block w-2.5 h-2.5 rounded-full border-2 border-notion-blue border-t-transparent animate-spin" />
       </div>
       <div className="min-w-0 flex-1">
-        <div className="mb-1.5 text-[12px] font-medium text-text-muted">{phase}</div>
+        <div className="mb-1.5 text-[12px] font-medium text-[#666]">{phase}</div>
         {steps.length > 0 ? <div className="mb-2"><StepsTree steps={steps} /></div> : null}
         {liveText ? (
-          <div className="text-[14.5px] leading-relaxed text-text-primary">
+          <div className="text-[13.5px] leading-relaxed text-[#8a8a8a]">
             <MessageBody text={liveText} />
             <span className="stream-caret" />
           </div>
         ) : (
-          <div className="flex items-center gap-1 text-text-muted">
-            <span className="dot-flash" style={dotDelay0} />
-            <span className="dot-flash" style={dotDelay1} />
-            <span className="dot-flash" style={dotDelay2} />
+          <div className="flex items-center gap-1.5 py-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#444] animate-bounce" style={dotDelay0} />
+            <span className="w-1.5 h-1.5 rounded-full bg-[#444] animate-bounce" style={dotDelay1} />
+            <span className="w-1.5 h-1.5 rounded-full bg-[#444] animate-bounce" style={dotDelay2} />
           </div>
         )}
       </div>
@@ -604,7 +606,7 @@ const dotDelay2: React.CSSProperties = { animationDelay: '320ms' }
 
 // The message composer owns its own input state so keystrokes don't re-render
 // the (potentially long) message log — this fixes typing lag on big threads.
-// The textarea auto-grows with the message (up to a cap) like DeepSeek/ChatGPT.
+// The textarea auto-grows with the message (up to a cap) like the mockup.
 const Composer = memo(function Composer({
   hasSpace,
   sending,
@@ -658,17 +660,17 @@ const Composer = memo(function Composer({
   )
 
   return (
-    <div className="border-t border-border p-3 bg-bg-secondary">
-      <div className="flex items-end gap-2 rounded-2xl border border-border bg-bg-input px-2.5 py-2 focus-within:border-notion-blue transition-colors">
+    <div className="relative z-10 px-4 md:px-6 pb-4 pt-2">
+      <div className="flex items-end gap-2.5 rounded-xl border border-white/[0.09] bg-[#080808] px-3.5 py-2.5 focus-within:border-white/[0.18] transition-colors">
         <textarea
           ref={taRef}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKeyDown}
           rows={1}
-          placeholder={hasSpace ? 'Сообщение…' : 'Сначала выберите пространство'}
+          placeholder={hasSpace ? 'Напишите сообщение…' : 'Сначала выберите пространство'}
           disabled={!hasSpace || sending}
-          className="flex-1 min-w-0 resize-none max-h-[220px] overflow-y-auto bg-transparent border-none outline-none text-text-primary text-[14.5px] leading-relaxed py-1 disabled:opacity-50"
+          className="flex-1 min-w-0 resize-none max-h-[220px] overflow-y-auto bg-transparent border-none outline-none text-[#e8e8e8] text-[13.5px] placeholder-[#333] leading-relaxed py-0.5 disabled:opacity-50"
         />
         {showModelPicker ? (
           <select
@@ -676,7 +678,7 @@ const Composer = memo(function Composer({
             onChange={(e) => onModelChange(e.target.value)}
             disabled={sending}
             title="Модель агента"
-            className="shrink-0 max-w-[120px] sm:max-w-[150px] px-2 py-1.5 rounded-lg bg-bg-secondary border border-border text-text-secondary text-[12.5px] focus:outline-none focus:border-notion-blue disabled:opacity-50 cursor-pointer"
+            className="shrink-0 max-w-[120px] sm:max-w-[150px] px-2 py-1.5 rounded-lg bg-white/[0.03] border border-white/[0.08] text-[#888] text-[12px] focus:outline-none focus:border-white/[0.18] disabled:opacity-50 cursor-pointer"
           >
             {models
               .filter((m) => !m.disabled)
@@ -692,12 +694,12 @@ const Composer = memo(function Composer({
           onClick={submit}
           disabled={!hasSpace || sending || text.trim() === ''}
           title="Отправить"
-          className="shrink-0 w-9 h-9 flex items-center justify-center rounded-xl bg-notion-blue text-white hover:opacity-90 transition-opacity disabled:opacity-40 border-none cursor-pointer"
+          className="shrink-0 w-7 h-7 flex items-center justify-center rounded-full bg-white text-black hover:bg-[#f0f0f0] transition-colors disabled:opacity-25 disabled:cursor-not-allowed border-none cursor-pointer"
         >
           <SendIcon />
         </button>
       </div>
-      <div className="mt-1.5 px-1 text-[11px] text-text-muted">Enter — отправить · Shift+Enter — новая строка</div>
+      <p className="text-center text-[10px] text-[#3a3a3a] mt-1.5">Enter — отправить · Shift+Enter — новая строка</p>
     </div>
   )
 })
@@ -1069,7 +1071,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const activeThreadTitle = threads.find((t) => t.id === activeThreadId)?.title || 'Новый чат'
 
   return (
-    <div className="relative flex gap-4 min-h-0 overflow-hidden" style={shellStyle}>
+    <div className="relative flex min-h-0 overflow-hidden rounded-xl border border-white/[0.08]" style={shellStyle}>
       {/* Mobile drawer backdrop */}
       {sidebarOpen ? (
         <div
@@ -1080,90 +1082,86 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       ) : null}
 
       <aside
-        className={`fixed inset-y-0 left-0 z-40 w-[280px] max-w-[82vw] flex flex-col gap-3 p-4 bg-bg-primary border-r border-border overflow-hidden transform transition-transform duration-200 md:static md:z-auto md:w-[280px] md:max-w-none md:p-0 md:bg-transparent md:border-r-0 md:translate-x-0 ${
+        className={`fixed inset-y-0 left-0 z-40 w-[280px] max-w-[82vw] flex flex-col p-3 bg-[#030303] border-r border-white/[0.08] overflow-hidden transform transition-transform duration-200 md:static md:z-auto md:w-56 md:max-w-none md:translate-x-0 ${
           sidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
-        <div className="flex items-center justify-between md:hidden">
-          <span className="text-sm font-semibold text-text-primary">Чаты</span>
+        <div className="flex items-center justify-between mb-3 md:hidden">
+          <span className="text-[12px] font-medium text-text-secondary">Чаты</span>
           <button
             type="button"
             onClick={() => setSidebarOpen(false)}
-            className="w-8 h-8 flex items-center justify-center rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-secondary bg-transparent border-none cursor-pointer"
+            className="w-7 h-7 flex items-center justify-center rounded-lg text-text-muted hover:text-text-primary hover:bg-white/[0.05] bg-transparent border-none cursor-pointer"
           >
             <CloseIcon />
           </button>
         </div>
 
-        <div className="space-y-1">
-          <label className="text-[11px] uppercase tracking-wide text-text-muted">Пространство</label>
-          <select
-            value={spaceKey}
-            onChange={(e) => setSpaceKey(e.target.value)}
-            className="w-full px-2.5 py-2 rounded-lg bg-bg-input border border-border text-text-primary text-sm"
-          >
-            {spaceOptions.length === 0 ? (
-              <option value="">Нет платных пространств</option>
-            ) : (
-              spaceOptions.map((s) => (
-                <option key={s.key} value={s.key}>
-                  {s.spaceName} · {s.accountLabel}
-                </option>
-              ))
-            )}
-          </select>
-        </div>
+        <div className="space-y-3 mb-3">
+          <div>
+            <div className="text-[9px] text-text-muted uppercase tracking-widest mb-1 px-0.5">Пространство</div>
+            <select
+              value={spaceKey}
+              onChange={(e) => setSpaceKey(e.target.value)}
+              className="w-full px-2.5 py-1.5 rounded-md bg-white/[0.03] border border-white/[0.07] text-[12px] text-[#888] hover:border-white/[0.12] focus:outline-none focus:border-white/[0.18] transition-colors cursor-pointer"
+            >
+              {spaceOptions.length === 0 ? (
+                <option value="">Нет платных пространств</option>
+              ) : (
+                spaceOptions.map((s) => (
+                  <option key={s.key} value={s.key}>
+                    {s.spaceName} · {s.accountLabel}
+                  </option>
+                ))
+              )}
+            </select>
+          </div>
 
-        <div className="space-y-1">
-          <label className="text-[11px] uppercase tracking-wide text-text-muted">Агент</label>
-          <select
-            value={agentId}
-            onChange={(e) => setAgentId(e.target.value)}
-            className="w-full px-2.5 py-2 rounded-lg bg-bg-input border border-border text-text-primary text-sm"
-          >
-            {agents.map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.name}{a.kind === 'custom' ? ' · кастом' : ''}
-              </option>
-            ))}
-          </select>
+          <div>
+            <div className="text-[9px] text-text-muted uppercase tracking-widest mb-1 px-0.5">Агент</div>
+            <select
+              value={agentId}
+              onChange={(e) => setAgentId(e.target.value)}
+              className="w-full px-2.5 py-1.5 rounded-md bg-white/[0.03] border border-white/[0.07] text-[12px] text-[#888] hover:border-white/[0.12] focus:outline-none focus:border-white/[0.18] transition-colors cursor-pointer"
+            >
+              {agents.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.name}{a.kind === 'custom' ? ' · кастом' : ''}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
 
         <button
           type="button"
           onClick={startNewChat}
-          className="w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-notion-blue text-white text-sm font-medium hover:opacity-90 transition-opacity border-none cursor-pointer"
+          className="w-full flex items-center justify-center gap-1.5 py-2 mb-4 rounded-lg border border-white/[0.07] text-[11px] text-[#888] hover:bg-white/[0.04] hover:text-text-secondary hover:border-white/[0.12] transition-colors bg-transparent cursor-pointer"
         >
           <PlusIcon /> Новый чат
         </button>
 
-        <div className="text-[11px] uppercase tracking-wide text-text-muted pt-1">История</div>
-        <div className="flex-1 min-h-0 overflow-y-auto space-y-1 pr-1">
+        <div className="text-[9px] text-text-muted uppercase tracking-widest mb-2 px-0.5">История</div>
+        <div className="flex-1 min-h-0 overflow-y-auto space-y-px pr-1">
           {threads.length === 0 ? (
-            <div className="text-xs text-text-muted py-2">Пока нет чатов</div>
+            <div className="text-[11px] text-text-muted py-2 px-0.5">Пока нет чатов</div>
           ) : (
             threads.map((t) => (
               <div
                 key={t.id}
-                className={`group flex items-center rounded-lg transition-colors ${
-                  t.id === activeThreadId ? 'bg-bg-card' : 'hover:bg-bg-secondary'
+                onClick={() => openThread(t)}
+                className={`group flex items-center justify-between px-2.5 py-2 rounded-md cursor-pointer transition-colors ${
+                  t.id === activeThreadId ? 'bg-white/[0.07] text-[#e8e8e8]' : 'text-[#666] hover:bg-white/[0.03] hover:text-[#999]'
                 }`}
               >
-                <button
-                  type="button"
-                  onClick={() => openThread(t)}
-                  className={`flex-1 min-w-0 text-left px-2.5 py-2 rounded-lg text-sm truncate bg-transparent border-none cursor-pointer ${
-                    t.id === activeThreadId ? 'text-text-primary' : 'text-text-secondary'
-                  }`}
-                  title={t.title || 'Без названия'}
-                >
+                <span className="text-[11px] truncate" title={t.title || 'Без названия'}>
                   {t.title || 'Без названия'}
-                </button>
+                </span>
                 <button
                   type="button"
                   onClick={(e) => deleteThread(t, e)}
                   title="Удалить чат"
-                  className="shrink-0 mr-1 w-7 h-7 flex items-center justify-center rounded-md text-text-muted hover:text-err hover:bg-bg-secondary bg-transparent border-none cursor-pointer opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
+                  className="opacity-0 group-hover:opacity-100 focus:opacity-100 p-0.5 ml-1 text-[#444] hover:text-red-400 transition-all shrink-0 bg-transparent border-none cursor-pointer"
                 >
                   <TrashIcon />
                 </button>
@@ -1173,31 +1171,33 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         </div>
       </aside>
 
-      <section className="flex-1 min-w-0 flex flex-col min-h-0 overflow-hidden rounded-xl border border-border bg-bg-secondary">
+      <section className="relative flex-1 min-w-0 flex flex-col min-h-0 overflow-hidden bg-black">
+        <ParticleField active={showThinking} />
+
         {/* Top bar — mobile only: menu + current thread + new chat */}
-        <div className="flex items-center gap-2 px-3 py-2 border-b border-border md:hidden">
+        <div className="relative z-10 flex items-center gap-2 px-3 py-2 border-b border-white/[0.06] md:hidden">
           <button
             type="button"
             onClick={() => setSidebarOpen(true)}
             title="Чаты"
-            className="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-text-secondary hover:text-text-primary hover:bg-bg-card bg-transparent border-none cursor-pointer"
+            className="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-text-secondary hover:text-text-primary hover:bg-white/[0.05] bg-transparent border-none cursor-pointer"
           >
             <MenuIcon />
           </button>
-          <div className="flex-1 min-w-0 truncate text-sm font-medium text-text-primary">{activeThreadTitle}</div>
+          <div className="flex-1 min-w-0 truncate text-[12px] font-medium text-text-secondary">{activeThreadTitle}</div>
           <button
             type="button"
             onClick={startNewChat}
             title="Новый чат"
-            className="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-text-secondary hover:text-text-primary hover:bg-bg-card bg-transparent border-none cursor-pointer"
+            className="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-text-secondary hover:text-text-primary hover:bg-white/[0.05] bg-transparent border-none cursor-pointer"
           >
             <PlusIcon />
           </button>
         </div>
 
-        <div ref={logRef} onScroll={onLogScroll} className="flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden p-4 space-y-4">
+        <div ref={logRef} onScroll={onLogScroll} className="relative z-10 flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden px-5 md:px-8 py-6 space-y-6">
           {messages.length === 0 && !historyLoading && !showThinking ? (
-            <div className="h-full flex items-center justify-center text-center text-text-muted text-sm px-6">
+            <div className="h-full flex items-center justify-center text-center text-[#444] text-[12px] px-6">
               {activeSpace
                 ? 'Напишите сообщение, чтобы начать диалог с агентом.'
                 : 'Выберите пространство с платным планом или включённой автооплатой.'}
@@ -1211,7 +1211,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           ) : null}
 
           {historyLoading ? (
-            <div className="flex items-center gap-2 text-text-muted text-sm">
+            <div className="flex items-center gap-2 text-text-muted text-[12px]">
               <span className="inline-block w-3 h-3 rounded-full border-2 border-text-muted border-t-transparent animate-spin" />
               Загружаю историю…
             </div>
@@ -1225,7 +1225,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         </div>
 
         {error ? (
-          <div className="px-4 py-2 text-sm text-err border-t border-border bg-bg-secondary">{error}</div>
+          <div className="relative z-10 px-4 py-2 text-[12px] text-red-400 border-t border-white/[0.06] bg-black/50">{error}</div>
         ) : null}
 
         <Composer

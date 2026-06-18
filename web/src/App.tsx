@@ -61,6 +61,14 @@ const IconClose = ({ size = 15 }: { size?: number }) => (
   </svg>
 )
 
+// Small chevron used to collapse / expand the whole hero header. Points up when
+// the header is expanded (click = collapse), flips down when collapsed.
+const IconChevron = ({ up = false, size = 15 }: { up?: boolean; size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={`transition-transform duration-200 ${up ? '' : 'rotate-180'}`}>
+    <polyline points="18 15 12 9 6 15" />
+  </svg>
+)
+
 // Subtle white radial glow behind the hero, matching the mockup.
 const HERO_GLOW = { background: 'radial-gradient(ellipse, rgba(255,255,255,0.045) 0%, transparent 70%)' }
 
@@ -83,7 +91,9 @@ function TabBar({ tab, onChange }: { tab: 'pay' | 'chat'; onChange: (t: 'pay' | 
 }
 
 // Hero band: brand capsule (top-left), primary actions (top-right), centered
-// tab pill + stats. Subtle white/blue/violet glow over the black canvas.
+// tab pill + stats. Subtle white/blue/violet glow over the black canvas. A
+// small chevron above the tab pill collapses the whole band to free up space —
+// when collapsed only the chevron + tab pill remain.
 function Hero({
   onAdd,
   accountCount,
@@ -91,6 +101,8 @@ function Hero({
   onLogout,
   tab,
   onTab,
+  collapsed,
+  onToggleCollapse,
 }: {
   onAdd: () => void
   accountCount: number
@@ -98,47 +110,63 @@ function Hero({
   onLogout?: () => void
   tab?: 'pay' | 'chat'
   onTab?: (t: 'pay' | 'chat') => void
+  collapsed?: boolean
+  onToggleCollapse?: () => void
 }) {
   return (
     <header className="relative overflow-hidden border-b border-white/[0.06]">
-      <div aria-hidden="true" className="absolute inset-0 pointer-events-none overflow-hidden">
-        <div className="absolute -top-20 left-1/2 -translate-x-1/2 w-[600px] h-[300px] rounded-full" style={HERO_GLOW} />
-        <div className="absolute -top-8 left-1/4 w-80 h-40 bg-blue-500/[0.05] blur-3xl rounded-full" />
-        <div className="absolute -top-8 right-1/4 w-64 h-36 bg-violet-500/[0.04] blur-3xl rounded-full" />
-      </div>
-
-      <div className="relative max-w-4xl mx-auto px-5 sm:px-8 pt-6 pb-5">
-        <div className="flex items-center justify-between mb-6">
-          <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/[0.08] bg-white/[0.02]">
-            <span className="text-[11px] text-white/80">✦</span>
-            <span className="text-[11px] text-text-muted tracking-wide font-mono">Notion Auto Pay</span>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              onClick={onAdd}
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-white text-black text-[11px] font-medium hover:bg-[#f2f2f2] active:scale-[0.98] transition-all border-none cursor-pointer"
-            >
-              <IconPlus size={12} />
-              <span className="hidden sm:inline">Добавить аккаунт</span>
-              <span className="sm:hidden">Добавить</span>
-            </button>
-            {onLogout && (
-              <button
-                onClick={onLogout}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-white/[0.08] text-[11px] text-text-muted hover:text-text-secondary hover:border-white/[0.15] transition-colors bg-transparent cursor-pointer"
-              >
-                <IconLogOut size={12} />
-                <span className="hidden sm:inline">Выйти</span>
-              </button>
-            )}
-          </div>
+      {!collapsed && (
+        <div aria-hidden="true" className="absolute inset-0 pointer-events-none overflow-hidden">
+          <div className="absolute -top-20 left-1/2 -translate-x-1/2 w-[600px] h-[300px] rounded-full" style={HERO_GLOW} />
+          <div className="absolute -top-8 left-1/4 w-80 h-40 bg-blue-500/[0.05] blur-3xl rounded-full" />
+          <div className="absolute -top-8 right-1/4 w-64 h-36 bg-violet-500/[0.04] blur-3xl rounded-full" />
         </div>
+      )}
+
+      <div className={`relative max-w-4xl mx-auto px-5 sm:px-8 ${collapsed ? 'pt-2 pb-2' : 'pt-6 pb-5'}`}>
+        {!collapsed && (
+          <div className="flex items-center justify-between mb-6">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/[0.08] bg-white/[0.02]">
+              <span className="text-[11px] text-white/80">✦</span>
+              <span className="text-[11px] text-text-muted tracking-wide font-mono">Notion Auto Pay</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={onAdd}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-white text-black text-[11px] font-medium hover:bg-[#f2f2f2] active:scale-[0.98] transition-all border-none cursor-pointer"
+              >
+                <IconPlus size={12} />
+                <span className="hidden sm:inline">Добавить аккаунт</span>
+                <span className="sm:hidden">Добавить</span>
+              </button>
+              {onLogout && (
+                <button
+                  onClick={onLogout}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-white/[0.08] text-[11px] text-text-muted hover:text-text-secondary hover:border-white/[0.15] transition-colors bg-transparent cursor-pointer"
+                >
+                  <IconLogOut size={12} />
+                  <span className="hidden sm:inline">Выйти</span>
+                </button>
+              )}
+            </div>
+          </div>
+        )}
 
         {tab && onTab && (
-          <div className="flex flex-col items-center gap-4">
+          <div className="flex flex-col items-center gap-3">
+            {onToggleCollapse && (
+              <button
+                onClick={onToggleCollapse}
+                title={collapsed ? 'Развернуть шапку' : 'Свернуть шапку'}
+                aria-label={collapsed ? 'Развернуть шапку' : 'Свернуть шапку'}
+                className="-mb-0.5 p-1 rounded-md text-text-muted hover:text-text-secondary hover:bg-white/[0.04] transition-colors bg-transparent border-none cursor-pointer"
+              >
+                <IconChevron up={!collapsed} />
+              </button>
+            )}
             <TabBar tab={tab} onChange={onTab} />
-            {(accountCount > 0 || spaceCount > 0) && (
-              <div className="flex items-center gap-6">
+            {!collapsed && (accountCount > 0 || spaceCount > 0) && (
+              <div className="flex items-center gap-6 mt-1">
                 <Stat value={accountCount} label="аккаунтов" />
                 <span className="w-px h-7 bg-white/[0.06]" />
                 <Stat value={spaceCount} label="пространств" />
@@ -353,6 +381,7 @@ function AddAccountModal({ onClose, onDiscovered }: { onClose: () => void; onDis
 function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const [showAddModal, setShowAddModal] = useState(false)
   const [tab, setTab] = useState<'pay' | 'chat'>('pay')
+  const [headerCollapsed, setHeaderCollapsed] = useState(false)
   const [discovered, setDiscovered] = useState<DiscoveredAccount[]>(() => {
     try {
       const raw = localStorage.getItem('nmp_discovered_workspaces')
@@ -408,6 +437,8 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         onLogout={onLogout}
         tab={tab}
         onTab={setTab}
+        collapsed={headerCollapsed}
+        onToggleCollapse={() => setHeaderCollapsed(v => !v)}
       />
 
       <main className="max-w-4xl mx-auto px-5 sm:px-8 py-7">
