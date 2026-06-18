@@ -15,6 +15,7 @@ import {
 import { fetchAutoPayConfig, type ServerAutoPayConfig } from '../autopay'
 import type { DiscoveredAccount } from './WorkspacePool'
 import { ParticleField } from './ParticleField'
+import { Dropdown } from './Dropdown'
 
 // The chat shell fills the viewport below the dashboard header. dvh keeps it
 // honest on mobile where the browser chrome shrinks the visible area.
@@ -138,6 +139,34 @@ function SendIcon() {
       <path d="M22 2 15 22l-4-9-9-4 20-7Z" />
     </svg>
   )
+}
+
+function StopIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" stroke="none">
+      <rect x="6" y="6" width="12" height="12" rx="2" />
+    </svg>
+  )
+}
+
+// Ask the proxy to clear the thread's in-flight inference so the server stops
+// the agent run (mirrors Notion's StopInference saveTransactionsFanout).
+async function requestStopInference(ref: {
+  token_v2: string
+  user_id?: string
+  space_id: string
+  thread_id: string
+}): Promise<void> {
+  try {
+    await fetch('/admin/chat/stop', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify(ref),
+    })
+  } catch {
+    // best-effort: the UI is already unblocked locally
+  }
 }
 
 function CloseIcon() {
@@ -615,6 +644,7 @@ const Composer = memo(function Composer({
   selectedModel,
   onModelChange,
   onSend,
+  onStop,
 }: {
   hasSpace: boolean
   sending: boolean
@@ -623,6 +653,7 @@ const Composer = memo(function Composer({
   selectedModel: string
   onModelChange: (id: string) => void
   onSend: (text: string) => void
+  onStop: () => void
 }) {
   const [text, setText] = useState('')
   const taRef = useRef<HTMLTextAreaElement>(null)
@@ -669,35 +700,43 @@ const Composer = memo(function Composer({
           onKeyDown={onKeyDown}
           rows={1}
           placeholder={hasSpace ? 'Напишите сообщение…' : 'Сначала выберите пространство'}
-          disabled={!hasSpace || sending}
+          disabled={!hasSpace}
           className="flex-1 min-w-0 resize-none max-h-[220px] overflow-y-auto bg-transparent border-none outline-none text-[#e8e8e8] text-[13.5px] placeholder-[#333] leading-relaxed py-0.5 disabled:opacity-50"
         />
         {showModelPicker ? (
-          <select
+          <Dropdown
             value={selectedModel}
-            onChange={(e) => onModelChange(e.target.value)}
-            disabled={sending}
+            onChange={onModelChange}
             title="Модель агента"
-            className="shrink-0 max-w-[120px] sm:max-w-[150px] px-2 py-1.5 rounded-lg bg-white/[0.03] border border-white/[0.08] text-[#888] text-[12px] focus:outline-none focus:border-white/[0.18] disabled:opacity-50 cursor-pointer"
-          >
-            {models
-              .filter((m) => !m.disabled)
-              .map((m) => (
-                <option key={m.id} value={m.id}>
-                  {m.label}
-                </option>
-              ))}
-          </select>
+            ariaLabel="Модель агента"
+            openUp
+            align="right"
+            className="shrink-0 max-w-[120px] sm:max-w-[150px]"
+            buttonClassName="rounded-lg px-2 py-1.5 text-[12px]"
+            menuClassName="min-w-full w-max max-w-[240px]"
+            options={models.filter((m) => !m.disabled).map((m) => ({ value: m.id, label: m.label }))}
+          />
         ) : null}
-        <button
-          type="button"
-          onClick={submit}
-          disabled={!hasSpace || sending || text.trim() === ''}
-          title="Отправить"
-          className="shrink-0 w-7 h-7 flex items-center justify-center rounded-full bg-white text-black hover:bg-[#f0f0f0] transition-colors disabled:opacity-25 disabled:cursor-not-allowed border-none cursor-pointer"
-        >
-          <SendIcon />
-        </button>
+        {sending ? (
+          <button
+            type="button"
+            onClick={onStop}
+            title="Остановить"
+            className="shrink-0 w-7 h-7 flex items-center justify-center rounded-full bg-white/[0.1] text-white hover:bg-white/[0.18] transition-colors border border-white/[0.14] cursor-pointer"
+          >
+            <StopIcon />
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={submit}
+            disabled={!hasSpace || text.trim() === ''}
+            title="Отправить"
+            className="shrink-0 w-7 h-7 flex items-center justify-center rounded-full bg-white text-black hover:bg-[#f0f0f0] transition-colors disabled:opacity-25 disabled:cursor-not-allowed border-none cursor-pointer"
+          >
+            <SendIcon />
+          </button>
+        )}
       </div>
       <p className="text-center text-[10px] text-[#3a3a3a] mt-1.5">Enter — отправить · Shift+Enter — новая строка</p>
     </div>
@@ -729,6 +768,9 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const instantScrollRef = useRef(false)
   const viewKeyRef = useRef(NEW_KEY)
   const threadAgentsRef = useRef<Record<string, string>>(loadThreadAgents())
+  const stopRef = useRef(false)
+  const streamThreadIdRef = useRef('')
+  const turnSeqRef = useRef(0)
 
   useEffect(() => {
     viewKeyRef.current = activeThreadId || NEW_KEY
@@ -939,12 +981,65 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     [activeSpace, activeThreadId, startNewChat],
   )
 
+  // After a turn ends (or is stopped) pull the thread's latest persisted state
+  // from the server so the last message reflects reality without a manual
+  // reopen. This is the lightweight stand-in for Notion's ~1s record polling.
+  const reconcileFromServer = useCallback(async (space: SpaceOption, threadId: string) => {
+    if (!space || !threadId) return
+    try {
+      const hist = await chatHistory({
+        token_v2: space.account.token_v2,
+        user_id: space.account.user_id,
+        space_id: space.spaceId,
+        thread_id: threadId,
+      })
+      if (viewKeyRef.current !== threadId) return
+      if (hist.length > 0 && hist[hist.length - 1].role === 'assistant') {
+        setMessages(hist.map((m) => ({ role: m.role, text: m.text, steps: m.steps })))
+      }
+    } catch {
+      // ignore — reconciliation is best-effort
+    }
+  }, [])
+
+  const handleStop = useCallback(() => {
+    if (!sending) return
+    stopRef.current = true
+    const partial = liveText.trim()
+    const carriedSteps = liveSteps
+    setSending(false)
+    setStatus(null)
+    setStreamKey(null)
+    setLiveSteps([])
+    setLiveText('')
+    setMessages((prev) => [
+      ...prev,
+      {
+        role: 'assistant',
+        text: partial ? `${partial}\n\n⏹ Остановлено` : '⏹ Остановлено',
+        steps: carriedSteps,
+      },
+    ])
+    const tid = streamThreadIdRef.current
+    if (tid && activeSpace) {
+      requestStopInference({
+        token_v2: activeSpace.account.token_v2,
+        user_id: activeSpace.account.user_id,
+        space_id: activeSpace.spaceId,
+        thread_id: tid,
+      }).then(() => reconcileFromServer(activeSpace, tid))
+    }
+  }, [sending, liveText, liveSteps, activeSpace, reconcileFromServer])
+
   const handleSend = useCallback(
     async (msg: string) => {
       const text = msg.trim()
       if (!text || !activeSpace || sending) return
       const originKey = activeThreadId || NEW_KEY
       const agentUsed = agentId
+      const myTurn = ++turnSeqRef.current
+      stopRef.current = false
+      streamThreadIdRef.current = activeThreadId || ''
       instantScrollRef.current = true
       setError('')
       setMessages((prev) => [...prev, { role: 'user', text }])
@@ -1024,6 +1119,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           onStatus,
         )
         if (res.thread_id) {
+          streamThreadIdRef.current = res.thread_id
           rememberThreadAgent(res.thread_id, agentUsed)
           setThreads((prev) =>
             prev.some((t) => t.id === res.thread_id)
@@ -1032,29 +1128,36 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           )
         }
         // Only mutate the visible conversation if the user is still viewing the
-        // chat this stream was started from. Otherwise the reply is persisted
-        // server-side and shows up when they reopen the thread.
-        if (viewKeyRef.current === originKey) {
+        // chat this stream was started from, and the turn wasn't stopped.
+        // Otherwise the reply is persisted server-side and shows up on reopen.
+        if (viewKeyRef.current === originKey && !stopRef.current) {
           if (res.thread_id && res.thread_id !== activeThreadId) setActiveThreadId(res.thread_id)
           setMessages((prev) => [
             ...prev,
             { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps },
           ])
         }
+        // Pull the freshly persisted thread state so the message list matches
+        // the server without needing a manual reopen (sync fix).
+        if (res.thread_id) reconcileFromServer(activeSpace, res.thread_id)
       } catch (e) {
-        if (viewKeyRef.current === originKey) {
+        if (viewKeyRef.current === originKey && !stopRef.current) {
           setError(e instanceof Error ? e.message : 'Ошибка отправки')
           setMessages((prev) => [...prev, { role: 'assistant', text: '⚠️ Не удалось получить ответ. Попробуйте ещё раз.' }])
         }
       } finally {
-        setSending(false)
-        setStatus(null)
-        setLiveSteps([])
-        setLiveText('')
-        setStreamKey(null)
+        // A stop (or a newer turn) may have already reset the live state; only
+        // the turn that still owns the stream should clear it.
+        if (turnSeqRef.current === myTurn) {
+          setSending(false)
+          setStatus(null)
+          setLiveSteps([])
+          setLiveText('')
+          setStreamKey(null)
+        }
       }
     },
-    [activeSpace, sending, activeThreadId, agentId, selectedModel, rememberThreadAgent],
+    [activeSpace, sending, activeThreadId, agentId, selectedModel, rememberThreadAgent, reconcileFromServer],
   )
 
   if (accounts.length === 0) {
@@ -1100,36 +1203,28 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         <div className="space-y-3 mb-3">
           <div>
             <div className="text-[9px] text-text-muted uppercase tracking-widest mb-1 px-0.5">Пространство</div>
-            <select
+            <Dropdown
               value={spaceKey}
-              onChange={(e) => setSpaceKey(e.target.value)}
-              className="w-full px-2.5 py-1.5 rounded-md bg-white/[0.03] border border-white/[0.07] text-[12px] text-[#888] hover:border-white/[0.12] focus:outline-none focus:border-white/[0.18] transition-colors cursor-pointer"
-            >
-              {spaceOptions.length === 0 ? (
-                <option value="">Нет платных пространств</option>
-              ) : (
-                spaceOptions.map((s) => (
-                  <option key={s.key} value={s.key}>
-                    {s.spaceName} · {s.accountLabel}
-                  </option>
-                ))
-              )}
-            </select>
+              onChange={setSpaceKey}
+              disabled={spaceOptions.length === 0}
+              ariaLabel="Пространство"
+              placeholder="Нет платных пространств"
+              buttonClassName="rounded-md px-2.5 py-1.5 text-[12px]"
+              menuClassName="w-full"
+              options={spaceOptions.map((s) => ({ value: s.key, label: `${s.spaceName} · ${s.accountLabel}` }))}
+            />
           </div>
 
           <div>
             <div className="text-[9px] text-text-muted uppercase tracking-widest mb-1 px-0.5">Агент</div>
-            <select
+            <Dropdown
               value={agentId}
-              onChange={(e) => setAgentId(e.target.value)}
-              className="w-full px-2.5 py-1.5 rounded-md bg-white/[0.03] border border-white/[0.07] text-[12px] text-[#888] hover:border-white/[0.12] focus:outline-none focus:border-white/[0.18] transition-colors cursor-pointer"
-            >
-              {agents.map((a) => (
-                <option key={a.id} value={a.id}>
-                  {a.name}{a.kind === 'custom' ? ' · кастом' : ''}
-                </option>
-              ))}
-            </select>
+              onChange={setAgentId}
+              ariaLabel="Агент"
+              buttonClassName="rounded-md px-2.5 py-1.5 text-[12px]"
+              menuClassName="w-full"
+              options={agents.map((a) => ({ value: a.id, label: `${a.name}${a.kind === 'custom' ? ' · кастом' : ''}` }))}
+            />
           </div>
         </div>
 
@@ -1236,6 +1331,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           selectedModel={selectedModel}
           onModelChange={setSelectedModel}
           onSend={handleSend}
+          onStop={handleStop}
         />
       </section>
     </div>

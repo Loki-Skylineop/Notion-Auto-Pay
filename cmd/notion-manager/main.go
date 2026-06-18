@@ -106,6 +106,9 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	mux.HandleFunc("/admin/chat/delete", proxy.HandleChatDelete(dashAuth))
 	mux.HandleFunc("/admin/chat/send", proxy.HandleChatSend(dashAuth))
 	mux.HandleFunc("/admin/chat/stream", proxy.HandleChatStream(dashAuth))
+	// Stop an in-flight chat turn (clears the thread's current_inference_id
+	// via saveTransactionsFanout, mirroring the web client's Stop button).
+	mux.HandleFunc("/admin/chat/stop", proxy.HandleChatStop(dashAuth))
 
 	// Server-side auto-pay config + manual trigger. The actual paying is done
 	// by the background scheduler (AutoPayManager.Start) so it keeps running
@@ -295,6 +298,7 @@ func main() {
 	log.Printf("  POST /admin/chat/delete           (soft-delete a chat thread)")
 	log.Printf("  POST /admin/chat/send             (run one chat turn)")
 	log.Printf("  POST /admin/chat/stream           (run one chat turn, live status)")
+	log.Printf("  POST /admin/chat/stop             (stop an in-flight chat turn)")
 	log.Printf("  GET  /admin/autopay               (server auto-pay config)")
 	log.Printf("  POST /admin/autopay/run           (trigger auto-pay scan now)")
 	log.Printf("  POST /admin/autopay/pay-space     (pay one workspace with saved card)")
