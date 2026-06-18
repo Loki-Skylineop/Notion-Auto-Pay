@@ -15,7 +15,9 @@ import {
 import { fetchAutoPayConfig, type ServerAutoPayConfig } from '../autopay'
 import type { DiscoveredAccount } from './WorkspacePool'
 
-const gridStyle: React.CSSProperties = { height: 'calc(100vh - 190px)' }
+// The chat shell fills the viewport below the dashboard header. dvh keeps it
+// honest on mobile where the browser chrome shrinks the visible area.
+const shellStyle: React.CSSProperties = { height: 'calc(100dvh - 168px)', minHeight: '420px' }
 
 // How many messages to render initially, and how many more to reveal each time
 // the user scrolls to the top of the log (lazy loading keeps long threads fast).
@@ -109,6 +111,43 @@ function TrashIcon() {
   )
 }
 
+function MenuIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="3" y1="6" x2="21" y2="6" />
+      <line x1="3" y1="12" x2="21" y2="12" />
+      <line x1="3" y1="18" x2="21" y2="18" />
+    </svg>
+  )
+}
+
+function PlusIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="12" y1="5" x2="12" y2="19" />
+      <line x1="5" y1="12" x2="19" y2="12" />
+    </svg>
+  )
+}
+
+function SendIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M22 2 11 13" />
+      <path d="M22 2 15 22l-4-9-9-4 20-7Z" />
+    </svg>
+  )
+}
+
+function CloseIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+      <line x1="18" y1="6" x2="6" y2="18" />
+      <line x1="6" y1="6" x2="18" y2="18" />
+    </svg>
+  )
+}
+
 // GitHub octocat mark — shown for GitHub MCP tool calls.
 function GithubMark() {
   return (
@@ -187,7 +226,7 @@ function CopyButton({ text }: { text: string }) {
       type="button"
       onClick={onCopy}
       title="Скопировать сообщение"
-      className="mt-1 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-text-muted hover:text-text-secondary hover:bg-bg-secondary transition-colors bg-transparent border-none cursor-pointer"
+      className="mt-1.5 inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-text-muted hover:text-text-secondary hover:bg-bg-secondary transition-colors bg-transparent border-none cursor-pointer"
     >
       {copied ? <span className="text-ok">✓</span> : <CopyIcon />}
       <span>{copied ? 'Скопировано' : 'Копировать'}</span>
@@ -203,7 +242,7 @@ function DetailBox({ title, text }: { title: string; text: string }) {
   return (
     <div className="rounded-md border border-border bg-bg-secondary overflow-hidden">
       <div className="px-2 py-1 border-b border-border text-[10px] uppercase tracking-wide text-text-muted">{title}</div>
-      <pre className="px-2 py-1.5 overflow-x-auto text-[11.5px] font-mono leading-relaxed text-text-secondary whitespace-pre-wrap max-h-72 overflow-y-auto">{text}</pre>
+      <pre className="px-2 py-1.5 text-[11.5px] font-mono leading-relaxed text-text-secondary whitespace-pre-wrap wrap-anywhere max-h-72 overflow-y-auto">{text}</pre>
     </div>
   )
 }
@@ -219,11 +258,11 @@ function StepRow({ step }: { step: ChatStep }) {
     const label = (step.tool || step.text || 'Инструмент').trim()
     const hasDetail = !!(step.input || step.result)
     return (
-      <div className="py-0.5">
+      <div className="py-0.5 min-w-0">
         <button
           type="button"
           onClick={() => hasDetail && setOpen((v) => !v)}
-          className={`w-full flex items-center gap-1.5 text-left bg-transparent border-none p-0 ${hasDetail ? 'cursor-pointer' : 'cursor-default'}`}
+          className={`w-full min-w-0 flex items-center gap-1.5 text-left bg-transparent border-none p-0 ${hasDetail ? 'cursor-pointer' : 'cursor-default'}`}
         >
           <span className="shrink-0 w-3 text-[10px] text-text-muted">{hasDetail ? (open ? '▾' : '▸') : ''}</span>
           <span className="shrink-0 w-4 h-4 flex items-center justify-center text-text-secondary">
@@ -232,7 +271,7 @@ function StepRow({ step }: { step: ChatStep }) {
           <span className="text-[12.5px] text-text-secondary truncate">{label}</span>
         </button>
         {open && hasDetail ? (
-          <div className="ml-[34px] mt-1 mb-1 space-y-1.5">
+          <div className="ml-[34px] mt-1 mb-1 space-y-1.5 min-w-0">
             {step.input ? <DetailBox title="Input" text={step.input} /> : null}
             {step.result ? <DetailBox title="Response" text={step.result} /> : null}
           </div>
@@ -245,18 +284,18 @@ function StepRow({ step }: { step: ChatStep }) {
   const oneLine = thought.replace(/\s+/g, ' ').trim()
   const preview = oneLine.length > 90 ? `${oneLine.slice(0, 90)}…` : oneLine
   return (
-    <div className="py-0.5">
+    <div className="py-0.5 min-w-0">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center gap-1.5 text-left bg-transparent border-none p-0 cursor-pointer"
+        className="w-full min-w-0 flex items-center gap-1.5 text-left bg-transparent border-none p-0 cursor-pointer"
       >
         <span className="shrink-0 w-3 text-[10px] text-text-muted">{open ? '▾' : '▸'}</span>
-        <span className="shrink-0 w-4 h-4 flex items-center justify-center">💭</span>
+        <span className="shrink-0 w-4 h-4 flex items-center justify-center">💡</span>
         <span className="text-[12.5px] text-text-muted truncate italic">{open ? 'Размышление' : preview || 'Размышление'}</span>
       </button>
       {open ? (
-        <div className="ml-[34px] mt-1 mb-1 text-[12px] text-text-muted whitespace-pre-wrap leading-snug">{thought}</div>
+        <div className="ml-[34px] mt-1 mb-1 text-[12px] text-text-muted whitespace-pre-wrap wrap-anywhere leading-snug">{thought}</div>
       ) : null}
     </div>
   )
@@ -265,7 +304,7 @@ function StepRow({ step }: { step: ChatStep }) {
 function StepsTree({ steps }: { steps: ChatStep[] }) {
   if (!steps || steps.length === 0) return null
   return (
-    <div className="border-l border-border pl-3 ml-1 space-y-0.5">
+    <div className="border-l border-border pl-3 ml-1 space-y-0.5 min-w-0">
       {steps.map((s, i) => (
         <StepRow key={i} step={s} />
       ))}
@@ -278,7 +317,7 @@ function StepsBlock({ steps }: { steps: ChatStep[] }) {
   const [open, setOpen] = useState(false)
   if (!steps || steps.length === 0) return null
   return (
-    <div className="mb-2 rounded-lg border border-border bg-bg-secondary overflow-hidden">
+    <div className="mb-2 rounded-lg border border-border bg-bg-secondary overflow-hidden min-w-0">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -312,13 +351,13 @@ function renderInline(text: string, keyPrefix: string): React.ReactNode[] {
       nodes.push(<em key={`${keyPrefix}-i${i}`}>{m[2]}</em>)
     } else if (m[3] !== undefined) {
       nodes.push(
-        <code key={`${keyPrefix}-c${i}`} className="px-1 py-0.5 rounded bg-bg-secondary text-[0.85em] font-mono">
+        <code key={`${keyPrefix}-c${i}`} className="px-1 py-0.5 rounded bg-bg-secondary text-[0.85em] font-mono wrap-anywhere">
           {m[3]}
         </code>,
       )
     } else if (m[4] !== undefined) {
       nodes.push(
-        <a key={`${keyPrefix}-l${i}`} href={m[5]} target="_blank" rel="noreferrer" className="text-notion-blue underline">
+        <a key={`${keyPrefix}-l${i}`} href={m[5]} target="_blank" rel="noreferrer" className="text-notion-blue underline wrap-anywhere">
           {m[4]}
         </a>,
       )
@@ -353,7 +392,7 @@ function CodeBlock({ code, lang }: { code: string; lang?: string }) {
     }
   }, [code])
   return (
-    <div className="relative my-2">
+    <div className="relative my-2 min-w-0">
       <button
         type="button"
         onClick={onCopy}
@@ -362,7 +401,7 @@ function CodeBlock({ code, lang }: { code: string; lang?: string }) {
       >
         {copied ? <span className="text-ok text-[11px]">✓</span> : <CopyIcon />}
       </button>
-      <pre className="p-3 pr-9 rounded-lg bg-bg-secondary overflow-x-auto text-[12.5px] font-mono leading-relaxed">
+      <pre className="p-3 pr-9 rounded-lg bg-bg-secondary overflow-x-auto max-w-full text-[12.5px] font-mono leading-relaxed">
         {lang ? <div className="mb-1 text-[10px] uppercase tracking-wide text-text-muted">{lang}</div> : null}
         <code>{code}</code>
       </pre>
@@ -400,7 +439,7 @@ function renderBlocks(text: string): React.ReactNode[] {
         i += 1
       }
       blocks.push(
-        <div key={key++} className="my-2 overflow-x-auto">
+        <div key={key++} className="my-2 overflow-x-auto max-w-full">
           <table className="w-full border-collapse text-[13px]">
             <thead>
               <tr>
@@ -456,7 +495,7 @@ function renderBlocks(text: string): React.ReactNode[] {
       blocks.push(
         <ul key={key++} className="my-1.5 ml-4 list-disc space-y-0.5">
           {items.map((it, ii) => (
-            <li key={ii}>{renderInline(it, `ul${key}-${ii}`)}</li>
+            <li key={ii} className="wrap-anywhere">{renderInline(it, `ul${key}-${ii}`)}</li>
           ))}
         </ul>,
       )
@@ -472,7 +511,7 @@ function renderBlocks(text: string): React.ReactNode[] {
       blocks.push(
         <ol key={key++} className="my-1.5 ml-4 list-decimal space-y-0.5">
           {items.map((it, ii) => (
-            <li key={ii}>{renderInline(it, `ol${key}-${ii}`)}</li>
+            <li key={ii} className="wrap-anywhere">{renderInline(it, `ol${key}-${ii}`)}</li>
           ))}
         </ol>,
       )
@@ -486,7 +525,7 @@ function renderBlocks(text: string): React.ReactNode[] {
     }
 
     blocks.push(
-      <p key={key++} className="whitespace-pre-wrap">
+      <p key={key++} className="whitespace-pre-wrap wrap-anywhere">
         {renderInline(line, `p${key}`)}
       </p>,
     )
@@ -496,31 +535,76 @@ function renderBlocks(text: string): React.ReactNode[] {
 }
 
 function MessageBody({ text }: { text: string }) {
-  return <div className="space-y-0.5">{renderBlocks(text)}</div>
+  return <div className="space-y-0.5 min-w-0">{renderBlocks(text)}</div>
 }
 
 // A single rendered message. Memoised so typing in the composer (which lives in
 // its own component) never re-runs the markdown renderer for the whole log.
+// DeepSeek-style layout: user turns sit in a compact right-aligned bubble,
+// assistant turns are full-width with an avatar and no heavy bubble so long
+// answers, code and tables read comfortably.
 const MessageRow = memo(function MessageRow({ role, text, steps }: { role: 'user' | 'assistant'; text: string; steps?: ChatStep[] }) {
-  return (
-    <div className={`flex flex-col ${role === 'user' ? 'items-end' : 'items-start'}`}>
-      <div
-        className={`max-w-[85%] px-3.5 py-2.5 rounded-2xl text-[14px] leading-relaxed ${
-          role === 'user'
-            ? 'bg-white text-black rounded-br-sm'
-            : 'bg-bg-card border border-border text-text-primary rounded-bl-sm'
-        }`}
-      >
-        {role === 'assistant' && steps && steps.length > 0 ? <StepsBlock steps={steps} /> : null}
-        <MessageBody text={text} />
+  if (role === 'user') {
+    return (
+      <div className="flex justify-end min-w-0">
+        <div className="max-w-[85%] min-w-0 px-3.5 py-2.5 rounded-2xl rounded-br-md bg-bg-card border border-border text-text-primary text-[14.5px] leading-relaxed wrap-anywhere">
+          <MessageBody text={text} />
+        </div>
       </div>
-      <CopyButton text={text} />
+    )
+  }
+  return (
+    <div className="flex gap-2.5 min-w-0">
+      <div className="shrink-0 mt-0.5 w-7 h-7 rounded-full bg-bg-card border border-border flex items-center justify-center text-[13px] text-notion-blue">✦</div>
+      <div className="min-w-0 flex-1">
+        {steps && steps.length > 0 ? <StepsBlock steps={steps} /> : null}
+        <div className="text-[14.5px] leading-relaxed text-text-primary">
+          <MessageBody text={text} />
+        </div>
+        <CopyButton text={text} />
+      </div>
     </div>
   )
 })
 
+// The live assistant turn while the agent is still working. It makes the
+// current state obvious: thinking dots before any text arrives, the agent's
+// step tree, then the answer typing out with a blinking caret. When the turn
+// finishes this is replaced by a normal (caret-free) MessageRow.
+function StreamingRow({ status, steps, liveText }: { status: ChatStatus | null; steps: ChatStep[]; liveText: string }) {
+  const phase = liveText ? 'Печатает…' : status?.label || 'Думаю…'
+  return (
+    <div className="flex gap-2.5 min-w-0">
+      <div className="shrink-0 mt-0.5 w-7 h-7 rounded-full bg-bg-card border border-border flex items-center justify-center">
+        <span className="inline-block w-3.5 h-3.5 rounded-full border-2 border-notion-blue border-t-transparent animate-spin" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="mb-1.5 text-[12px] font-medium text-text-muted">{phase}</div>
+        {steps.length > 0 ? <div className="mb-2"><StepsTree steps={steps} /></div> : null}
+        {liveText ? (
+          <div className="text-[14.5px] leading-relaxed text-text-primary">
+            <MessageBody text={liveText} />
+            <span className="stream-caret" />
+          </div>
+        ) : (
+          <div className="flex items-center gap-1 text-text-muted">
+            <span className="dot-flash" style={dotDelay0} />
+            <span className="dot-flash" style={dotDelay1} />
+            <span className="dot-flash" style={dotDelay2} />
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+const dotDelay0: React.CSSProperties = { animationDelay: '0ms' }
+const dotDelay1: React.CSSProperties = { animationDelay: '160ms' }
+const dotDelay2: React.CSSProperties = { animationDelay: '320ms' }
+
 // The message composer owns its own input state so keystrokes don't re-render
 // the (potentially long) message log — this fixes typing lag on big threads.
+// The textarea auto-grows with the message (up to a cap) like DeepSeek/ChatGPT.
 const Composer = memo(function Composer({
   hasSpace,
   sending,
@@ -539,12 +623,30 @@ const Composer = memo(function Composer({
   onSend: (text: string) => void
 }) {
   const [text, setText] = useState('')
+  const taRef = useRef<HTMLTextAreaElement>(null)
+
+  const resize = useCallback(() => {
+    const el = taRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, 220)}px`
+  }, [])
+
+  useEffect(() => {
+    resize()
+  }, [text, resize])
+
   const submit = useCallback(() => {
     const t = text.trim()
     if (!t || !hasSpace || sending) return
     onSend(t)
     setText('')
+    requestAnimationFrame(() => {
+      const el = taRef.current
+      if (el) el.style.height = 'auto'
+    })
   }, [text, hasSpace, sending, onSend])
+
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (e.key === 'Enter' && !e.shiftKey) {
@@ -554,17 +656,19 @@ const Composer = memo(function Composer({
     },
     [submit],
   )
+
   return (
     <div className="border-t border-border p-3 bg-bg-secondary">
-      <div className="flex items-end gap-2">
+      <div className="flex items-end gap-2 rounded-2xl border border-border bg-bg-input px-2.5 py-2 focus-within:border-notion-blue transition-colors">
         <textarea
+          ref={taRef}
           value={text}
           onChange={(e) => setText(e.target.value)}
           onKeyDown={onKeyDown}
           rows={1}
-          placeholder={hasSpace ? 'Сообщение… (Enter — отправить, Shift+Enter — перенос)' : 'Сначала выберите пространство'}
+          placeholder={hasSpace ? 'Сообщение…' : 'Сначала выберите пространство'}
           disabled={!hasSpace || sending}
-          className="flex-1 resize-none max-h-32 px-3 py-2 rounded-lg bg-bg-input border border-border text-text-primary text-sm focus:outline-none focus:border-notion-blue disabled:opacity-50"
+          className="flex-1 min-w-0 resize-none max-h-[220px] overflow-y-auto bg-transparent border-none outline-none text-text-primary text-[14.5px] leading-relaxed py-1 disabled:opacity-50"
         />
         {showModelPicker ? (
           <select
@@ -572,7 +676,7 @@ const Composer = memo(function Composer({
             onChange={(e) => onModelChange(e.target.value)}
             disabled={sending}
             title="Модель агента"
-            className="shrink-0 max-w-[150px] px-2 py-2 rounded-lg bg-bg-input border border-border text-text-primary text-[13px] focus:outline-none focus:border-notion-blue disabled:opacity-50 cursor-pointer"
+            className="shrink-0 max-w-[120px] sm:max-w-[150px] px-2 py-1.5 rounded-lg bg-bg-secondary border border-border text-text-secondary text-[12.5px] focus:outline-none focus:border-notion-blue disabled:opacity-50 cursor-pointer"
           >
             {models
               .filter((m) => !m.disabled)
@@ -587,11 +691,13 @@ const Composer = memo(function Composer({
           type="button"
           onClick={submit}
           disabled={!hasSpace || sending || text.trim() === ''}
-          className="px-4 py-2 rounded-lg bg-notion-blue text-white text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-40 border-none cursor-pointer shrink-0"
+          title="Отправить"
+          className="shrink-0 w-9 h-9 flex items-center justify-center rounded-xl bg-notion-blue text-white hover:opacity-90 transition-opacity disabled:opacity-40 border-none cursor-pointer"
         >
-          Отправить
+          <SendIcon />
         </button>
       </div>
+      <div className="mt-1.5 px-1 text-[11px] text-text-muted">Enter — отправить · Shift+Enter — новая строка</div>
     </div>
   )
 })
@@ -611,10 +717,12 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const [sending, setSending] = useState(false)
   const [status, setStatus] = useState<ChatStatus | null>(null)
   const [liveSteps, setLiveSteps] = useState<ChatStep[]>([])
+  const [liveText, setLiveText] = useState('')
   const [streamKey, setStreamKey] = useState<string | null>(null)
   const [historyLoading, setHistoryLoading] = useState(false)
   const [error, setError] = useState('')
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
+  const [sidebarOpen, setSidebarOpen] = useState(false)
   const logRef = useRef<HTMLDivElement>(null)
   const instantScrollRef = useRef(false)
   const viewKeyRef = useRef(NEW_KEY)
@@ -747,9 +855,9 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       el.scrollTop = el.scrollHeight
       return
     }
-    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 140
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160
     if (nearBottom) el.scrollTop = el.scrollHeight
-  }, [messages, sending, historyLoading, liveSteps, status])
+  }, [messages, sending, historyLoading, liveSteps, liveText, status])
 
   const visibleMessages = useMemo(
     () => messages.slice(Math.max(0, messages.length - visibleCount)),
@@ -776,6 +884,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     setMessages([])
     setVisibleCount(PAGE_SIZE)
     setError('')
+    setSidebarOpen(false)
   }, [])
 
   const openThread = useCallback(
@@ -783,6 +892,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       if (!activeSpace) return
       instantScrollRef.current = true
       setActiveThreadId(t.id)
+      setSidebarOpen(false)
       const remembered = threadAgentsRef.current[t.id]
       if (remembered && agents.some((a) => a.id === remembered)) setAgentId(remembered)
       setError('')
@@ -840,14 +950,20 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       setStreamKey(originKey)
       setStatus(null)
       setLiveSteps([])
+      setLiveText('')
 
       // Live status reducer. The backend tags every event with a kind:
       // "tool" (a connector call, carrying label/server/input/result),
-      // "thought" (streamed reasoning) or "text" (the answer is being written).
-      // We fold tool + thought events into liveSteps so the live tree mirrors
-      // the finished message exactly.
+      // "thought" (streamed reasoning) or "text" (the answer itself, now
+      // carrying the cumulative text as it is written). We fold tool + thought
+      // events into liveSteps so the live tree mirrors the finished message,
+      // and mirror text into liveText so the reply types out in place.
       const onStatus = (s: ChatStatus) => {
         setStatus(s)
+        if (s.kind === 'text') {
+          if (s.detail) setLiveText(s.detail)
+          return
+        }
         setLiveSteps((prev) => {
           if (s.kind === 'tool') {
             const label = (s.tool || s.detail || '').trim()
@@ -932,6 +1048,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         setSending(false)
         setStatus(null)
         setLiveSteps([])
+        setLiveText('')
         setStreamKey(null)
       }
     },
@@ -949,10 +1066,35 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const viewKey = activeThreadId || NEW_KEY
   const showThinking = sending && streamKey === viewKey
   const showModelPicker = agentId === 'default' && models.filter((m) => !m.disabled).length > 0
+  const activeThreadTitle = threads.find((t) => t.id === activeThreadId)?.title || 'Новый чат'
 
   return (
-    <div className="grid grid-cols-1 md:grid-cols-[280px_1fr] gap-4 overflow-hidden" style={gridStyle}>
-      <aside className="flex flex-col gap-3 overflow-hidden">
+    <div className="relative flex gap-4 min-h-0 overflow-hidden" style={shellStyle}>
+      {/* Mobile drawer backdrop */}
+      {sidebarOpen ? (
+        <div
+          className="fixed inset-0 z-30 bg-black/60 md:hidden"
+          onClick={() => setSidebarOpen(false)}
+          aria-hidden="true"
+        />
+      ) : null}
+
+      <aside
+        className={`fixed inset-y-0 left-0 z-40 w-[280px] max-w-[82vw] flex flex-col gap-3 p-4 bg-bg-primary border-r border-border overflow-hidden transform transition-transform duration-200 md:static md:z-auto md:w-[280px] md:max-w-none md:p-0 md:bg-transparent md:border-r-0 md:translate-x-0 ${
+          sidebarOpen ? 'translate-x-0' : '-translate-x-full'
+        }`}
+      >
+        <div className="flex items-center justify-between md:hidden">
+          <span className="text-sm font-semibold text-text-primary">Чаты</span>
+          <button
+            type="button"
+            onClick={() => setSidebarOpen(false)}
+            className="w-8 h-8 flex items-center justify-center rounded-lg text-text-muted hover:text-text-primary hover:bg-bg-secondary bg-transparent border-none cursor-pointer"
+          >
+            <CloseIcon />
+          </button>
+        </div>
+
         <div className="space-y-1">
           <label className="text-[11px] uppercase tracking-wide text-text-muted">Пространство</label>
           <select
@@ -990,9 +1132,9 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         <button
           type="button"
           onClick={startNewChat}
-          className="w-full px-3 py-2 rounded-lg bg-notion-blue text-white text-sm font-medium hover:opacity-90 transition-opacity border-none cursor-pointer"
+          className="w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-notion-blue text-white text-sm font-medium hover:opacity-90 transition-opacity border-none cursor-pointer"
         >
-          + Новый чат
+          <PlusIcon /> Новый чат
         </button>
 
         <div className="text-[11px] uppercase tracking-wide text-text-muted pt-1">История</div>
@@ -1031,8 +1173,29 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         </div>
       </aside>
 
-      <section className="flex flex-col min-h-0 overflow-hidden rounded-xl border border-border bg-bg-secondary">
-        <div ref={logRef} onScroll={onLogScroll} className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
+      <section className="flex-1 min-w-0 flex flex-col min-h-0 overflow-hidden rounded-xl border border-border bg-bg-secondary">
+        {/* Top bar — mobile only: menu + current thread + new chat */}
+        <div className="flex items-center gap-2 px-3 py-2 border-b border-border md:hidden">
+          <button
+            type="button"
+            onClick={() => setSidebarOpen(true)}
+            title="Чаты"
+            className="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-text-secondary hover:text-text-primary hover:bg-bg-card bg-transparent border-none cursor-pointer"
+          >
+            <MenuIcon />
+          </button>
+          <div className="flex-1 min-w-0 truncate text-sm font-medium text-text-primary">{activeThreadTitle}</div>
+          <button
+            type="button"
+            onClick={startNewChat}
+            title="Новый чат"
+            className="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-text-secondary hover:text-text-primary hover:bg-bg-card bg-transparent border-none cursor-pointer"
+          >
+            <PlusIcon />
+          </button>
+        </div>
+
+        <div ref={logRef} onScroll={onLogScroll} className="flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden p-4 space-y-4">
           {messages.length === 0 && !historyLoading && !showThinking ? (
             <div className="h-full flex items-center justify-center text-center text-text-muted text-sm px-6">
               {activeSpace
@@ -1058,21 +1221,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
             <MessageRow key={hiddenCount + idx} role={msg.role} text={msg.text} steps={msg.steps} />
           ))}
 
-          {showThinking ? (
-            <div className="flex flex-col items-start w-full">
-              <div className="max-w-[90%] w-full px-3.5 py-2.5 rounded-2xl rounded-bl-sm bg-bg-card border border-border">
-                <div className="flex items-center gap-2 text-text-primary text-[13px] font-medium">
-                  <span className="inline-block w-3 h-3 rounded-full border-2 border-text-muted border-t-transparent animate-spin" />
-                  {status?.label || 'Думаю…'}
-                </div>
-                {liveSteps.length > 0 ? (
-                  <div className="mt-2">
-                    <StepsTree steps={liveSteps} />
-                  </div>
-                ) : null}
-              </div>
-            </div>
-          ) : null}
+          {showThinking ? <StreamingRow status={status} steps={liveSteps} liveText={liveText} /> : null}
         </div>
 
         {error ? (
