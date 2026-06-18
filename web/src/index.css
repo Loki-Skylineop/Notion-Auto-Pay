@@ -1,28 +1,30 @@
 @import "tailwindcss";
 
 @theme {
-  /* Pure-black dark system: near-black canvas, soft light ink, hairline
-     borders and a single multi-stop mesh gradient as the only chrome. */
+  /* Vercel-style pure-black system, ported 1:1 from the mockup: black canvas,
+     soft light ink, translucent white hairline borders, nested near-black
+     surfaces. Muted tones are kept a touch brighter than the mockup so the
+     small labels stay readable. */
   --color-bg-primary: #000000;      /* page body */
-  --color-bg-secondary: #111111;    /* inset surface */
+  --color-bg-secondary: #080808;    /* account header / inset surface */
   --color-bg-card: #0a0a0a;          /* card / dialog */
-  --color-bg-card-hover: #161616;
+  --color-bg-card-hover: #0f0f0f;
   --color-bg-exhausted: #1a0f0f;
-  --color-bg-input: #111111;
+  --color-bg-input: #080808;
   --color-text-primary: #ededed;    /* light ink */
-  --color-text-secondary: #b0b0b0;  /* body (slightly brighter) */
-  --color-text-muted: #7a7a7a;      /* mute (slightly brighter) */
+  --color-text-secondary: #a8a8a8;  /* body (brighter than mockup) */
+  --color-text-muted: #6f6f6f;      /* mute (brighter than mockup) */
   --color-notion-blue: #3291ff;     /* link */
   --color-notion-blue-hover: #1d6fe0;
   --color-ok: #4ade80;
   --color-warn: #f5a623;
   --color-err: #ff5c5c;
-  --color-border: #242424;          /* hairline */
-  --color-hairline-strong: #3a3a3a;
+  --color-border: rgba(255, 255, 255, 0.08);   /* translucent hairline */
+  --color-hairline-strong: rgba(255, 255, 255, 0.14);
   --color-research: #a371f7;
 
-  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  --font-sans: "Geist", system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
 }
 
 * {
@@ -72,17 +74,13 @@ body {
   50% { opacity: 0.4; }
 }
 
-/* ── Signature multi-stop mesh gradient ────────────────────────
-   The brand's only decoration: cyan / blue / violet / magenta / amber /
-   coral stops collapsed into one atmospheric glow over the black canvas. */
+/* Legacy mesh helper kept for any consumer that still references it. The hero
+   now uses the mockup's subtle white/blue/violet glow blobs inline. */
 .mesh-hero {
   background:
-    radial-gradient(40% 60% at 12% 18%, rgba(0, 124, 240, 0.50), transparent 60%),
-    radial-gradient(36% 55% at 38% 6%, rgba(0, 223, 216, 0.40), transparent 60%),
-    radial-gradient(45% 65% at 64% 20%, rgba(121, 40, 202, 0.45), transparent 62%),
-    radial-gradient(42% 60% at 86% 8%, rgba(255, 0, 128, 0.40), transparent 60%),
-    radial-gradient(50% 70% at 100% 42%, rgba(249, 203, 40, 0.32), transparent 62%),
-    radial-gradient(45% 70% at 80% 62%, rgba(255, 77, 77, 0.28), transparent 60%);
+    radial-gradient(40% 60% at 12% 18%, rgba(0, 124, 240, 0.30), transparent 60%),
+    radial-gradient(45% 65% at 64% 20%, rgba(121, 40, 202, 0.28), transparent 62%),
+    radial-gradient(42% 60% at 86% 8%, rgba(255, 0, 128, 0.22), transparent 60%);
   background-size: 200% 200%;
   filter: blur(48px) saturate(1.1);
   animation: meshShift 20s ease-in-out infinite;
@@ -92,8 +90,7 @@ body {
   50% { background-position: 100% 50%; }
 }
 
-/* ── Stacked-shadow elevation ladder (dark) ──────────────────
-   Inset hairline ring + layered deep drops. */
+/* Stacked-shadow elevation ladder (dark). */
 .shadow-card {
   box-shadow:
     0 0 0 1px rgba(255, 255, 255, 0.06),
@@ -111,7 +108,7 @@ body {
     0px 24px 48px -12px rgba(0, 0, 0, 0.7);
 }
 
-/* Small section label — now a clean sans label (no monospace, no uppercase). */
+/* Small section label. */
 .eyebrow {
   font-family: var(--font-sans);
   font-size: 12.5px;
@@ -122,9 +119,7 @@ body {
   color: var(--color-text-secondary);
 }
 
-/* ── Chat streaming affordances ───────────────────────────
-   A blinking caret shows the answer is still being written; the three
-   dots show the agent is thinking before any text has arrived. */
+/* Chat streaming affordances. */
 @keyframes blink {
   0%, 100% { opacity: 1; }
   50% { opacity: 0; }
@@ -152,8 +147,7 @@ body {
   animation: dotFlash 1.2s infinite both;
 }
 
-/* Break long unbroken tokens (URLs, hashes) so chat bubbles never force a
-   horizontal scrollbar on the whole page. */
+/* Break long unbroken tokens so chat bubbles never force a page scrollbar. */
 .wrap-anywhere {
   overflow-wrap: anywhere;
   word-break: break-word;
