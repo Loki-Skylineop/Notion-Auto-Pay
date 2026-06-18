@@ -112,6 +112,39 @@ export const IconChevronRight = ({ size, className }: IconProps) => (
   </svg>
 )
 
+// ── Brand marks ── minimalist MotherDuck-style line shapes ─────────────
+
+// Signature double water ripple.
+export const IconWave = ({ size, className }: IconProps) => (
+  <svg {...baseProps(size)} className={className}>
+    <path d="M2 9c2.2 0 2.2-2.6 4.4-2.6S8.6 9 10.8 9 13 6.4 15.2 6.4 17.4 9 19.6 9 22 6.4 22 6.4" />
+    <path d="M2 15c2.2 0 2.2-2.6 4.4-2.6S8.6 15 10.8 15 13 12.4 15.2 12.4 17.4 15 19.6 15 22 12.4 22 12.4" />
+  </svg>
+)
+
+// Soft four-point sparkle.
+export const IconSpark = ({ size, className }: IconProps) => (
+  <svg {...baseProps(size)} className={className}>
+    <path d="M12 3c.4 4.6 1.4 5.6 6 6-4.6.4-5.6 1.4-6 6-.4-4.6-1.4-5.6-6-6 4.6-.4 5.6-1.4 6-6z" />
+  </svg>
+)
+
+// Rounded wallet for payment surfaces.
+export const IconWallet = ({ size, className }: IconProps) => (
+  <svg {...baseProps(size)} className={className}>
+    <path d="M3 7a2 2 0 0 1 2-2h13a1 1 0 0 1 1 1v2" />
+    <path d="M3 7v10a2 2 0 0 0 2 2h14a1 1 0 0 0 1-1v-3" />
+    <path d="M21 11h-4a2 2 0 0 0 0 4h4a1 1 0 0 0 1-1v-2a1 1 0 0 0-1-1z" />
+  </svg>
+)
+
+// Quick "auto" action bolt.
+export const IconBolt = ({ size, className }: IconProps) => (
+  <svg {...baseProps(size)} className={className}>
+    <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" />
+  </svg>
+)
+
 // Spinner: stroke uses currentColor; consumer adds animate-spin.
 export const IconSpinner = ({ size = 14, className }: { size?: number; className?: string }) => (
   <svg

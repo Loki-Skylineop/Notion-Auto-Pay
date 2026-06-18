@@ -1,28 +1,39 @@
 @import "tailwindcss";
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap");
+
+/* MotherDuck-style display font; gracefully falls back to the mono stack. */
+@font-face {
+  font-family: "Aeonik Mono";
+  src: url("https://motherduck.com/fonts/AeonikMono/AeonikMono-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
 
 @theme {
-  /* Pure-black dark system: near-black canvas, soft light ink, hairline
-     borders and a single multi-stop mesh gradient as the only chrome. */
-  --color-bg-primary: #000000;      /* page body */
-  --color-bg-secondary: #111111;    /* inset surface */
-  --color-bg-card: #0a0a0a;          /* card / dialog */
-  --color-bg-card-hover: #161616;
-  --color-bg-exhausted: #1a0f0f;
-  --color-bg-input: #111111;
-  --color-text-primary: #ededed;    /* light ink */
-  --color-text-secondary: #b0b0b0;  /* body (slightly brighter) */
-  --color-text-muted: #7a7a7a;      /* mute (slightly brighter) */
-  --color-notion-blue: #3291ff;     /* link */
-  --color-notion-blue-hover: #1d6fe0;
-  --color-ok: #4ade80;
-  --color-warn: #f5a623;
-  --color-err: #ff5c5c;
-  --color-border: #242424;          /* hairline */
-  --color-hairline-strong: #3a3a3a;
-  --color-research: #a371f7;
+  /* Warm light system inspired by MotherDuck: cream canvas, graphite ink,
+     sky-blue accent, flat hairline borders, (almost) no shadows. */
+  --color-bg-primary: #f4efea;      /* page body — Bunny Hop cream */
+  --color-bg-secondary: #ece4db;    /* inset surface */
+  --color-bg-card: #fbf9f6;         /* card / dialog */
+  --color-bg-card-hover: #f2ebe3;
+  --color-bg-exhausted: #f7e6dd;    /* low-credit / warning tint */
+  --color-bg-input: #ffffff;
+  --color-text-primary: #383838;    /* graphite ink */
+  --color-text-secondary: #5d564e;  /* body */
+  --color-text-muted: #8c8278;      /* mute */
+  --color-notion-blue: #1f7fc2;     /* readable link/accent on cream */
+  --color-notion-blue-hover: #17648f;
+  --color-accent: #97d4ff;          /* MotherDuck sky accent (fills) */
+  --color-ok: #3f9e5a;
+  --color-warn: #c77d1a;
+  --color-err: #cf4b3f;
+  --color-border: #ded4c8;          /* warm hairline */
+  --color-hairline-strong: #383838; /* signature charcoal edge */
+  --color-research: #8a63d2;
 
   --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
-  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
+  --font-mono: "Aeonik Mono", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
 }
 
 * {
@@ -37,16 +48,27 @@ html {
 body {
   margin: 0;
   font-family: var(--font-sans);
-  background: #000000;
+  background: #f4efea;
   color: var(--color-text-primary);
   line-height: 1.5;
   min-height: 100vh;
-  letter-spacing: -0.011em;
+  letter-spacing: -0.006em;
+}
+
+/* Monospace, lightly tracked headings — the MotherDuck signature.
+   Wrapped in the base layer so Tailwind utilities can still override. */
+@layer base {
+  h1, h2, h3, h4 {
+    font-family: var(--font-mono);
+    font-weight: 400;
+    letter-spacing: 0.01em;
+    color: var(--color-text-primary);
+  }
 }
 
 ::selection {
-  background: rgba(255, 255, 255, 0.2);
-  color: #ffffff;
+  background: rgba(151, 212, 255, 0.5);
+  color: #383838;
 }
 
 ::-webkit-scrollbar {
@@ -57,11 +79,11 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.14);
+  background: rgba(56, 56, 56, 0.18);
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.26);
+  background: rgba(56, 56, 56, 0.32);
 }
 
 @keyframes spin {
@@ -72,19 +94,17 @@ body {
   50% { opacity: 0.4; }
 }
 
-/* ── Signature multi-stop mesh gradient ──────────────────────────────
-   The brand's only decoration: cyan / blue / violet / magenta / amber /
-   coral stops collapsed into one atmospheric glow over the black canvas. */
+/* ── Signature soft mesh (light) ───────────────────────────────
+   Sky-blue, peach and cream blobs drifting over the warm canvas. */
 .mesh-hero {
   background:
-    radial-gradient(40% 60% at 12% 18%, rgba(0, 124, 240, 0.50), transparent 60%),
-    radial-gradient(36% 55% at 38% 6%, rgba(0, 223, 216, 0.40), transparent 60%),
-    radial-gradient(45% 65% at 64% 20%, rgba(121, 40, 202, 0.45), transparent 62%),
-    radial-gradient(42% 60% at 86% 8%, rgba(255, 0, 128, 0.40), transparent 60%),
-    radial-gradient(50% 70% at 100% 42%, rgba(249, 203, 40, 0.32), transparent 62%),
-    radial-gradient(45% 70% at 80% 62%, rgba(255, 77, 77, 0.28), transparent 60%);
+    radial-gradient(42% 60% at 14% 18%, rgba(151, 212, 255, 0.55), transparent 60%),
+    radial-gradient(38% 55% at 40% 6%, rgba(150, 208, 244, 0.45), transparent 60%),
+    radial-gradient(46% 65% at 66% 20%, rgba(240, 180, 144, 0.40), transparent 62%),
+    radial-gradient(44% 60% at 88% 10%, rgba(249, 149, 62, 0.30), transparent 60%),
+    radial-gradient(52% 70% at 100% 44%, rgba(244, 236, 234, 0.60), transparent 62%);
   background-size: 200% 200%;
-  filter: blur(48px) saturate(1.1);
+  filter: blur(46px) saturate(1.05);
   animation: meshShift 20s ease-in-out infinite;
 }
 @keyframes meshShift {
@@ -92,34 +112,30 @@ body {
   50% { background-position: 100% 50%; }
 }
 
-/* ── Stacked-shadow elevation ladder (dark) ────────────────────────
-   Inset hairline ring + layered deep drops. */
+/* ── Flat elevation: hairline rings, no heavy drops ────────────────── */
 .shadow-card {
-  box-shadow:
-    0 0 0 1px rgba(255, 255, 255, 0.06),
-    0px 1px 2px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 0 0 1px rgba(56, 56, 56, 0.08);
 }
 .shadow-float {
   box-shadow:
-    0 0 0 1px rgba(255, 255, 255, 0.07),
-    0px 4px 8px -2px rgba(0, 0, 0, 0.5);
+    0 0 0 1px rgba(56, 56, 56, 0.10),
+    0 2px 6px -2px rgba(56, 56, 56, 0.12);
 }
 .shadow-modal {
   box-shadow:
-    0 0 0 1px rgba(255, 255, 255, 0.08),
-    0px 8px 16px -4px rgba(0, 0, 0, 0.5),
-    0px 24px 48px -12px rgba(0, 0, 0, 0.7);
+    0 0 0 1px rgba(56, 56, 56, 0.12),
+    0 12px 32px -12px rgba(56, 56, 56, 0.28);
 }
 
-/* Small section label — now a clean sans label (no monospace, no uppercase). */
+/* Small section label. */
 .eyebrow {
-  font-family: var(--font-sans);
-  font-size: 12.5px;
+  font-family: var(--font-mono);
+  font-size: 12px;
   line-height: 16px;
-  letter-spacing: 0;
-  text-transform: none;
-  font-weight: 500;
-  color: var(--color-text-secondary);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  font-weight: 400;
+  color: var(--color-text-muted);
 }
 
 @media (prefers-reduced-motion: reduce) {
