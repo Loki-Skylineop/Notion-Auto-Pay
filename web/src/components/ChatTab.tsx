@@ -16,6 +16,7 @@ import { fetchAutoPayConfig, type ServerAutoPayConfig } from '../autopay'
 import type { DiscoveredAccount } from './WorkspacePool'
 import { ParticleField } from './ParticleField'
 import { Dropdown } from './Dropdown'
+import { chatSync, type ChatSyncResult } from '../chatSync'
 
 // The chat shell fills the viewport below the dashboard header. dvh keeps it
 // honest on mobile where the browser chrome shrinks the visible area.
@@ -771,6 +772,11 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const stopRef = useRef(false)
   const streamThreadIdRef = useRef('')
   const turnSeqRef = useRef(0)
+  // Poll-loop bookkeeping for the version-gated chatSync mirror of Notion's
+  // ~1s record polling. pollTokenRef cancels a stale loop when the user
+  // switches threads; pollVersionRef holds the last applied thread version.
+  const pollTokenRef = useRef(0)
+  const pollVersionRef = useRef(-1)
 
   useEffect(() => {
     viewKeyRef.current = activeThreadId || NEW_KEY
@@ -922,18 +928,68 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     })
   }, [messages.length])
 
+  // stopPolling cancels any live poll loop by advancing the token it checks.
+  const stopPolling = useCallback(() => {
+    pollTokenRef.current += 1
+  }, [])
+
+  // startPolling is the faithful port of the Notion web client's continuous
+  // syncRecordValuesSpaceInitial polling. While a turn is in-flight -- whether
+  // started here or on another device, and even if the stream connection has
+  // dropped -- it folds in new/updated messages as soon as the thread version
+  // advances, and stops once the server reports the turn is no longer running.
+  const startPolling = useCallback((space: SpaceOption, threadId: string) => {
+    if (!space || !threadId) return
+    const myToken = ++pollTokenRef.current
+    pollVersionRef.current = -1
+    const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+    const loop = async () => {
+      // Let the server persist the just-started turn before the first poll.
+      await sleep(1500)
+      while (pollTokenRef.current === myToken) {
+        let res: ChatSyncResult | null = null
+        try {
+          res = await chatSync({
+            token_v2: space.account.token_v2,
+            user_id: space.account.user_id,
+            space_id: space.spaceId,
+            thread_id: threadId,
+            since_version: pollVersionRef.current,
+          })
+        } catch {
+          await sleep(1500)
+          continue
+        }
+        if (pollTokenRef.current !== myToken) return
+        if (!res) {
+          await sleep(1500)
+          continue
+        }
+        if (res.changed && res.messages && viewKeyRef.current === threadId) {
+          setMessages(res.messages.map((m) => ({ role: m.role, text: m.text, steps: m.steps })))
+        }
+        if (res.version >= 0) pollVersionRef.current = res.version
+        if (!res.running) return
+        await sleep(1500)
+      }
+    }
+    void loop()
+  }, [])
+
   const startNewChat = useCallback(() => {
+    stopPolling()
     instantScrollRef.current = true
     setActiveThreadId('')
     setMessages([])
     setVisibleCount(PAGE_SIZE)
     setError('')
     setSidebarOpen(false)
-  }, [])
+  }, [stopPolling])
 
   const openThread = useCallback(
     async (t: ChatThread) => {
       if (!activeSpace) return
+      stopPolling()
       instantScrollRef.current = true
       setActiveThreadId(t.id)
       setSidebarOpen(false)
@@ -951,6 +1007,11 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           thread_id: t.id,
         })
         setMessages(hist.map((m) => ({ role: m.role, text: m.text, steps: m.steps })))
+        // Keep mirroring the server while the thread is open so a turn that is
+        // still running (or was started elsewhere) streams in, and the final
+        // state lands without a manual reopen. The loop stops itself once the
+        // server reports no in-flight turn.
+        startPolling(activeSpace, t.id)
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Не удалось загрузить историю чата')
       } finally {
@@ -958,7 +1019,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         setHistoryLoading(false)
       }
     },
-    [activeSpace, agents],
+    [activeSpace, agents, startPolling, stopPolling],
   )
 
   const deleteThread = useCallback(
@@ -1004,6 +1065,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
 
   const handleStop = useCallback(() => {
     if (!sending) return
+    stopPolling()
     stopRef.current = true
     const partial = liveText.trim()
     const carriedSteps = liveSteps
@@ -1029,7 +1091,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         thread_id: tid,
       }).then(() => reconcileFromServer(activeSpace, tid))
     }
-  }, [sending, liveText, liveSteps, activeSpace, reconcileFromServer])
+  }, [sending, liveText, liveSteps, activeSpace, reconcileFromServer, stopPolling])
 
   const handleSend = useCallback(
     async (msg: string) => {
@@ -1044,6 +1106,10 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       setError('')
       setMessages((prev) => [...prev, { role: 'user', text }])
       setSending(true)
+      // Mirror Notion's live record polling for the duration of the turn so the
+      // open chat keeps updating even if the stream stalls. A brand-new thread
+      // has no id yet, so polling is (re)started below with res.thread_id.
+      if (activeThreadId) startPolling(activeSpace, activeThreadId)
       setStreamKey(originKey)
       setStatus(null)
       setLiveSteps([])
@@ -1137,9 +1203,10 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
             { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps },
           ])
         }
-        // Pull the freshly persisted thread state so the message list matches
-        // the server without needing a manual reopen (sync fix).
-        if (res.thread_id) reconcileFromServer(activeSpace, res.thread_id)
+        // Keep polling the freshly persisted thread state so the message list
+        // converges to the server without a manual reopen. The loop applies the
+        // final history and then stops once the turn is no longer in-flight.
+        if (res.thread_id) startPolling(activeSpace, res.thread_id)
       } catch (e) {
         if (viewKeyRef.current === originKey && !stopRef.current) {
           setError(e instanceof Error ? e.message : 'Ошибка отправки')
@@ -1157,7 +1224,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         }
       }
     },
-    [activeSpace, sending, activeThreadId, agentId, selectedModel, rememberThreadAgent, reconcileFromServer],
+    [activeSpace, sending, activeThreadId, agentId, selectedModel, rememberThreadAgent, startPolling],
   )
 
   if (accounts.length === 0) {
