@@ -72,7 +72,7 @@ body {
   50% { opacity: 0.4; }
 }
 
-/* ── Signature multi-stop mesh gradient ──────────────────────────────
+/* ── Signature multi-stop mesh gradient ────────────────────────
    The brand's only decoration: cyan / blue / violet / magenta / amber /
    coral stops collapsed into one atmospheric glow over the black canvas. */
 .mesh-hero {
@@ -92,7 +92,7 @@ body {
   50% { background-position: 100% 50%; }
 }
 
-/* ── Stacked-shadow elevation ladder (dark) ────────────────────────
+/* ── Stacked-shadow elevation ladder (dark) ──────────────────
    Inset hairline ring + layered deep drops. */
 .shadow-card {
   box-shadow:
@@ -122,6 +122,45 @@ body {
   color: var(--color-text-secondary);
 }
 
+/* ── Chat streaming affordances ───────────────────────────
+   A blinking caret shows the answer is still being written; the three
+   dots show the agent is thinking before any text has arrived. */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+.stream-caret {
+  display: inline-block;
+  width: 6px;
+  height: 1.05em;
+  margin-left: 2px;
+  vertical-align: -0.16em;
+  background: var(--color-notion-blue);
+  border-radius: 1px;
+  animation: blink 1.05s step-start infinite;
+}
+@keyframes dotFlash {
+  0%, 80%, 100% { opacity: 0.2; transform: translateY(0); }
+  40% { opacity: 1; transform: translateY(-2px); }
+}
+.dot-flash {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 9999px;
+  background: currentColor;
+  animation: dotFlash 1.2s infinite both;
+}
+
+/* Break long unbroken tokens (URLs, hashes) so chat bubbles never force a
+   horizontal scrollbar on the whole page. */
+.wrap-anywhere {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .mesh-hero { animation: none; }
+  .stream-caret { animation: none; }
+  .dot-flash { animation: none; opacity: 0.6; }
 }
