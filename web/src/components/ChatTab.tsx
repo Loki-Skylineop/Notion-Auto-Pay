@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   chatAgents,
   chatDelete,
@@ -24,6 +24,23 @@ const gridStyle: React.CSSProperties = { height: 'calc(100vh - 190px)' }
 // the user scrolls to the top of the log. Keeping the rendered set small keeps
 // very long threads snappy (lazy loading).
 const PAGE_SIZE = 30
+
+// Sentinel view-key for the "new chat" view (no thread id yet). Used to keep an
+// in-flight stream's status bound to the chat it was started from.
+const NEW_KEY = '__new__'
+
+// localStorage key for remembering which agent was last used in each thread, so
+// reopening a chat restores the agent it was created with.
+const THREAD_AGENT_KEY = 'nmp_thread_agent'
+
+function loadThreadAgents(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(THREAD_AGENT_KEY)
+    return raw ? (JSON.parse(raw) as Record<string, string>) : {}
+  } catch {
+    return {}
+  }
+}
 
 interface SpaceOption {
   key: string
@@ -101,6 +118,67 @@ function TrashIcon() {
   )
 }
 
+// GitHub octocat mark — shown for GitHub MCP tool calls so the user can tell at a
+// glance which connector the agent is hitting.
+function GithubMark() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M12 .5C5.37.5 0 5.78 0 12.29c0 5.2 3.44 9.6 8.21 11.16.6.11.82-.26.82-.58 0-.29-.01-1.04-.02-2.05-3.34.72-4.04-1.6-4.04-1.6-.55-1.38-1.34-1.75-1.34-1.75-1.09-.74.08-.73.08-.73 1.2.08 1.84 1.23 1.84 1.23 1.07 1.82 2.81 1.3 3.5.99.11-.77.42-1.3.76-1.6-2.67-.3-5.47-1.32-5.47-5.87 0-1.3.47-2.36 1.24-3.19-.12-.3-.54-1.52.12-3.18 0 0 1.01-.32 3.3 1.22.96-.26 1.98-.39 3-.4 1.02.01 2.04.14 3 .4 2.28-1.54 3.29-1.22 3.29-1.22.66 1.66.24 2.88.12 3.18.77.83 1.24 1.89 1.24 3.19 0 4.56-2.81 5.57-5.49 5.86.43.36.81 1.09.81 2.2 0 1.59-.01 2.87-.01 3.26 0 .32.22.7.83.58A12.01 12.01 0 0 0 24 12.29C24 5.78 18.63.5 12 .5z" />
+    </svg>
+  )
+}
+
+// Generic MCP / connector icon (a small stack) for non-GitHub MCP servers.
+function McpIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="3" y="4" width="18" height="6" rx="1.5" />
+      <rect x="3" y="14" width="18" height="6" rx="1.5" />
+    </svg>
+  )
+}
+
+function ToolWrench() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18v3h3l6.3-6.3a4 4 0 0 0 5.4-5.4l-2.5 2.5-2.2-.6-.6-2.2 2.3-2.3z" />
+    </svg>
+  )
+}
+
+// parseTool turns a raw tool identifier (e.g. "connections.mcpServer_github.get_me")
+// into a friendly label plus connector hints used to pick the icon.
+function parseTool(tool?: string): { label: string; server?: string; isMcp: boolean } {
+  const raw = (tool || '').trim()
+  if (!raw) return { label: 'Инструмент', isMcp: false }
+  const t = raw
+    .replace(/^adminUserConnections\./, '')
+    .replace(/^userConnections\./, '')
+    .replace(/^connections\./, '')
+  const lower = t.toLowerCase()
+  const mcp = /mcpServer[_.]([a-zA-Z0-9]+)\.(.+)$/.exec(t)
+  let server: string | undefined
+  let label: string
+  if (mcp) {
+    server = mcp[1].toLowerCase()
+    const nice = server.charAt(0).toUpperCase() + server.slice(1)
+    label = `${nice} · ${mcp[2]}`
+  } else {
+    const seg = t.split('.')
+    label = seg.length >= 2 ? seg.slice(-2).join('.') : t
+  }
+  if (!server && lower.includes('github')) server = 'github'
+  const isMcp = !!mcp || /mcp/i.test(lower)
+  return { label, server, isMcp }
+}
+
+function ToolIcon({ tool }: { tool?: string }) {
+  const info = parseTool(tool)
+  if (info.server === 'github') return <GithubMark />
+  if (info.isMcp) return <McpIcon />
+  return <ToolWrench />
+}
+
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false)
   const onCopy = useCallback(async () => {
@@ -124,10 +202,45 @@ function CopyButton({ text }: { text: string }) {
   )
 }
 
-// --- agent steps ---
+// --- agent steps (tree view) ---
 
+function StepRow({ step }: { step: ChatStep }) {
+  if (step.kind === 'tool') {
+    const info = parseTool(step.tool || step.text)
+    return (
+      <div className="flex items-center gap-2 py-1">
+        <span className="shrink-0 w-4 h-4 flex items-center justify-center text-text-secondary">
+          <ToolIcon tool={step.tool || step.text} />
+        </span>
+        <span className="text-[12.5px] text-text-secondary truncate">{info.label}</span>
+      </div>
+    )
+  }
+  return (
+    <div className="flex gap-2 py-1">
+      <span className="shrink-0 mt-0.5">💡</span>
+      <span className="text-[12.5px] text-text-muted whitespace-pre-wrap leading-snug">{step.text}</span>
+    </div>
+  )
+}
+
+// StepsTree renders a vertical "branch" of reasoning + tool steps, mirroring the
+// agent thinking tree shown in the Notion AI client.
+function StepsTree({ steps }: { steps: ChatStep[] }) {
+  if (!steps || steps.length === 0) return null
+  return (
+    <div className="border-l border-border pl-3 ml-1 space-y-0.5">
+      {steps.map((s, i) => (
+        <StepRow key={i} step={s} />
+      ))}
+    </div>
+  )
+}
+
+// StepsBlock is the collapsible "Шаги агента" panel attached to a finished
+// assistant message. Collapsed by default — the user opens it on demand.
 function StepsBlock({ steps }: { steps: ChatStep[] }) {
-  const [open, setOpen] = useState(true)
+  const [open, setOpen] = useState(false)
   if (!steps || steps.length === 0) return null
   return (
     <div className="mb-2 rounded-lg border border-border bg-bg-secondary overflow-hidden">
@@ -140,22 +253,8 @@ function StepsBlock({ steps }: { steps: ChatStep[] }) {
         <span>{open ? '▾' : '▸'}</span>
       </button>
       {open && (
-        <div className="px-2.5 pb-2 space-y-1.5">
-          {steps.map((s, i) => (
-            <div key={i} className="text-[12px] leading-snug">
-              {s.kind === 'tool' ? (
-                <div className="flex items-center gap-1.5 text-notion-blue">
-                  <span>🔧</span>
-                  <span className="font-medium">{s.tool || s.text}</span>
-                </div>
-              ) : (
-                <div className="flex gap-1.5 text-text-secondary">
-                  <span className="shrink-0">💡</span>
-                  <span className="whitespace-pre-wrap">{s.text}</span>
-                </div>
-              )}
-            </div>
-          ))}
+        <div className="px-2.5 pb-2 pt-1">
+          <StepsTree steps={steps} />
         </div>
       )}
     </div>
@@ -208,6 +307,35 @@ function isTableSeparator(line: string): boolean {
   return t.includes('-') && /^\|?[\s:|-]+\|?$/.test(t)
 }
 
+// A fenced code block with a small copy button in the top-right corner so the
+// user can grab e.g. a bash command the agent produced.
+function CodeBlock({ code, lang }: { code: string; lang?: string }) {
+  const [copied, setCopied] = useState(false)
+  const onCopy = useCallback(async () => {
+    const ok = await copyToClipboard(code)
+    if (ok) {
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1200)
+    }
+  }, [code])
+  return (
+    <div className="relative my-2">
+      <button
+        type="button"
+        onClick={onCopy}
+        title="Скопировать код"
+        className="absolute top-1.5 right-1.5 z-10 inline-flex items-center justify-center w-6 h-6 rounded-md text-text-muted hover:text-text-primary bg-bg-card border border-border cursor-pointer opacity-60 hover:opacity-100 transition-opacity"
+      >
+        {copied ? <span className="text-ok text-[11px]">✓</span> : <CopyIcon />}
+      </button>
+      <pre className="p-3 pr-9 rounded-lg bg-bg-secondary overflow-x-auto text-[12.5px] font-mono leading-relaxed">
+        {lang ? <div className="mb-1 text-[10px] uppercase tracking-wide text-text-muted">{lang}</div> : null}
+        <code>{code}</code>
+      </pre>
+    </div>
+  )
+}
+
 function renderBlocks(text: string): React.ReactNode[] {
   const lines = text.replace(/\r\n/g, '\n').split('\n')
   const blocks: React.ReactNode[] = []
@@ -226,12 +354,7 @@ function renderBlocks(text: string): React.ReactNode[] {
         i += 1
       }
       i += 1 // skip closing fence
-      blocks.push(
-        <pre key={key++} className="my-2 p-3 rounded-lg bg-bg-secondary overflow-x-auto text-[12.5px] font-mono leading-relaxed">
-          {lang ? <div className="mb-1 text-[10px] uppercase tracking-wide text-text-muted">{lang}</div> : null}
-          <code>{buf.join('\n')}</code>
-        </pre>,
-      )
+      blocks.push(<CodeBlock key={key++} code={buf.join('\n')} lang={lang} />)
       continue
     }
 
@@ -274,549 +397,4 @@ function renderBlocks(text: string): React.ReactNode[] {
     }
 
     // headings
-    const h = /^(#{1,4})\s+(.*)$/.exec(line)
-    if (h) {
-      const level = h[1].length
-      const cls = level <= 1 ? 'text-lg font-semibold' : level === 2 ? 'text-base font-semibold' : 'text-sm font-semibold'
-      blocks.push(
-        <div key={key++} className={`mt-2 mb-1 ${cls}`}>
-          {renderInline(h[2], `h${key}`)}
-        </div>,
-      )
-      i += 1
-      continue
-    }
-
-    // horizontal rule
-    if (/^\s*---+\s*$/.test(line)) {
-      blocks.push(<hr key={key++} className="my-2 border-border" />)
-      i += 1
-      continue
-    }
-
-    // unordered list
-    if (/^\s*[-*]\s+/.test(line)) {
-      const items: string[] = []
-      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
-        items.push(lines[i].replace(/^\s*[-*]\s+/, ''))
-        i += 1
-      }
-      blocks.push(
-        <ul key={key++} className="my-1.5 ml-4 list-disc space-y-0.5">
-          {items.map((it, ii) => (
-            <li key={ii}>{renderInline(it, `ul${key}-${ii}`)}</li>
-          ))}
-        </ul>,
-      )
-      continue
-    }
-
-    // ordered list
-    if (/^\s*\d+\.\s+/.test(line)) {
-      const items: string[] = []
-      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
-        items.push(lines[i].replace(/^\s*\d+\.\s+/, ''))
-        i += 1
-      }
-      blocks.push(
-        <ol key={key++} className="my-1.5 ml-4 list-decimal space-y-0.5">
-          {items.map((it, ii) => (
-            <li key={ii}>{renderInline(it, `ol${key}-${ii}`)}</li>
-          ))}
-        </ol>,
-      )
-      continue
-    }
-
-    // blank line
-    if (line.trim() === '') {
-      blocks.push(<div key={key++} className="h-2" />)
-      i += 1
-      continue
-    }
-
-    // paragraph
-    blocks.push(
-      <p key={key++} className="whitespace-pre-wrap">
-        {renderInline(line, `p${key}`)}
-      </p>,
-    )
-    i += 1
-  }
-  return blocks
-}
-
-function MessageBody({ text }: { text: string }) {
-  return <div className="space-y-0.5">{renderBlocks(text)}</div>
-}
-
-// --- main component ---
-
-export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
-  const [autoCfg, setAutoCfg] = useState<ServerAutoPayConfig | null>(null)
-  const [spaceKey, setSpaceKey] = useState('')
-  const [agents, setAgents] = useState<ChatAgent[]>([])
-  const [agentId, setAgentId] = useState('default')
-  const [models, setModels] = useState<ChatModel[]>([])
-  const [selectedModel, setSelectedModel] = useState('')
-  const [threads, setThreads] = useState<ChatThread[]>([])
-  const [activeThreadId, setActiveThreadId] = useState('')
-  const [messages, setMessages] = useState<ChatMessage[]>([])
-  const [input, setInput] = useState('')
-  const [sending, setSending] = useState(false)
-  const [status, setStatus] = useState<ChatStatus | null>(null)
-  const [historyLoading, setHistoryLoading] = useState(false)
-  const [error, setError] = useState('')
-  // Lazy loading: only the last `visibleCount` messages are rendered; scrolling
-  // to the top reveals more.
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
-  const messagesEndRef = useRef<HTMLDivElement>(null)
-  const logRef = useRef<HTMLDivElement>(null)
-
-  // Load server auto-pay config once — used to keep auto-pay-armed spaces in
-  // the picker even when they are still on the free tier.
-  useEffect(() => {
-    fetchAutoPayConfig().then(setAutoCfg).catch(() => {})
-  }, [])
-
-  // Build the visible space list: only paid spaces OR spaces with auto-pay on.
-  const spaceOptions = useMemo<SpaceOption[]>(() => {
-    const out: SpaceOption[] = []
-    for (const acc of accounts) {
-      const accountLabel = acc.user_email || acc.user_name || acc.user_id || 'Аккаунт'
-      for (const sp of acc.spaces || []) {
-        const subscribed = sp.is_subscribed === true
-        const autoArmed = !!autoCfg?.spaces?.[sp.space_id]
-        if (isFreeTier(sp.plan_type) && !subscribed && !autoArmed) continue
-        out.push({
-          key: `${acc.user_id || acc.token_v2}:${sp.space_id}`,
-          account: acc,
-          spaceId: sp.space_id,
-          spaceViewId: sp.space_view_id,
-          spaceName: sp.name || sp.space_id,
-          accountLabel,
-        })
-      }
-    }
-    return out
-  }, [accounts, autoCfg])
-
-  const activeSpace = useMemo(
-    () => spaceOptions.find((s) => s.key === spaceKey) || null,
-    [spaceOptions, spaceKey],
-  )
-
-  // Keep a valid space selected as the filtered list changes.
-  useEffect(() => {
-    if (spaceOptions.length === 0) {
-      if (spaceKey !== '') setSpaceKey('')
-      return
-    }
-    if (!spaceOptions.some((s) => s.key === spaceKey)) {
-      setSpaceKey(spaceOptions[0].key)
-    }
-  }, [spaceOptions, spaceKey])
-
-  // Load agents + threads whenever the active space changes.
-  useEffect(() => {
-    if (!activeSpace) {
-      setAgents([])
-      setThreads([])
-      return
-    }
-    const ref = {
-      token_v2: activeSpace.account.token_v2,
-      user_id: activeSpace.account.user_id,
-      space_id: activeSpace.spaceId,
-    }
-    let cancelled = false
-    chatAgents(ref)
-      .then((a) => {
-        if (cancelled) return
-        setAgents(a)
-        setAgentId((prev) => (a.some((x) => x.id === prev) ? prev : 'default'))
-      })
-      .catch(() => {
-        if (!cancelled) setAgents([{ id: 'default', name: 'Обычный агент', kind: 'default' }])
-      })
-    chatThreads(ref)
-      .then((t) => {
-        if (!cancelled) setThreads(t)
-      })
-      .catch(() => {
-        if (!cancelled) setThreads([])
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [activeSpace])
-
-  // Load the model list for the built-in assistant whenever the space changes,
-  // defaulting to Opus 4.8 (ambrosia-tart-high) when available.
-  useEffect(() => {
-    if (!activeSpace) {
-      setModels([])
-      return
-    }
-    let cancelled = false
-    chatModels({
-      token_v2: activeSpace.account.token_v2,
-      user_id: activeSpace.account.user_id,
-      space_id: activeSpace.spaceId,
-    })
-      .then((m) => {
-        if (cancelled) return
-        setModels(m)
-        const enabled = m.filter((x) => !x.disabled)
-        setSelectedModel((prev) => {
-          if (prev && enabled.some((x) => x.id === prev)) return prev
-          const opus = enabled.find((x) => x.id === 'ambrosia-tart-high')
-          return opus ? opus.id : enabled[0]?.id || ''
-        })
-      })
-      .catch(() => {
-        if (!cancelled) setModels([])
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [activeSpace])
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, sending, historyLoading])
-
-  // Only the tail of the conversation is rendered (lazy loading). Older
-  // messages are revealed PAGE_SIZE at a time when the user scrolls up.
-  const visibleMessages = useMemo(
-    () => messages.slice(Math.max(0, messages.length - visibleCount)),
-    [messages, visibleCount],
-  )
-  const hiddenCount = messages.length - visibleMessages.length
-
-  const onLogScroll = useCallback(() => {
-    const el = logRef.current
-    if (!el || el.scrollTop >= 40) return
-    setVisibleCount((c) => {
-      if (c >= messages.length) return c
-      const prevHeight = el.scrollHeight
-      // Preserve the scroll position after the taller list renders so the view
-      // doesn't jump when older messages are prepended.
-      requestAnimationFrame(() => {
-        if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight - prevHeight
-      })
-      return Math.min(messages.length, c + PAGE_SIZE)
-    })
-  }, [messages.length])
-
-  const startNewChat = useCallback(() => {
-    setActiveThreadId('')
-    setMessages([])
-    setVisibleCount(PAGE_SIZE)
-    setError('')
-  }, [])
-
-  // Open an existing thread — load its real history instead of wiping it.
-  const openThread = useCallback(
-    async (t: ChatThread) => {
-      if (!activeSpace) return
-      setActiveThreadId(t.id)
-      setError('')
-      setMessages([])
-      setVisibleCount(PAGE_SIZE)
-      setHistoryLoading(true)
-      try {
-        const hist = await chatHistory({
-          token_v2: activeSpace.account.token_v2,
-          user_id: activeSpace.account.user_id,
-          space_id: activeSpace.spaceId,
-          thread_id: t.id,
-        })
-        setMessages(hist.map((m) => ({ role: m.role, text: m.text, steps: m.steps })))
-      } catch (e) {
-        setError(e instanceof Error ? e.message : 'Не удалось загрузить историю чата')
-      } finally {
-        setHistoryLoading(false)
-      }
-    },
-    [activeSpace],
-  )
-
-  // Delete (archive) a thread from the sidebar. Optimistically removes it from
-  // the list; if it was the open thread, reset to a fresh chat.
-  const deleteThread = useCallback(
-    async (t: ChatThread, e: React.MouseEvent) => {
-      e.stopPropagation()
-      if (!activeSpace) return
-      setThreads((prev) => prev.filter((x) => x.id !== t.id))
-      if (t.id === activeThreadId) startNewChat()
-      try {
-        await chatDelete({
-          token_v2: activeSpace.account.token_v2,
-          user_id: activeSpace.account.user_id,
-          space_id: activeSpace.spaceId,
-          thread_id: t.id,
-        })
-      } catch {
-        // Already removed from the UI; ignore backend failures.
-      }
-    },
-    [activeSpace, activeThreadId, startNewChat],
-  )
-
-  const handleSend = useCallback(async () => {
-    const msg = input.trim()
-    if (!msg || !activeSpace || sending) return
-    setError('')
-    setInput('')
-    setMessages((prev) => [...prev, { role: 'user', text: msg }])
-    setSending(true)
-    setStatus(null)
-    try {
-      const res = await chatStream(
-        {
-          token_v2: activeSpace.account.token_v2,
-          user_id: activeSpace.account.user_id,
-          user_name: activeSpace.account.user_name,
-          user_email: activeSpace.account.user_email,
-          space_id: activeSpace.spaceId,
-          space_view_id: activeSpace.spaceViewId,
-          space_name: activeSpace.spaceName,
-          timezone: browserTimezone(),
-          agent: agentId,
-          model: agentId === 'default' ? selectedModel || undefined : undefined,
-          thread_id: activeThreadId || undefined,
-          message: msg,
-        },
-        (s) => setStatus(s),
-      )
-      if (res.thread_id && res.thread_id !== activeThreadId) {
-        setActiveThreadId(res.thread_id)
-        setThreads((prev) => {
-          if (prev.some((t) => t.id === res.thread_id)) return prev
-          return [{ id: res.thread_id, title: res.title || msg.slice(0, 40), type: 'workflow' }, ...prev]
-        })
-      }
-      setMessages((prev) => [
-        ...prev,
-        { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps },
-      ])
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Ошибка отправки')
-      setMessages((prev) => [...prev, { role: 'assistant', text: '⚠️ Не удалось получить ответ. Попробуйте ещё раз.' }])
-    } finally {
-      setSending(false)
-      setStatus(null)
-    }
-  }, [input, activeSpace, sending, agentId, selectedModel, activeThreadId])
-
-  const onKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault()
-        handleSend()
-      }
-    },
-    [handleSend],
-  )
-
-  if (accounts.length === 0) {
-    return (
-      <div className="p-8 text-center text-text-secondary">
-        Сначала добавьте рабочие пространства на вкладке «Оплата», чтобы начать чат.
-      </div>
-    )
-  }
-
-  const showModelPicker = agentId === 'default' && models.filter((m) => !m.disabled).length > 0
-
-  return (
-    <div className="grid grid-cols-1 md:grid-cols-[280px_1fr] gap-4 overflow-hidden" style={gridStyle}>
-      {/* Sidebar: space + agent pickers and the thread list */}
-      <aside className="flex flex-col gap-3 overflow-hidden">
-        <div className="space-y-1">
-          <label className="text-[11px] uppercase tracking-wide text-text-muted">Пространство</label>
-          <select
-            value={spaceKey}
-            onChange={(e) => setSpaceKey(e.target.value)}
-            className="w-full px-2.5 py-2 rounded-lg bg-bg-input border border-border text-text-primary text-sm"
-          >
-            {spaceOptions.length === 0 ? (
-              <option value="">Нет платных пространств</option>
-            ) : (
-              spaceOptions.map((s) => (
-                <option key={s.key} value={s.key}>
-                  {s.spaceName} · {s.accountLabel}
-                </option>
-              ))
-            )}
-          </select>
-        </div>
-
-        <div className="space-y-1">
-          <label className="text-[11px] uppercase tracking-wide text-text-muted">Агент</label>
-          <select
-            value={agentId}
-            onChange={(e) => setAgentId(e.target.value)}
-            className="w-full px-2.5 py-2 rounded-lg bg-bg-input border border-border text-text-primary text-sm"
-          >
-            {agents.map((a) => (
-              <option key={a.id} value={a.id}>
-                {a.name}{a.kind === 'custom' ? ' · кастом' : ''}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <button
-          type="button"
-          onClick={startNewChat}
-          className="w-full px-3 py-2 rounded-lg bg-notion-blue text-white text-sm font-medium hover:opacity-90 transition-opacity border-none cursor-pointer"
-        >
-          + Новый чат
-        </button>
-
-        <div className="text-[11px] uppercase tracking-wide text-text-muted pt-1">История</div>
-        <div className="flex-1 min-h-0 overflow-y-auto space-y-1 pr-1">
-          {threads.length === 0 ? (
-            <div className="text-xs text-text-muted py-2">Пока нет чатов</div>
-          ) : (
-            threads.map((t) => (
-              <div
-                key={t.id}
-                className={`group flex items-center rounded-lg transition-colors ${
-                  t.id === activeThreadId ? 'bg-bg-card' : 'hover:bg-bg-secondary'
-                }`}
-              >
-                <button
-                  type="button"
-                  onClick={() => openThread(t)}
-                  className={`flex-1 min-w-0 text-left px-2.5 py-2 rounded-lg text-sm truncate bg-transparent border-none cursor-pointer ${
-                    t.id === activeThreadId ? 'text-text-primary' : 'text-text-secondary'
-                  }`}
-                  title={t.title || 'Без названия'}
-                >
-                  {t.title || 'Без названия'}
-                </button>
-                <button
-                  type="button"
-                  onClick={(e) => deleteThread(t, e)}
-                  title="Удалить чат"
-                  className="shrink-0 mr-1 w-7 h-7 flex items-center justify-center rounded-md text-text-muted hover:text-err hover:bg-bg-secondary bg-transparent border-none cursor-pointer opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
-                >
-                  <TrashIcon />
-                </button>
-              </div>
-            ))
-          )}
-        </div>
-      </aside>
-
-      {/* Conversation pane: scrollable message log + pinned composer */}
-      <section className="flex flex-col min-h-0 overflow-hidden rounded-xl border border-border bg-bg-secondary">
-        <div ref={logRef} onScroll={onLogScroll} className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
-          {messages.length === 0 && !historyLoading && !sending ? (
-            <div className="h-full flex items-center justify-center text-center text-text-muted text-sm px-6">
-              {activeSpace
-                ? 'Напишите сообщение, чтобы начать диалог с агентом.'
-                : 'Выберите пространство с платным планом или включённой автооплатой.'}
-            </div>
-          ) : null}
-
-          {hiddenCount > 0 ? (
-            <div className="text-center text-[11px] text-text-muted py-1">
-              Прокрутите вверх, чтобы загрузить ещё · {hiddenCount}
-            </div>
-          ) : null}
-
-          {historyLoading ? (
-            <div className="flex items-center gap-2 text-text-muted text-sm">
-              <span className="inline-block w-3 h-3 rounded-full border-2 border-text-muted border-t-transparent animate-spin" />
-              Загружаю историю…
-            </div>
-          ) : null}
-
-          {visibleMessages.map((msg, idx) => {
-            const gi = hiddenCount + idx
-            return (
-              <div key={gi} className={`flex flex-col ${msg.role === 'user' ? 'items-end' : 'items-start'}`}>
-                <div
-                  className={`max-w-[85%] px-3.5 py-2.5 rounded-2xl text-[14px] leading-relaxed ${
-                    msg.role === 'user'
-                      ? 'bg-white text-black rounded-br-sm'
-                      : 'bg-bg-card border border-border text-text-primary rounded-bl-sm'
-                  }`}
-                >
-                  {msg.role === 'assistant' && msg.steps && msg.steps.length > 0 ? <StepsBlock steps={msg.steps} /> : null}
-                  <MessageBody text={msg.text} />
-                </div>
-                <CopyButton text={msg.text} />
-              </div>
-            )
-          })}
-
-          {sending ? (
-            <div className="flex flex-col items-start w-full">
-              <div className="max-w-[85%] w-full px-3.5 py-2.5 rounded-2xl rounded-bl-sm bg-bg-card border border-border">
-                <div className="flex items-center gap-2 text-text-primary text-[13px] font-medium">
-                  <span className="inline-block w-3 h-3 rounded-full border-2 border-text-muted border-t-transparent animate-spin" />
-                  {status?.label || 'Агент работает…'}
-                </div>
-                {status?.detail ? (
-                  <div className="mt-1.5 text-[12px] leading-snug text-text-muted whitespace-pre-wrap max-h-40 overflow-y-auto">
-                    {status.detail}
-                  </div>
-                ) : null}
-              </div>
-            </div>
-          ) : null}
-
-          <div ref={messagesEndRef} />
-        </div>
-
-        {error ? (
-          <div className="px-4 py-2 text-sm text-err border-t border-border bg-bg-secondary">{error}</div>
-        ) : null}
-
-        <div className="border-t border-border p-3 bg-bg-secondary">
-          <div className="flex items-end gap-2">
-            <textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={onKeyDown}
-              rows={1}
-              placeholder={activeSpace ? 'Сообщение… (Enter — отправить, Shift+Enter — перенос)' : 'Сначала выберите пространство'}
-              disabled={!activeSpace || sending}
-              className="flex-1 resize-none max-h-32 px-3 py-2 rounded-lg bg-bg-input border border-border text-text-primary text-sm focus:outline-none focus:border-notion-blue disabled:opacity-50"
-            />
-            {showModelPicker ? (
-              <select
-                value={selectedModel}
-                onChange={(e) => setSelectedModel(e.target.value)}
-                disabled={sending}
-                title="Модель агента"
-                className="shrink-0 max-w-[150px] px-2 py-2 rounded-lg bg-bg-input border border-border text-text-primary text-[13px] focus:outline-none focus:border-notion-blue disabled:opacity-50 cursor-pointer"
-              >
-                {models
-                  .filter((m) => !m.disabled)
-                  .map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.label}
-                    </option>
-                  ))}
-              </select>
-            ) : null}
-            <button
-              type="button"
-              onClick={handleSend}
-              disabled={!activeSpace || sending || input.trim() === ''}
-              className="px-4 py-2 rounded-lg bg-notion-blue text-white text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-40 border-none cursor-pointer shrink-0"
-            >
-              Отправить
-            </button>
-          </div>
-        </div>
-      </section>
-    </div>
-  )
-}
+    const h = /^(#{1,4})\s+(
