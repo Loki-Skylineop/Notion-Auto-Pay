@@ -825,7 +825,9 @@ func emitStep(emit func(map[string]interface{}), label string, m sMeta) {
 
 // processStreamLine parses one ndjson line of the patch stream and emits a
 // best-effort "status" event describing what the agent is doing right now.
-func processStreamLine(line []byte, sItems *[]sMeta, emit func(map[string]interface{})) {
+// answer accumulates the streamed answer text so the frontend can render the
+// reply as it is typed out (live text deltas), not just at the end.
+func processStreamLine(line []byte, sItems *[]sMeta, answer *strings.Builder, emit func(map[string]interface{})) {
 	var probe struct {
 		Type string `json:"type"`
 	}
@@ -877,7 +879,8 @@ func processStreamLine(line []byte, sItems *[]sMeta, emit func(map[string]interf
 						meta.thinking += delta
 						emit(map[string]interface{}{"event": "status", "label": "Размышляю", "detail": meta.thinking, "kind": "thought"})
 					} else if meta.partTypes[part] == "text" {
-						emit(map[string]interface{}{"event": "status", "label": "Отвечаю", "detail": "", "kind": "text"})
+						answer.WriteString(delta)
+						emit(map[string]interface{}{"event": "status", "label": "Отвечаю", "detail": answer.String(), "kind": "text"})
 					}
 				}
 			}
@@ -935,6 +938,7 @@ func HandleChatStream(auth *DashboardAuth) http.HandlerFunc {
 
 		var acc bytes.Buffer
 		var sItems []sMeta
+		var answer strings.Builder
 		sc := bufio.NewScanner(resp.Body)
 		sc.Buffer(make([]byte, 1024*1024), 32*1024*1024)
 		for sc.Scan() {
@@ -943,7 +947,7 @@ func HandleChatStream(auth *DashboardAuth) http.HandlerFunc {
 			acc.WriteByte('\n')
 			lineCopy := make([]byte, len(line))
 			copy(lineCopy, line)
-			processStreamLine(lineCopy, &sItems, emit)
+			processStreamLine(lineCopy, &sItems, &answer, emit)
 		}
 		text, title, steps := parseInferenceStream(acc.Bytes())
 		if strings.TrimSpace(text) == "" {
