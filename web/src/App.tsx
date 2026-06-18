@@ -5,8 +5,7 @@ import { ChatTab } from './components/ChatTab'
 
 // Pull the persisted accounts + their workspaces straight from the server so
 // the pool shows up even in a fresh browser / incognito window where the
-// localStorage cache (nmp_discovered_workspaces) is empty. The /admin/workspaces
-// endpoint returns the same shape we cache locally, so the two merge cleanly.
+// localStorage cache (nmp_discovered_workspaces) is empty.
 async function fetchServerWorkspaces(): Promise<DiscoveredAccount[]> {
   const resp = await fetch('/admin/workspaces', {
     headers: { Accept: 'application/json' },
@@ -32,36 +31,59 @@ async function fetchServerWorkspaces(): Promise<DiscoveredAccount[]> {
     }))
 }
 
-const IconPlus = () => (
-  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+const IconPlus = ({ size = 14 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
     <line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
   </svg>
 )
 
-const IconSpark = () => (
-  <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-    <path d="M12 2l1.7 6.3L20 10l-6.3 1.7L12 18l-1.7-6.3L4 10l6.3-1.7z" />
+const IconLogOut = ({ size = 12 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" />
   </svg>
 )
 
+const IconEye = ({ size = 14 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7-11-7-11-7z" /><circle cx="12" cy="12" r="3" />
+  </svg>
+)
+
+const IconEyeOff = ({ size = 14 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" /><line x1="1" y1="1" x2="23" y2="23" />
+  </svg>
+)
+
+const IconClose = ({ size = 15 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+  </svg>
+)
+
+// Subtle white radial glow behind the hero, matching the mockup.
+const HERO_GLOW = { background: 'radial-gradient(ellipse, rgba(255,255,255,0.045) 0%, transparent 70%)' }
+
 // Top-level tab switcher between the payment pool (Оплата) and the AI chat
-// surface (Чат). Rendered centered inside the hero band.
+// surface (Чат). Rendered as the mockup's capsule pill.
 function TabBar({ tab, onChange }: { tab: 'pay' | 'chat'; onChange: (t: 'pay' | 'chat') => void }) {
-  const base = 'h-9 px-5 rounded-full text-[13px] font-medium cursor-pointer transition-colors border-none'
-  const active = 'bg-white text-black'
-  const idle = 'bg-transparent text-text-secondary hover:text-text-primary'
   return (
-    <div className="flex items-center gap-1 bg-bg-secondary border border-border rounded-full p-1 w-fit mx-auto">
-      <button onClick={() => onChange('pay')} className={`${base} ${tab === 'pay' ? active : idle}`}>Оплата</button>
-      <button onClick={() => onChange('chat')} className={`${base} ${tab === 'chat' ? active : idle}`}>Чат</button>
+    <div className="p-[3px] rounded-full bg-white/[0.03] border border-white/[0.07]">
+      {(['pay', 'chat'] as const).map(t => (
+        <button
+          key={t}
+          onClick={() => onChange(t)}
+          className={`px-5 py-1.5 rounded-full text-[12px] font-medium transition-all duration-200 border-none cursor-pointer ${tab === t ? 'bg-white text-black' : 'bg-transparent text-text-muted hover:text-text-secondary'}`}
+        >
+          {t === 'pay' ? 'Оплата' : 'Чат'}
+        </button>
+      ))}
     </div>
   )
 }
 
-// Hero band carrying the brand's signature mesh-gradient atmospheric glow over
-// the black canvas. The primary "Добавить аккаунт" action and the logout
-// button live in the top-right corner; the Оплата / Чат tab switcher sits
-// centered in the band.
+// Hero band: brand capsule (top-left), primary actions (top-right), centered
+// tab pill + stats. Subtle white/blue/violet glow over the black canvas.
 function Hero({
   onAdd,
   accountCount,
@@ -78,38 +100,50 @@ function Hero({
   onTab?: (t: 'pay' | 'chat') => void
 }) {
   return (
-    <header className="relative overflow-hidden border-b border-border">
-      <div aria-hidden="true" className="mesh-hero pointer-events-none absolute -top-56 left-1/2 -translate-x-1/2 w-[150%] h-[520px] opacity-70" />
-      <div className="absolute top-4 right-4 z-10 flex items-center gap-2">
-        <button
-          onClick={onAdd}
-          className="inline-flex items-center gap-1.5 h-9 px-4 bg-white hover:bg-white/90 text-black rounded-full text-[13px] font-medium cursor-pointer transition-colors border-none"
-        >
-          <IconPlus /> Добавить аккаунт
-        </button>
-        {onLogout && (
-          <button
-            onClick={onLogout}
-            className="inline-flex items-center gap-1.5 h-9 px-3 bg-white/5 hover:bg-white/10 border border-border rounded-full text-[12px] text-text-secondary hover:text-text-primary cursor-pointer transition-colors"
-          >
-            Выйти
-          </button>
-        )}
+    <header className="relative overflow-hidden border-b border-white/[0.06]">
+      <div aria-hidden="true" className="absolute inset-0 pointer-events-none overflow-hidden">
+        <div className="absolute -top-20 left-1/2 -translate-x-1/2 w-[600px] h-[300px] rounded-full" style={HERO_GLOW} />
+        <div className="absolute -top-8 left-1/4 w-80 h-40 bg-blue-500/[0.05] blur-3xl rounded-full" />
+        <div className="absolute -top-8 right-1/4 w-64 h-36 bg-violet-500/[0.04] blur-3xl rounded-full" />
       </div>
-      <div className="relative max-w-[1100px] mx-auto px-6 pt-16 pb-12 text-center">
-        <span className="eyebrow inline-flex items-center gap-1.5 bg-white/5 backdrop-blur border border-border rounded-full px-3 py-1 shadow-card">
-          <IconSpark /> Notion Auto Pay
-        </span>
-        {tab && onTab && (
-          <div className="flex items-center justify-center gap-3 mt-7">
-            <TabBar tab={tab} onChange={onTab} />
+
+      <div className="relative max-w-4xl mx-auto px-5 sm:px-8 pt-6 pb-5">
+        <div className="flex items-center justify-between mb-6">
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/[0.08] bg-white/[0.02]">
+            <span className="text-[11px] text-white/80">\u2726</span>
+            <span className="text-[11px] text-text-muted tracking-wide font-mono">Notion Auto Pay</span>
           </div>
-        )}
-        {(accountCount > 0 || spaceCount > 0) && (
-          <div className="flex items-center justify-center gap-6 mt-9">
-            <Stat value={accountCount} label="аккаунтов" />
-            <span className="w-px h-8 bg-border" />
-            <Stat value={spaceCount} label="пространств" />
+          <div className="flex items-center gap-2">
+            <button
+              onClick={onAdd}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-white text-black text-[11px] font-medium hover:bg-[#f2f2f2] active:scale-[0.98] transition-all border-none cursor-pointer"
+            >
+              <IconPlus size={12} />
+              <span className="hidden sm:inline">Добавить аккаунт</span>
+              <span className="sm:hidden">Добавить</span>
+            </button>
+            {onLogout && (
+              <button
+                onClick={onLogout}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-white/[0.08] text-[11px] text-text-muted hover:text-text-secondary hover:border-white/[0.15] transition-colors bg-transparent cursor-pointer"
+              >
+                <IconLogOut size={12} />
+                <span className="hidden sm:inline">Выйти</span>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {tab && onTab && (
+          <div className="flex flex-col items-center gap-4">
+            <TabBar tab={tab} onChange={onTab} />
+            {(accountCount > 0 || spaceCount > 0) && (
+              <div className="flex items-center gap-6">
+                <Stat value={accountCount} label="аккаунтов" />
+                <span className="w-px h-7 bg-white/[0.06]" />
+                <Stat value={spaceCount} label="пространств" />
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -119,20 +153,20 @@ function Hero({
 
 function Stat({ value, label }: { value: number; label: string }) {
   return (
-    <div className="flex flex-col items-center">
-      <span className="text-[24px] font-semibold tracking-tight text-text-primary tabular-nums leading-none">{value}</span>
-      <span className="text-[12px] text-text-muted mt-1.5">{label}</span>
+    <div className="text-center">
+      <div className="text-[22px] font-medium text-white tabular-nums leading-none">{value}</div>
+      <div className="text-[9px] text-text-muted uppercase tracking-widest mt-1">{label}</div>
     </div>
   )
 }
 
 // --- Login Screen ---
 // Shown when the server reports that a dashboard password is required and the
-// current browser session is not yet authenticated. The actual password never
-// leaves the browser in plaintext — api.login() salts + SHA-256-hashes it
-// before POSTing to /dashboard/auth/login.
+// current browser session is not yet authenticated. api.login() salts +
+// SHA-256-hashes the password before POSTing it.
 function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
   const [password, setPassword] = useState('')
+  const [show, setShow] = useState(false)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const inputRef = useRef<HTMLInputElement>(null)
@@ -156,32 +190,43 @@ function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center px-4">
-      <div className="w-full max-w-sm bg-bg-card border border-border rounded-2xl shadow-modal p-6">
-        <div className="flex items-center justify-center gap-1.5 mb-5">
-          <IconSpark /> <span className="text-[14px] font-medium text-text-primary">Notion Auto Pay</span>
+    <div className="min-h-screen bg-black flex items-center justify-center p-4">
+      <div className="w-full max-w-sm">
+        <div className="flex justify-center mb-8">
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/[0.08] bg-white/[0.02]">
+            <span className="text-[11px] text-white">\u2726</span>
+            <span className="text-[11px] text-text-muted tracking-wide font-mono">Notion Auto Pay</span>
+          </div>
         </div>
-        <h2 className="text-[18px] font-semibold tracking-tight text-text-primary text-center mb-1">Вход в панель</h2>
-        <p className="text-[13px] text-text-muted text-center mb-5">Введите пароль для доступа к панели.</p>
-        <form onSubmit={handleSubmit}>
-          <input
-            ref={inputRef}
-            type="password"
-            value={password}
-            onChange={e => setPassword(e.target.value)}
-            placeholder="Пароль"
-            autoComplete="current-password"
-            className="w-full py-2.5 px-3 bg-bg-input border border-border rounded-lg text-[14px] text-text-primary outline-none focus:border-notion-blue focus:ring-2 focus:ring-notion-blue/20 transition-all placeholder:text-text-muted"
-          />
-          {error && (
-            <div className="text-err text-[12px] mt-2 px-1">{error}</div>
-          )}
+        <h1 className="text-center text-xl font-medium text-text-primary mb-1">Вход в панель</h1>
+        <p className="text-center text-[12px] text-text-muted mb-8">Введите пароль для доступа</p>
+
+        <form onSubmit={handleSubmit} className="space-y-3">
+          <div className="relative">
+            <input
+              ref={inputRef}
+              type={show ? 'text' : 'password'}
+              value={password}
+              onChange={e => { setPassword(e.target.value); setError('') }}
+              placeholder="Пароль"
+              autoComplete="current-password"
+              className="w-full bg-[#080808] border border-white/[0.08] rounded-lg px-3.5 py-2.5 text-[13px] text-text-primary placeholder:text-text-muted focus:outline-none focus:border-white/[0.20] transition-colors pr-10"
+            />
+            <button
+              type="button"
+              onClick={() => setShow(v => !v)}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-text-muted hover:text-text-secondary bg-transparent border-none cursor-pointer"
+            >
+              {show ? <IconEyeOff size={14} /> : <IconEye size={14} />}
+            </button>
+          </div>
+          {error && <p className="text-[12px] text-err">{error}</p>}
           <button
             type="submit"
             disabled={loading || !password}
-            className="w-full h-11 mt-4 bg-white hover:bg-white/90 text-black rounded-full text-[14px] font-medium cursor-pointer transition-colors border-none disabled:opacity-40 disabled:cursor-not-allowed"
+            className="w-full py-2.5 rounded-lg bg-white text-black text-[13px] font-medium hover:bg-[#f0f0f0] disabled:opacity-35 disabled:cursor-not-allowed transition-colors border-none cursor-pointer"
           >
-            {loading ? 'Проверка...' : 'Войти'}
+            {loading ? 'Проверка…' : 'Войти'}
           </button>
         </form>
       </div>
@@ -220,8 +265,7 @@ function AddAccountModal({ onClose, onDiscovered }: { onClose: () => void; onDis
         setLoading(false)
         return
       }
-      // Авто-обнаружение всех рабочих пространств аккаунта,
-      // чтобы они появились в пуле ниже.
+      // Авто-обнаружение всех рабочих пространств аккаунта.
       try {
         const disc = await discoverWorkspaces(trimmed)
         if (!disc.error && disc.spaces && disc.spaces.length > 0) {
@@ -239,7 +283,7 @@ function AddAccountModal({ onClose, onDiscovered }: { onClose: () => void; onDis
       }
       setTimeout(() => {
         onClose()
-      }, 1500)
+      }, 1600)
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Ошибка запроса')
     } finally {
@@ -248,56 +292,59 @@ function AddAccountModal({ onClose, onDiscovered }: { onClose: () => void; onDis
   }
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={onClose}>
-      <div className="w-full max-w-lg bg-bg-card border border-border rounded-2xl shadow-modal p-6" onClick={e => e.stopPropagation()}>
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-[18px] font-semibold tracking-tight text-text-primary">Добавить аккаунт Notion</h2>
-          <button onClick={onClose} className="w-7 h-7 flex items-center justify-center rounded-full text-text-muted hover:text-text-primary hover:bg-bg-secondary bg-transparent border-none cursor-pointer text-lg leading-none">×</button>
+    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-black/75 backdrop-blur-sm" onClick={onClose} />
+      <div className="relative w-full max-w-md rounded-xl border border-white/[0.12] bg-[#0c0c0c] shadow-modal overflow-hidden">
+        <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.07]">
+          <div className="text-[13px] font-medium text-text-primary">Добавить аккаунт Notion</div>
+          <button onClick={onClose} className="p-1 rounded text-text-muted hover:text-text-secondary bg-transparent border-none cursor-pointer">
+            <IconClose size={15} />
+          </button>
         </div>
 
-        <div className="text-[13px] text-text-secondary mb-4 space-y-1.5">
-          <p>Вставьте cookie <code className="font-mono bg-bg-secondary px-1.5 py-0.5 rounded text-[12px] text-text-primary">token_v2</code> — система автоматически получит данные аккаунта.</p>
-          <p className="text-text-muted">Как получить: откройте <code className="font-mono bg-bg-secondary px-1.5 py-0.5 rounded text-[12px] text-text-primary">notion.so</code> → F12 → Application → Cookies → скопируйте значение <code className="font-mono bg-bg-secondary px-1.5 py-0.5 rounded text-[12px] text-text-primary">token_v2</code></p>
-        </div>
-
-        <form onSubmit={handleSubmit}>
-          <textarea
-            ref={inputRef}
-            value={token}
-            onChange={e => setToken(e.target.value)}
-            placeholder="Вставьте значение token_v2..."
-            rows={3}
-            className="w-full py-2.5 px-3 bg-bg-input border border-border rounded-lg text-[13px] text-text-primary outline-none focus:border-notion-blue focus:ring-2 focus:ring-notion-blue/20 transition-all placeholder:text-text-muted resize-none font-mono"
-          />
-          {error && (
-            <div className="text-err text-[12px] mt-2 px-1">{error}</div>
-          )}
-          {result && (
-            <div className="mt-3 p-3 bg-notion-blue/10 border border-notion-blue/30 rounded-lg text-[12px]">
-              <div className="text-notion-blue font-semibold mb-1.5">Аккаунт добавлен</div>
-              <div className="space-y-0.5 text-text-secondary">
-                <div>Пользователь: <span className="text-text-primary font-medium">{result.name}</span> ({result.email})</div>
-                <div>Пространство: <span className="text-text-primary font-medium">{result.space}</span> · {result.plan_type}</div>
+        <div className="p-5 space-y-4">
+          {result ? (
+            <div className="flex flex-col items-center py-6 gap-3">
+              <div className="w-10 h-10 rounded-full bg-ok/10 border border-ok/30 flex items-center justify-center text-ok text-lg leading-none">\u2713</div>
+              <div className="text-[13px] font-medium text-text-primary">Аккаунт добавлен</div>
+              <div className="text-[11px] text-text-muted text-center">
+                {result.name} · {result.email}<br />{result.space} · {result.plan_type}
               </div>
             </div>
+          ) : (
+            <form onSubmit={handleSubmit} className="space-y-4">
+              <p className="text-[12px] text-text-secondary leading-relaxed">
+                Откройте <span className="text-text-primary">notion.so</span> → F12 → Application → Cookies →{' '}
+                <code className="px-1 py-0.5 rounded bg-white/[0.05] text-text-secondary font-mono text-[11px]">token_v2</code>
+              </p>
+              <textarea
+                ref={inputRef}
+                value={token}
+                onChange={e => { setToken(e.target.value); setError('') }}
+                placeholder="v02:user_token_or_internal:..."
+                rows={4}
+                className="w-full bg-[#080808] border border-white/[0.08] rounded-lg px-3 py-2.5 text-[12px] text-text-primary placeholder:text-text-muted font-mono resize-none focus:outline-none focus:border-white/[0.18] transition-colors"
+              />
+              {error && <p className="text-[12px] text-err">{error}</p>}
+              <div className="flex gap-2.5">
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[12px] text-text-muted hover:text-text-secondary hover:border-white/[0.14] transition-colors bg-transparent cursor-pointer"
+                >
+                  Отмена
+                </button>
+                <button
+                  type="submit"
+                  disabled={loading || !token.trim()}
+                  className="flex-1 py-2 rounded-lg bg-white text-black text-[12px] font-medium hover:bg-[#f0f0f0] disabled:opacity-35 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2 border-none cursor-pointer"
+                >
+                  {loading ? 'Проверка…' : 'Добавить аккаунт'}
+                </button>
+              </div>
+            </form>
           )}
-          <div className="flex gap-2.5 mt-5">
-            <button
-              type="button"
-              onClick={onClose}
-              className="flex-1 h-11 bg-bg-card hover:bg-bg-secondary text-text-primary rounded-full text-[14px] font-medium cursor-pointer transition-colors border border-border"
-            >
-              Отмена
-            </button>
-            <button
-              type="submit"
-              disabled={loading || !token.trim() || !!result}
-              className="flex-1 h-11 bg-white hover:bg-white/90 text-black rounded-full text-[14px] font-medium cursor-pointer transition-colors border-none disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              {loading ? 'Проверка...' : 'Добавить аккаунт'}
-            </button>
-          </div>
-        </form>
+        </div>
       </div>
     </div>
   )
@@ -306,8 +353,6 @@ function AddAccountModal({ onClose, onDiscovered }: { onClose: () => void; onDis
 function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const [showAddModal, setShowAddModal] = useState(false)
   const [tab, setTab] = useState<'pay' | 'chat'>('pay')
-  // Обнаруженные рабочие пространства по каждому добавленному аккаунту.
-  // Сохраняются локально, чтобы пул переживал перезагрузку.
   const [discovered, setDiscovered] = useState<DiscoveredAccount[]>(() => {
     try {
       const raw = localStorage.getItem('nmp_discovered_workspaces')
@@ -322,9 +367,6 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
     } catch { /* ignore */ }
   }, [discovered])
 
-  // При загрузке подтягиваем пул с сервера, чтобы пространства появлялись
-  // даже когда локальный кэш пуст (например, в режиме инкогнито).
-  // Данные сервера приоритетнее — они накладываются поверх кэша.
   const [hydrating, setHydrating] = useState(true)
   useEffect(() => {
     let cancelled = false
@@ -368,25 +410,20 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         onTab={setTab}
       />
 
-      <main className="max-w-[1100px] mx-auto px-6 py-10">
+      <main className="max-w-4xl mx-auto px-5 sm:px-8 py-7">
         {tab === 'pay' ? (
           discovered.length === 0 ? (
             hydrating ? (
-              <div className="text-center py-16 px-6 text-text-muted text-[13px]">Загрузка рабочих пространств...</div>
+              <div className="text-center py-24 text-text-muted text-[13px]">Загрузка рабочих пространств…</div>
             ) : (
-              <div className="text-center py-16 px-6 bg-bg-secondary border border-border rounded-2xl">
-                <div className="w-12 h-12 mx-auto mb-4 rounded-xl bg-bg-card border border-border flex items-center justify-center text-text-muted shadow-card">
-                  <IconPlus />
-                </div>
-                <div className="text-[16px] font-medium text-text-primary mb-1">Пока нет рабочих пространств</div>
-                <p className="text-[13px] text-text-muted max-w-sm mx-auto mb-5">
-                  Нажмите «Добавить аккаунт» — все пространства токена появятся здесь автоматически.
-                </p>
+              <div className="flex flex-col items-center justify-center py-24 gap-4">
+                <div className="w-12 h-12 rounded-full border border-white/[0.07] flex items-center justify-center text-text-muted text-2xl">\u25fb</div>
+                <div className="text-[13px] text-text-muted">Пока нет рабочих пространств</div>
                 <button
                   onClick={() => setShowAddModal(true)}
-                  className="inline-flex items-center gap-2 h-9 px-4 bg-white hover:bg-white/90 text-black rounded-full text-[13px] font-medium cursor-pointer transition-colors border-none"
+                  className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-white text-black text-[12px] font-medium hover:bg-[#f0f0f0] transition-colors border-none cursor-pointer"
                 >
-                  <IconPlus /> Добавить аккаунт
+                  <IconPlus size={13} /> Добавить аккаунт
                 </button>
               </div>
             )
@@ -404,9 +441,6 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
 }
 
 export default function App() {
-  // Auth gate: ask the server whether a dashboard password is required and
-  // whether this browser session is already authenticated. Only render the
-  // dashboard once we're past the login requirement.
   const [authState, setAuthState] = useState<'loading' | 'login' | 'authed'>('loading')
   const [requiresPassword, setRequiresPassword] = useState(false)
 
@@ -420,9 +454,6 @@ export default function App() {
         else setAuthState('login')
       })
       .catch(() => {
-        // If the auth check itself fails (e.g. transient network error), fail
-        // open to the dashboard — any protected /admin call will still 401 if a
-        // password is actually required.
         if (!cancelled) setAuthState('authed')
       })
     return () => { cancelled = true }
@@ -435,7 +466,7 @@ export default function App() {
 
   if (authState === 'loading') {
     return (
-      <div className="min-h-screen flex items-center justify-center text-text-muted text-[13px]">Загрузка...</div>
+      <div className="min-h-screen flex items-center justify-center text-text-muted text-[13px]">Загрузка…</div>
     )
   }
 
