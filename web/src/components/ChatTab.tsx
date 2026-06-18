@@ -15,22 +15,16 @@ import {
 import { fetchAutoPayConfig, type ServerAutoPayConfig } from '../autopay'
 import type { DiscoveredAccount } from './WorkspacePool'
 
-// The chat grid is height-bounded to the viewport so a long thread list on the
-// left can never push the message composer below the fold — instead each pane
-// (thread list / message log) scrolls independently. See the min-h-0 children.
 const gridStyle: React.CSSProperties = { height: 'calc(100vh - 190px)' }
 
 // How many messages to render initially, and how many more to reveal each time
-// the user scrolls to the top of the log. Keeping the rendered set small keeps
-// very long threads snappy (lazy loading).
+// the user scrolls to the top of the log (lazy loading keeps long threads fast).
 const PAGE_SIZE = 30
 
-// Sentinel view-key for the "new chat" view (no thread id yet). Used to keep an
-// in-flight stream's status bound to the chat it was started from.
+// Sentinel view-key for the "new chat" view (no thread id yet).
 const NEW_KEY = '__new__'
 
-// localStorage key for remembering which agent was last used in each thread, so
-// reopening a chat restores the agent it was created with.
+// localStorage key for remembering which agent was last used in each thread.
 const THREAD_AGENT_KEY = 'nmp_thread_agent'
 
 function loadThreadAgents(): Record<string, string> {
@@ -41,6 +35,9 @@ function loadThreadAgents(): Record<string, string> {
     return {}
   }
 }
+
+const TOOL_LABEL = 'Использую инструмент'
+const THINK_LABEL = 'Размышляю'
 
 interface SpaceOption {
   key: string
@@ -65,9 +62,6 @@ function browserTimezone(): string {
   }
 }
 
-// A space counts as "free" (and is hidden from the chat picker) when its plan
-// is empty/free/personal AND it is not explicitly subscribed. Such a space is
-// still shown if server auto-pay is armed for it.
 function isFreeTier(planType: string | undefined): boolean {
   const tier = (planType || '').toLowerCase()
   return tier === '' || tier === 'free' || tier === 'personal'
@@ -118,8 +112,7 @@ function TrashIcon() {
   )
 }
 
-// GitHub octocat mark — shown for GitHub MCP tool calls so the user can tell at a
-// glance which connector the agent is hitting.
+// GitHub octocat mark — shown for GitHub MCP tool calls.
 function GithubMark() {
   return (
     <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
@@ -128,7 +121,6 @@ function GithubMark() {
   )
 }
 
-// Generic MCP / connector icon (a small stack) for non-GitHub MCP servers.
 function McpIcon() {
   return (
     <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
@@ -146,7 +138,7 @@ function ToolWrench() {
   )
 }
 
-// parseTool turns a raw tool identifier (e.g. "connections.mcpServer_github.get_me")
+// parseTool turns a raw tool id (e.g. "connections.mcpServer_github.get_me")
 // into a friendly label plus connector hints used to pick the icon.
 function parseTool(tool?: string): { label: string; server?: string; isMcp: boolean } {
   const raw = (tool || '').trim()
@@ -224,8 +216,6 @@ function StepRow({ step }: { step: ChatStep }) {
   )
 }
 
-// StepsTree renders a vertical "branch" of reasoning + tool steps, mirroring the
-// agent thinking tree shown in the Notion AI client.
 function StepsTree({ steps }: { steps: ChatStep[] }) {
   if (!steps || steps.length === 0) return null
   return (
@@ -237,8 +227,7 @@ function StepsTree({ steps }: { steps: ChatStep[] }) {
   )
 }
 
-// StepsBlock is the collapsible "Шаги агента" panel attached to a finished
-// assistant message. Collapsed by default — the user opens it on demand.
+// Collapsible "Шаги агента" panel — collapsed by default.
 function StepsBlock({ steps }: { steps: ChatStep[] }) {
   const [open, setOpen] = useState(false)
   if (!steps || steps.length === 0) return null
@@ -307,8 +296,7 @@ function isTableSeparator(line: string): boolean {
   return t.includes('-') && /^\|?[\s:|-]+\|?$/.test(t)
 }
 
-// A fenced code block with a small copy button in the top-right corner so the
-// user can grab e.g. a bash command the agent produced.
+// Fenced code block with a copy button in the top-right corner.
 function CodeBlock({ code, lang }: { code: string; lang?: string }) {
   const [copied, setCopied] = useState(false)
   const onCopy = useCallback(async () => {
@@ -344,7 +332,6 @@ function renderBlocks(text: string): React.ReactNode[] {
   while (i < lines.length) {
     const line = lines[i]
 
-    // fenced code block
     if (line.trim().startsWith('```')) {
       const lang = line.trim().slice(3).trim()
       const buf: string[] = []
@@ -353,12 +340,11 @@ function renderBlocks(text: string): React.ReactNode[] {
         buf.push(lines[i])
         i += 1
       }
-      i += 1 // skip closing fence
+      i += 1
       blocks.push(<CodeBlock key={key++} code={buf.join('\n')} lang={lang} />)
       continue
     }
 
-    // markdown table: a row with pipes followed by a separator row
     if (line.includes('|') && i + 1 < lines.length && isTableSeparator(lines[i + 1])) {
       const header = splitTableRow(line)
       i += 2
@@ -396,5 +382,648 @@ function renderBlocks(text: string): React.ReactNode[] {
       continue
     }
 
-    // headings
-    const h = /^(#{1,4})\s+(
+    const h = /^(#{1,4})\s+(.*)$/.exec(line)
+    if (h) {
+      const level = h[1].length
+      const cls = level <= 1 ? 'text-lg font-semibold' : level === 2 ? 'text-base font-semibold' : 'text-sm font-semibold'
+      blocks.push(
+        <div key={key++} className={`mt-2 mb-1 ${cls}`}>
+          {renderInline(h[2], `h${key}`)}
+        </div>,
+      )
+      i += 1
+      continue
+    }
+
+    if (/^\s*---+\s*$/.test(line)) {
+      blocks.push(<hr key={key++} className="my-2 border-border" />)
+      i += 1
+      continue
+    }
+
+    if (/^\s*[-*]\s+/.test(line)) {
+      const items: string[] = []
+      while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*[-*]\s+/, ''))
+        i += 1
+      }
+      blocks.push(
+        <ul key={key++} className="my-1.5 ml-4 list-disc space-y-0.5">
+          {items.map((it, ii) => (
+            <li key={ii}>{renderInline(it, `ul${key}-${ii}`)}</li>
+          ))}
+        </ul>,
+      )
+      continue
+    }
+
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items: string[] = []
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+\.\s+/, ''))
+        i += 1
+      }
+      blocks.push(
+        <ol key={key++} className="my-1.5 ml-4 list-decimal space-y-0.5">
+          {items.map((it, ii) => (
+            <li key={ii}>{renderInline(it, `ol${key}-${ii}`)}</li>
+          ))}
+        </ol>,
+      )
+      continue
+    }
+
+    if (line.trim() === '') {
+      blocks.push(<div key={key++} className="h-2" />)
+      i += 1
+      continue
+    }
+
+    blocks.push(
+      <p key={key++} className="whitespace-pre-wrap">
+        {renderInline(line, `p${key}`)}
+      </p>,
+    )
+    i += 1
+  }
+  return blocks
+}
+
+function MessageBody({ text }: { text: string }) {
+  return <div className="space-y-0.5">{renderBlocks(text)}</div>
+}
+
+// A single rendered message. Memoised so typing in the composer (which lives in
+// its own component) never re-runs the markdown renderer for the whole log.
+const MessageRow = memo(function MessageRow({ role, text, steps }: { role: 'user' | 'assistant'; text: string; steps?: ChatStep[] }) {
+  return (
+    <div className={`flex flex-col ${role === 'user' ? 'items-end' : 'items-start'}`}>
+      <div
+        className={`max-w-[85%] px-3.5 py-2.5 rounded-2xl text-[14px] leading-relaxed ${
+          role === 'user'
+            ? 'bg-white text-black rounded-br-sm'
+            : 'bg-bg-card border border-border text-text-primary rounded-bl-sm'
+        }`}
+      >
+        {role === 'assistant' && steps && steps.length > 0 ? <StepsBlock steps={steps} /> : null}
+        <MessageBody text={text} />
+      </div>
+      <CopyButton text={text} />
+    </div>
+  )
+})
+
+// The message composer owns its own input state so keystrokes don't re-render
+// the (potentially long) message log — this fixes typing lag on big threads.
+const Composer = memo(function Composer({
+  hasSpace,
+  sending,
+  showModelPicker,
+  models,
+  selectedModel,
+  onModelChange,
+  onSend,
+}: {
+  hasSpace: boolean
+  sending: boolean
+  showModelPicker: boolean
+  models: ChatModel[]
+  selectedModel: string
+  onModelChange: (id: string) => void
+  onSend: (text: string) => void
+}) {
+  const [text, setText] = useState('')
+  const submit = useCallback(() => {
+    const t = text.trim()
+    if (!t || !hasSpace || sending) return
+    onSend(t)
+    setText('')
+  }, [text, hasSpace, sending, onSend])
+  const onKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault()
+        submit()
+      }
+    },
+    [submit],
+  )
+  return (
+    <div className="border-t border-border p-3 bg-bg-secondary">
+      <div className="flex items-end gap-2">
+        <textarea
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={onKeyDown}
+          rows={1}
+          placeholder={hasSpace ? 'Сообщение… (Enter — отправить, Shift+Enter — перенос)' : 'Сначала выберите пространство'}
+          disabled={!hasSpace || sending}
+          className="flex-1 resize-none max-h-32 px-3 py-2 rounded-lg bg-bg-input border border-border text-text-primary text-sm focus:outline-none focus:border-notion-blue disabled:opacity-50"
+        />
+        {showModelPicker ? (
+          <select
+            value={selectedModel}
+            onChange={(e) => onModelChange(e.target.value)}
+            disabled={sending}
+            title="Модель агента"
+            className="shrink-0 max-w-[150px] px-2 py-2 rounded-lg bg-bg-input border border-border text-text-primary text-[13px] focus:outline-none focus:border-notion-blue disabled:opacity-50 cursor-pointer"
+          >
+            {models
+              .filter((m) => !m.disabled)
+              .map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.label}
+                </option>
+              ))}
+          </select>
+        ) : null}
+        <button
+          type="button"
+          onClick={submit}
+          disabled={!hasSpace || sending || text.trim() === ''}
+          className="px-4 py-2 rounded-lg bg-notion-blue text-white text-sm font-medium hover:opacity-90 transition-opacity disabled:opacity-40 border-none cursor-pointer shrink-0"
+        >
+          Отправить
+        </button>
+      </div>
+    </div>
+  )
+})
+
+// --- main component ---
+
+export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
+  const [autoCfg, setAutoCfg] = useState<ServerAutoPayConfig | null>(null)
+  const [spaceKey, setSpaceKey] = useState('')
+  const [agents, setAgents] = useState<ChatAgent[]>([])
+  const [agentId, setAgentId] = useState('default')
+  const [models, setModels] = useState<ChatModel[]>([])
+  const [selectedModel, setSelectedModel] = useState('')
+  const [threads, setThreads] = useState<ChatThread[]>([])
+  const [activeThreadId, setActiveThreadId] = useState('')
+  const [messages, setMessages] = useState<ChatMessage[]>([])
+  const [sending, setSending] = useState(false)
+  const [status, setStatus] = useState<ChatStatus | null>(null)
+  const [liveSteps, setLiveSteps] = useState<ChatStep[]>([])
+  const [streamKey, setStreamKey] = useState<string | null>(null)
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
+  const logRef = useRef<HTMLDivElement>(null)
+  const instantScrollRef = useRef(false)
+  const viewKeyRef = useRef(NEW_KEY)
+  const threadAgentsRef = useRef<Record<string, string>>(loadThreadAgents())
+
+  useEffect(() => {
+    viewKeyRef.current = activeThreadId || NEW_KEY
+  }, [activeThreadId])
+
+  const rememberThreadAgent = useCallback((threadId: string, agent: string) => {
+    if (!threadId) return
+    threadAgentsRef.current = { ...threadAgentsRef.current, [threadId]: agent }
+    try {
+      localStorage.setItem(THREAD_AGENT_KEY, JSON.stringify(threadAgentsRef.current))
+    } catch {
+      // ignore quota / privacy-mode failures
+    }
+  }, [])
+
+  useEffect(() => {
+    fetchAutoPayConfig().then(setAutoCfg).catch(() => {})
+  }, [])
+
+  const spaceOptions = useMemo<SpaceOption[]>(() => {
+    const out: SpaceOption[] = []
+    for (const acc of accounts) {
+      const accountLabel = acc.user_email || acc.user_name || acc.user_id || 'Аккаунт'
+      for (const sp of acc.spaces || []) {
+        const subscribed = sp.is_subscribed === true
+        const autoArmed = !!autoCfg?.spaces?.[sp.space_id]
+        if (isFreeTier(sp.plan_type) && !subscribed && !autoArmed) continue
+        out.push({
+          key: `${acc.user_id || acc.token_v2}:${sp.space_id}`,
+          account: acc,
+          spaceId: sp.space_id,
+          spaceViewId: sp.space_view_id,
+          spaceName: sp.name || sp.space_id,
+          accountLabel,
+        })
+      }
+    }
+    return out
+  }, [accounts, autoCfg])
+
+  const activeSpace = useMemo(
+    () => spaceOptions.find((s) => s.key === spaceKey) || null,
+    [spaceOptions, spaceKey],
+  )
+
+  useEffect(() => {
+    if (spaceOptions.length === 0) {
+      if (spaceKey !== '') setSpaceKey('')
+      return
+    }
+    if (!spaceOptions.some((s) => s.key === spaceKey)) {
+      setSpaceKey(spaceOptions[0].key)
+    }
+  }, [spaceOptions, spaceKey])
+
+  useEffect(() => {
+    if (!activeSpace) {
+      setAgents([])
+      setThreads([])
+      return
+    }
+    const ref = {
+      token_v2: activeSpace.account.token_v2,
+      user_id: activeSpace.account.user_id,
+      space_id: activeSpace.spaceId,
+    }
+    let cancelled = false
+    chatAgents(ref)
+      .then((a) => {
+        if (cancelled) return
+        setAgents(a)
+        setAgentId((prev) => (a.some((x) => x.id === prev) ? prev : 'default'))
+      })
+      .catch(() => {
+        if (!cancelled) setAgents([{ id: 'default', name: 'Обычный агент', kind: 'default' }])
+      })
+    chatThreads(ref)
+      .then((t) => {
+        if (!cancelled) setThreads(t)
+      })
+      .catch(() => {
+        if (!cancelled) setThreads([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [activeSpace])
+
+  useEffect(() => {
+    if (!activeSpace) {
+      setModels([])
+      return
+    }
+    let cancelled = false
+    chatModels({
+      token_v2: activeSpace.account.token_v2,
+      user_id: activeSpace.account.user_id,
+      space_id: activeSpace.spaceId,
+    })
+      .then((m) => {
+        if (cancelled) return
+        setModels(m)
+        const enabled = m.filter((x) => !x.disabled)
+        setSelectedModel((prev) => {
+          if (prev && enabled.some((x) => x.id === prev)) return prev
+          const opus = enabled.find((x) => x.id === 'ambrosia-tart-high')
+          return opus ? opus.id : enabled[0]?.id || ''
+        })
+      })
+      .catch(() => {
+        if (!cancelled) setModels([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [activeSpace])
+
+  // Keep the log pinned to the bottom. On thread open / new chat we jump
+  // instantly to the end; during live updates we only follow if the user is
+  // already near the bottom (so scrolling up to read history isn't hijacked).
+  useLayoutEffect(() => {
+    const el = logRef.current
+    if (!el) return
+    if (instantScrollRef.current) {
+      instantScrollRef.current = false
+      el.scrollTop = el.scrollHeight
+      return
+    }
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 140
+    if (nearBottom) el.scrollTop = el.scrollHeight
+  }, [messages, sending, historyLoading, liveSteps, status])
+
+  const visibleMessages = useMemo(
+    () => messages.slice(Math.max(0, messages.length - visibleCount)),
+    [messages, visibleCount],
+  )
+  const hiddenCount = messages.length - visibleMessages.length
+
+  const onLogScroll = useCallback(() => {
+    const el = logRef.current
+    if (!el || el.scrollTop >= 40) return
+    setVisibleCount((c) => {
+      if (c >= messages.length) return c
+      const prevHeight = el.scrollHeight
+      requestAnimationFrame(() => {
+        if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight - prevHeight
+      })
+      return Math.min(messages.length, c + PAGE_SIZE)
+    })
+  }, [messages.length])
+
+  const startNewChat = useCallback(() => {
+    instantScrollRef.current = true
+    setActiveThreadId('')
+    setMessages([])
+    setVisibleCount(PAGE_SIZE)
+    setError('')
+  }, [])
+
+  const openThread = useCallback(
+    async (t: ChatThread) => {
+      if (!activeSpace) return
+      instantScrollRef.current = true
+      setActiveThreadId(t.id)
+      const remembered = threadAgentsRef.current[t.id]
+      if (remembered && agents.some((a) => a.id === remembered)) setAgentId(remembered)
+      setError('')
+      setMessages([])
+      setVisibleCount(PAGE_SIZE)
+      setHistoryLoading(true)
+      try {
+        const hist = await chatHistory({
+          token_v2: activeSpace.account.token_v2,
+          user_id: activeSpace.account.user_id,
+          space_id: activeSpace.spaceId,
+          thread_id: t.id,
+        })
+        setMessages(hist.map((m) => ({ role: m.role, text: m.text, steps: m.steps })))
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Не удалось загрузить историю чата')
+      } finally {
+        instantScrollRef.current = true
+        setHistoryLoading(false)
+      }
+    },
+    [activeSpace, agents],
+  )
+
+  const deleteThread = useCallback(
+    async (t: ChatThread, e: React.MouseEvent) => {
+      e.stopPropagation()
+      if (!activeSpace) return
+      setThreads((prev) => prev.filter((x) => x.id !== t.id))
+      if (t.id === activeThreadId) startNewChat()
+      try {
+        await chatDelete({
+          token_v2: activeSpace.account.token_v2,
+          user_id: activeSpace.account.user_id,
+          space_id: activeSpace.spaceId,
+          thread_id: t.id,
+        })
+      } catch {
+        // already removed from the UI; ignore backend failures
+      }
+    },
+    [activeSpace, activeThreadId, startNewChat],
+  )
+
+  const handleSend = useCallback(
+    async (msg: string) => {
+      const text = msg.trim()
+      if (!text || !activeSpace || sending) return
+      const originKey = activeThreadId || NEW_KEY
+      const agentUsed = agentId
+      instantScrollRef.current = true
+      setError('')
+      setMessages((prev) => [...prev, { role: 'user', text }])
+      setSending(true)
+      setStreamKey(originKey)
+      setStatus(null)
+      setLiveSteps([])
+
+      const onStatus = (s: ChatStatus) => {
+        setStatus(s)
+        setLiveSteps((prev) => {
+          if (s.label === TOOL_LABEL) {
+            const tool = (s.detail || '').trim()
+            if (!tool) return prev
+            const last = prev[prev.length - 1]
+            if (last && last.kind === 'tool' && last.tool === tool) return prev
+            return [...prev, { kind: 'tool', text: tool, tool }]
+          }
+          if (s.label === THINK_LABEL) {
+            const thought = s.detail || ''
+            const last = prev[prev.length - 1]
+            if (last && last.kind === 'thought') {
+              return [...prev.slice(0, -1), { kind: 'thought', text: thought }]
+            }
+            if (thought.trim() === '') return prev
+            return [...prev, { kind: 'thought', text: thought }]
+          }
+          return prev
+        })
+      }
+
+      try {
+        const res = await chatStream(
+          {
+            token_v2: activeSpace.account.token_v2,
+            user_id: activeSpace.account.user_id,
+            user_name: activeSpace.account.user_name,
+            user_email: activeSpace.account.user_email,
+            space_id: activeSpace.spaceId,
+            space_view_id: activeSpace.spaceViewId,
+            space_name: activeSpace.spaceName,
+            timezone: browserTimezone(),
+            agent: agentUsed,
+            model: agentUsed === 'default' ? selectedModel || undefined : undefined,
+            thread_id: activeThreadId || undefined,
+            message: text,
+          },
+          onStatus,
+        )
+        if (res.thread_id) {
+          rememberThreadAgent(res.thread_id, agentUsed)
+          setThreads((prev) =>
+            prev.some((t) => t.id === res.thread_id)
+              ? prev
+              : [{ id: res.thread_id, title: res.title || text.slice(0, 40), type: 'workflow' }, ...prev],
+          )
+        }
+        // Only mutate the visible conversation if the user is still viewing the
+        // chat this stream was started from. Otherwise the reply is persisted
+        // server-side and shows up when they reopen the thread.
+        if (viewKeyRef.current === originKey) {
+          if (res.thread_id && res.thread_id !== activeThreadId) setActiveThreadId(res.thread_id)
+          setMessages((prev) => [
+            ...prev,
+            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps },
+          ])
+        }
+      } catch (e) {
+        if (viewKeyRef.current === originKey) {
+          setError(e instanceof Error ? e.message : 'Ошибка отправки')
+          setMessages((prev) => [...prev, { role: 'assistant', text: '⚠️ Не удалось получить ответ. Попробуйте ещё раз.' }])
+        }
+      } finally {
+        setSending(false)
+        setStatus(null)
+        setLiveSteps([])
+        setStreamKey(null)
+      }
+    },
+    [activeSpace, sending, activeThreadId, agentId, selectedModel, rememberThreadAgent],
+  )
+
+  if (accounts.length === 0) {
+    return (
+      <div className="p-8 text-center text-text-secondary">
+        Сначала добавьте рабочие пространства на вкладке «Оплата», чтобы начать чат.
+      </div>
+    )
+  }
+
+  const viewKey = activeThreadId || NEW_KEY
+  const showThinking = sending && streamKey === viewKey
+  const showModelPicker = agentId === 'default' && models.filter((m) => !m.disabled).length > 0
+
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-[280px_1fr] gap-4 overflow-hidden" style={gridStyle}>
+      <aside className="flex flex-col gap-3 overflow-hidden">
+        <div className="space-y-1">
+          <label className="text-[11px] uppercase tracking-wide text-text-muted">Пространство</label>
+          <select
+            value={spaceKey}
+            onChange={(e) => setSpaceKey(e.target.value)}
+            className="w-full px-2.5 py-2 rounded-lg bg-bg-input border border-border text-text-primary text-sm"
+          >
+            {spaceOptions.length === 0 ? (
+              <option value="">Нет платных пространств</option>
+            ) : (
+              spaceOptions.map((s) => (
+                <option key={s.key} value={s.key}>
+                  {s.spaceName} · {s.accountLabel}
+                </option>
+              ))
+            )}
+          </select>
+        </div>
+
+        <div className="space-y-1">
+          <label className="text-[11px] uppercase tracking-wide text-text-muted">Агент</label>
+          <select
+            value={agentId}
+            onChange={(e) => setAgentId(e.target.value)}
+            className="w-full px-2.5 py-2 rounded-lg bg-bg-input border border-border text-text-primary text-sm"
+          >
+            {agents.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.name}{a.kind === 'custom' ? ' · кастом' : ''}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <button
+          type="button"
+          onClick={startNewChat}
+          className="w-full px-3 py-2 rounded-lg bg-notion-blue text-white text-sm font-medium hover:opacity-90 transition-opacity border-none cursor-pointer"
+        >
+          + Новый чат
+        </button>
+
+        <div className="text-[11px] uppercase tracking-wide text-text-muted pt-1">История</div>
+        <div className="flex-1 min-h-0 overflow-y-auto space-y-1 pr-1">
+          {threads.length === 0 ? (
+            <div className="text-xs text-text-muted py-2">Пока нет чатов</div>
+          ) : (
+            threads.map((t) => (
+              <div
+                key={t.id}
+                className={`group flex items-center rounded-lg transition-colors ${
+                  t.id === activeThreadId ? 'bg-bg-card' : 'hover:bg-bg-secondary'
+                }`}
+              >
+                <button
+                  type="button"
+                  onClick={() => openThread(t)}
+                  className={`flex-1 min-w-0 text-left px-2.5 py-2 rounded-lg text-sm truncate bg-transparent border-none cursor-pointer ${
+                    t.id === activeThreadId ? 'text-text-primary' : 'text-text-secondary'
+                  }`}
+                  title={t.title || 'Без названия'}
+                >
+                  {t.title || 'Без названия'}
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => deleteThread(t, e)}
+                  title="Удалить чат"
+                  className="shrink-0 mr-1 w-7 h-7 flex items-center justify-center rounded-md text-text-muted hover:text-err hover:bg-bg-secondary bg-transparent border-none cursor-pointer opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
+                >
+                  <TrashIcon />
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+      </aside>
+
+      <section className="flex flex-col min-h-0 overflow-hidden rounded-xl border border-border bg-bg-secondary">
+        <div ref={logRef} onScroll={onLogScroll} className="flex-1 min-h-0 overflow-y-auto p-4 space-y-4">
+          {messages.length === 0 && !historyLoading && !showThinking ? (
+            <div className="h-full flex items-center justify-center text-center text-text-muted text-sm px-6">
+              {activeSpace
+                ? 'Напишите сообщение, чтобы начать диалог с агентом.'
+                : 'Выберите пространство с платным планом или включённой автооплатой.'}
+            </div>
+          ) : null}
+
+          {hiddenCount > 0 ? (
+            <div className="text-center text-[11px] text-text-muted py-1">
+              Прокрутите вверх, чтобы загрузить ещё · {hiddenCount}
+            </div>
+          ) : null}
+
+          {historyLoading ? (
+            <div className="flex items-center gap-2 text-text-muted text-sm">
+              <span className="inline-block w-3 h-3 rounded-full border-2 border-text-muted border-t-transparent animate-spin" />
+              Загружаю историю…
+            </div>
+          ) : null}
+
+          {visibleMessages.map((msg, idx) => (
+            <MessageRow key={hiddenCount + idx} role={msg.role} text={msg.text} steps={msg.steps} />
+          ))}
+
+          {showThinking ? (
+            <div className="flex flex-col items-start w-full">
+              <div className="max-w-[90%] w-full px-3.5 py-2.5 rounded-2xl rounded-bl-sm bg-bg-card border border-border">
+                <div className="flex items-center gap-2 text-text-primary text-[13px] font-medium">
+                  <span className="inline-block w-3 h-3 rounded-full border-2 border-text-muted border-t-transparent animate-spin" />
+                  {status?.label || 'Думаю…'}
+                </div>
+                {liveSteps.length > 0 ? (
+                  <div className="mt-2">
+                    <StepsTree steps={liveSteps} />
+                  </div>
+                ) : status?.detail ? (
+                  <div className="mt-1.5 text-[12px] leading-snug text-text-muted whitespace-pre-wrap max-h-40 overflow-y-auto">
+                    {status.detail}
+                  </div>
+                ) : null}
+              </div>
+            </div>
+          ) : null}
+        </div>
+
+        {error ? (
+          <div className="px-4 py-2 text-sm text-err border-t border-border bg-bg-secondary">{error}</div>
+        ) : null}
+
+        <Composer
+          hasSpace={!!activeSpace}
+          sending={sending}
+          showModelPicker={showModelPicker}
+          models={models}
+          selectedModel={selectedModel}
+          onModelChange={setSelectedModel}
+          onSend={handleSend}
+        />
+      </section>
+    </div>
+  )
+}
