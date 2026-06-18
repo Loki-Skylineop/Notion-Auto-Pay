@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -16,9 +15,8 @@ import (
 
 // chat.go proxies the private Notion AI chat protocol (runInferenceTranscript +
 // the thread/agent listing endpoints) using each workspace account's token_v2
-// cookie. It powers the dashboard "Чат" tab: pick a workspace, pick an agent
-// (the built-in assistant or a custom agent), start a new chat or continue an
-// existing thread, and stream the assistant reply.
+// cookie. It powers the dashboard "Чат" tab. The ndjson/record-map parsing and
+// tool-call presentation helpers live in chat_parse.go (same package).
 
 // notionChatRequest issues a POST to a private Notion API endpoint authenticated
 // with the account's token_v2 cookie, mirroring the headers the real web client
@@ -371,162 +369,6 @@ type chatHistMsg struct {
 	Role  string     `json:"role"` // "user" | "assistant"
 	Text  string     `json:"text"`
 	Steps []chatStep `json:"steps,omitempty"`
-}
-
-// ---- tool-call presentation helpers ----
-
-// serverLabel turns an MCP connector key into a display name ("github" -> "GitHub").
-func serverLabel(s string) string {
-	switch strings.ToLower(s) {
-	case "github":
-		return "GitHub"
-	case "":
-		return "MCP"
-	default:
-		return strings.ToUpper(s[:1]) + s[1:]
-	}
-}
-
-func isMeaningful(raw json.RawMessage) bool {
-	s := strings.TrimSpace(string(raw))
-	return s != "" && s != "null" && s != "{}" && s != "[]"
-}
-
-func clip(s string, n int) string {
-	if len(s) > n {
-		return s[:n] + "\n… (обрезано)"
-	}
-	return s
-}
-
-func prettyJSON(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var v interface{}
-	if json.Unmarshal(raw, &v) != nil {
-		return clip(strings.TrimSpace(string(raw)), 4000)
-	}
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return clip(strings.TrimSpace(string(raw)), 4000)
-	}
-	return clip(string(b), 4000)
-}
-
-func prettyMaybeJSON(s string) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return ""
-	}
-	var v interface{}
-	if json.Unmarshal([]byte(s), &v) == nil {
-		if b, err := json.MarshalIndent(v, "", "  "); err == nil {
-			return clip(string(b), 4000)
-		}
-	}
-	return clip(s, 4000)
-}
-
-// describeToolCall turns a callFunction input ({function, args}) into a human
-// label, an icon hint (connector key) and the pretty-printed input arguments.
-// For MCP connectors it digs into args.toolName / args.toolArguments so the
-// label reads e.g. "GitHub / get_me" instead of the wrapper "runTool".
-func describeToolCall(fn string, args json.RawMessage) (label, server, input string) {
-	fn = strings.TrimSpace(fn)
-	short := fn
-	for _, p := range []string{"connections.", "adminUserConnections.", "userConnections."} {
-		if strings.HasPrefix(short, p) {
-			short = strings.TrimPrefix(short, p)
-			break
-		}
-	}
-	module := short
-	method := ""
-	if i := strings.Index(short, "."); i >= 0 {
-		module = short[:i]
-		method = short[i+1:]
-	}
-	if strings.HasPrefix(module, "mcpServer") {
-		srv := strings.TrimPrefix(module, "mcpServer")
-		srv = strings.TrimPrefix(srv, "_")
-		server = strings.ToLower(srv)
-		var a struct {
-			ToolName      string          `json:"toolName"`
-			ToolArguments json.RawMessage `json:"toolArguments"`
-		}
-		_ = json.Unmarshal(args, &a)
-		if method == "listTools" {
-			return serverLabel(server) + ": список инструментов", server, ""
-		}
-		tn := a.ToolName
-		if tn == "" {
-			tn = method
-		}
-		label = serverLabel(server) + " / " + tn
-		if isMeaningful(a.ToolArguments) {
-			input = prettyJSON(a.ToolArguments)
-		}
-		return label, server, input
-	}
-	label = short
-	if isMeaningful(args) {
-		input = prettyJSON(args)
-	}
-	return label, "", input
-}
-
-// resultString prefers the structured result object, falling back to the raw
-// output string (which is itself often JSON).
-func resultString(output, result json.RawMessage) string {
-	if isMeaningful(result) {
-		return prettyJSON(result)
-	}
-	if len(output) > 0 && strings.TrimSpace(string(output)) != "null" {
-		var s string
-		if json.Unmarshal(output, &s) == nil {
-			return prettyMaybeJSON(s)
-		}
-		return prettyJSON(output)
-	}
-	return ""
-}
-
-// parseToolResultStep folds one agent-tool-result step into a tool chatStep,
-// pulling label/input from step.input.function and result from output/result.
-func parseToolResultStep(s tmStep) chatStep {
-	inputRaw := s.Input
-	outputRaw := s.Output
-	resultRaw := s.Result
-	toolName := s.ToolName
-	if len(inputRaw) == 0 && len(s.Value) > 0 {
-		var v struct {
-			ToolName string          `json:"toolName"`
-			Input    json.RawMessage `json:"input"`
-			Output   json.RawMessage `json:"output"`
-			Result   json.RawMessage `json:"result"`
-		}
-		if json.Unmarshal(s.Value, &v) == nil {
-			inputRaw = v.Input
-			outputRaw = v.Output
-			resultRaw = v.Result
-			toolName = v.ToolName
-		}
-	}
-	var in struct {
-		Function string          `json:"function"`
-		Args     json.RawMessage `json:"args"`
-	}
-	_ = json.Unmarshal(inputRaw, &in)
-	label, server, input := describeToolCall(in.Function, in.Args)
-	if label == "" {
-		if toolName != "" {
-			label = toolName
-		} else {
-			label = "Инструмент"
-		}
-	}
-	return chatStep{Kind: "tool", Tool: label, Text: label, Server: server, Input: input, Result: resultString(outputRaw, resultRaw)}
 }
 
 // syncRecordValues fetches one or more records by pointer through the private
@@ -893,7 +735,8 @@ func HandleChatSend(auth *DashboardAuth) http.HandlerFunc {
 // ---- Streaming send (live agent state) ----
 
 // sMeta tracks the type of each entry in the patch stream's state array ("s")
-// so content deltas (op "x") can be attributed to the right kind of step.
+// so content deltas (op "x") can be attributed to the right kind of step, and
+// so tool calls can be surfaced live with their real name + input/result.
 type sMeta struct {
 	typ       string
 	tool      string
@@ -964,6 +807,22 @@ func parseContentPath(p string) (int, int, bool) {
 	return idx, pt, true
 }
 
+// emitStep sends a live status event describing the current step. The frontend
+// uses kind/tool/server/input/result to render the live agent tree.
+func emitStep(emit func(map[string]interface{}), label string, m sMeta) {
+	switch m.typ {
+	case "agent-tool-result":
+		emit(map[string]interface{}{
+			"event": "status", "label": "Использую инструмент", "detail": m.label,
+			"kind": "tool", "tool": m.label, "server": m.server, "input": m.input, "result": m.result,
+		})
+	case "agent-inference":
+		emit(map[string]interface{}{"event": "status", "label": "Размышляю", "detail": m.thinking, "kind": "thought"})
+	case "text":
+		emit(map[string]interface{}{"event": "status", "label": "Отвечаю", "detail": "", "kind": "text"})
+	}
+}
+
 // processStreamLine parses one ndjson line of the patch stream and emits a
 // best-effort "status" event describing what the agent is doing right now.
 func processStreamLine(line []byte, sItems *[]sMeta, emit func(map[string]interface{})) {
@@ -982,7 +841,9 @@ func processStreamLine(line []byte, sItems *[]sMeta, emit func(map[string]interf
 		}
 		if json.Unmarshal(line, &ps) == nil {
 			for _, raw := range ps.Data.S {
-				*sItems = append(*sItems, metaFromItem(raw))
+				m := metaFromItem(raw)
+				*sItems = append(*sItems, m)
+				emitStep(emit, "", m)
 			}
 		}
 	case "patch":
@@ -997,3 +858,103 @@ func processStreamLine(line []byte, sItems *[]sMeta, emit func(map[string]interf
 			return
 		}
 		for _, op := range p.V {
+			if op.O == "a" && strings.HasSuffix(op.P, "/s/-") {
+				m := metaFromItem(op.V)
+				*sItems = append(*sItems, m)
+				emitStep(emit, "", m)
+			} else if op.O == "x" {
+				idx, part, ok := parseContentPath(op.P)
+				if !ok || idx >= len(*sItems) {
+					continue
+				}
+				meta := &(*sItems)[idx]
+				if meta.typ == "agent-inference" && part < len(meta.partTypes) {
+					var delta string
+					if json.Unmarshal(op.V, &delta) != nil {
+						continue
+					}
+					if meta.partTypes[part] == "thinking" {
+						meta.thinking += delta
+						emit(map[string]interface{}{"event": "status", "label": "Размышляю", "detail": meta.thinking, "kind": "thought"})
+					} else if meta.partTypes[part] == "text" {
+						emit(map[string]interface{}{"event": "status", "label": "Отвечаю", "detail": "", "kind": "text"})
+					}
+				}
+			}
+		}
+	}
+}
+
+// HandleChatStream is the streaming counterpart of HandleChatSend. It forwards
+// the live agent state (thinking / tool calls) to the browser as newline-
+// delimited JSON events, then a final "done" event with the full answer.
+func HandleChatStream(auth *DashboardAuth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !chatAuthOK(auth, w, r) {
+			return
+		}
+		var body chatSendBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+		body.TokenV2 = strings.TrimSpace(body.TokenV2)
+		body.SpaceID = strings.TrimSpace(body.SpaceID)
+		body.Message = strings.TrimSpace(body.Message)
+		if body.TokenV2 == "" || body.SpaceID == "" || body.Message == "" {
+			http.Error(w, `{"error":"token_v2, space_id and message are required"}`, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+		flusher, _ := w.(http.Flusher)
+		emit := func(obj map[string]interface{}) {
+			b, _ := json.Marshal(obj)
+			w.Write(b)
+			w.Write([]byte("\n"))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+
+		payload, threadID := buildSendPayload(body)
+		reqBody, _ := json.Marshal(payload)
+		resp, err := notionChatRequest(body.TokenV2, body.UserID, body.SpaceID, "runInferenceTranscript", reqBody, "application/x-ndjson", 600*time.Second)
+		if err != nil {
+			emit(map[string]interface{}{"event": "error", "error": err.Error()})
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != 200 {
+			raw, _ := io.ReadAll(resp.Body)
+			log.Printf("[chat] stream %d: %s", resp.StatusCode, truncate(string(raw), 300))
+			emit(map[string]interface{}{"event": "error", "error": fmt.Sprintf("notion error %d", resp.StatusCode)})
+			return
+		}
+
+		var acc bytes.Buffer
+		var sItems []sMeta
+		sc := bufio.NewScanner(resp.Body)
+		sc.Buffer(make([]byte, 1024*1024), 32*1024*1024)
+		for sc.Scan() {
+			line := sc.Bytes()
+			acc.Write(line)
+			acc.WriteByte('\n')
+			lineCopy := make([]byte, len(line))
+			copy(lineCopy, line)
+			processStreamLine(lineCopy, &sItems, emit)
+		}
+		text, title, steps := parseInferenceStream(acc.Bytes())
+		if strings.TrimSpace(text) == "" {
+			text = "(агент не вернул текстового ответа)"
+		}
+		emit(map[string]interface{}{
+			"event":     "done",
+			"thread_id": threadID,
+			"title":     title,
+			"text":      text,
+			"steps":     steps,
+		})
+	}
+}
