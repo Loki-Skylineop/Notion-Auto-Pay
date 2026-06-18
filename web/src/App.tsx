@@ -110,7 +110,7 @@ function Hero({
       <div className="relative max-w-4xl mx-auto px-5 sm:px-8 pt-6 pb-5">
         <div className="flex items-center justify-between mb-6">
           <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/[0.08] bg-white/[0.02]">
-            <span className="text-[11px] text-white/80">\u2726</span>
+            <span className="text-[11px] text-white/80">✦</span>
             <span className="text-[11px] text-text-muted tracking-wide font-mono">Notion Auto Pay</span>
           </div>
           <div className="flex items-center gap-2">
@@ -194,7 +194,7 @@ function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
       <div className="w-full max-w-sm">
         <div className="flex justify-center mb-8">
           <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/[0.08] bg-white/[0.02]">
-            <span className="text-[11px] text-white">\u2726</span>
+            <span className="text-[11px] text-white">✦</span>
             <span className="text-[11px] text-text-muted tracking-wide font-mono">Notion Auto Pay</span>
           </div>
         </div>
@@ -305,7 +305,7 @@ function AddAccountModal({ onClose, onDiscovered }: { onClose: () => void; onDis
         <div className="p-5 space-y-4">
           {result ? (
             <div className="flex flex-col items-center py-6 gap-3">
-              <div className="w-10 h-10 rounded-full bg-ok/10 border border-ok/30 flex items-center justify-center text-ok text-lg leading-none">\u2713</div>
+              <div className="w-10 h-10 rounded-full bg-ok/10 border border-ok/30 flex items-center justify-center text-ok text-lg leading-none">✓</div>
               <div className="text-[13px] font-medium text-text-primary">Аккаунт добавлен</div>
               <div className="text-[11px] text-text-muted text-center">
                 {result.name} · {result.email}<br />{result.space} · {result.plan_type}
@@ -417,7 +417,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
               <div className="text-center py-24 text-text-muted text-[13px]">Загрузка рабочих пространств…</div>
             ) : (
               <div className="flex flex-col items-center justify-center py-24 gap-4">
-                <div className="w-12 h-12 rounded-full border border-white/[0.07] flex items-center justify-center text-text-muted text-2xl">\u25fb</div>
+                <div className="w-12 h-12 rounded-full border border-white/[0.07] flex items-center justify-center text-text-muted text-2xl">◻</div>
                 <div className="text-[13px] text-text-muted">Пока нет рабочих пространств</div>
                 <button
                   onClick={() => setShowAddModal(true)}
