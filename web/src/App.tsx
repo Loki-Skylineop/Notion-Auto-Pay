@@ -117,17 +117,19 @@ function Hero({
     <header className="relative overflow-hidden border-b border-white/[0.06]">
       {!collapsed && (
         <div aria-hidden="true" className="absolute inset-0 pointer-events-none overflow-hidden">
-          <div className="absolute -top-20 left-1/2 -translate-x-1/2 w-[600px] h-[300px] rounded-full" style={HERO_GLOW} />
-          <div className="absolute -top-8 left-1/4 w-80 h-40 bg-blue-500/[0.05] blur-3xl rounded-full" />
-          <div className="absolute -top-8 right-1/4 w-64 h-36 bg-violet-500/[0.04] blur-3xl rounded-full" />
+          <div className="hero-glow absolute -top-20 left-0 right-0 mx-auto w-[600px] h-[300px] rounded-full" style={HERO_GLOW} />
+          <div className="hero-float-a absolute -top-8 left-1/4 w-80 h-40 bg-blue-500/[0.06] blur-3xl rounded-full" />
+          <div className="hero-float-b absolute -top-8 right-1/4 w-64 h-36 bg-violet-500/[0.05] blur-3xl rounded-full" />
         </div>
       )}
+
+      <div aria-hidden="true" className="hero-sweep absolute bottom-0 left-0 right-0 h-px pointer-events-none" />
 
       <div className={`relative max-w-4xl mx-auto px-5 sm:px-8 ${collapsed ? 'pt-2 pb-2' : 'pt-6 pb-5'}`}>
         {!collapsed && (
           <div className="flex items-center justify-between mb-6">
             <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/[0.08] bg-white/[0.02]">
-              <span className="text-[11px] text-white/80">✦</span>
+              <span className="brand-star text-[11px] text-white/80">✦</span>
               <span className="text-[11px] text-text-muted tracking-wide font-mono">Notion Auto Pay</span>
             </div>
             <div className="flex items-center gap-2">
@@ -222,7 +224,7 @@ function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
       <div className="w-full max-w-sm">
         <div className="flex justify-center mb-8">
           <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/[0.08] bg-white/[0.02]">
-            <span className="text-[11px] text-white">✦</span>
+            <span className="brand-star text-[11px] text-white">✦</span>
             <span className="text-[11px] text-text-muted tracking-wide font-mono">Notion Auto Pay</span>
           </div>
         </div>

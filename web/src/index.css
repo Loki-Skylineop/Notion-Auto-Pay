@@ -166,8 +166,51 @@ body {
 .border-white\/\[0\.12\] { border-color: color-mix(in oklab, #ffffff 18%, transparent); }
 .border-white\/\[0\.14\] { border-color: color-mix(in oklab, #ffffff 20%, transparent); }
 
+/* Header flourishes: a slow breathing white glow, drifting colour blobs, a
+   twinkling brand star and a light sweep along the bottom hairline. */
+@keyframes heroGlowPulse {
+  0%, 100% { opacity: 0.55; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.12); }
+}
+.hero-glow { animation: heroGlowPulse 9s ease-in-out infinite; }
+
+@keyframes heroFloatA {
+  0%, 100% { transform: translate(0, 0); }
+  50% { transform: translate(26px, 12px); }
+}
+@keyframes heroFloatB {
+  0%, 100% { transform: translate(0, 0); }
+  50% { transform: translate(-24px, 14px); }
+}
+.hero-float-a { animation: heroFloatA 12s ease-in-out infinite; }
+.hero-float-b { animation: heroFloatB 14s ease-in-out infinite; }
+
+@keyframes twinkle {
+  0%, 100% { opacity: 0.55; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.28); }
+}
+.brand-star { display: inline-block; animation: twinkle 3.2s ease-in-out infinite; }
+
+@keyframes heroSweep {
+  0% { background-position: -160% 0; }
+  100% { background-position: 160% 0; }
+}
+.hero-sweep {
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.28), transparent);
+  background-size: 200% 100%;
+  animation: heroSweep 7s linear infinite;
+}
+
+/* Custom dropdown menu pop-in (replaces the off-theme native <select> popup). */
+@keyframes dropdownPop {
+  0% { opacity: 0; transform: translateY(-4px) scale(0.98); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+.dropdown-pop { animation: dropdownPop 0.13s ease-out; }
+
 @media (prefers-reduced-motion: reduce) {
   .mesh-hero { animation: none; }
   .stream-caret { animation: none; }
   .dot-flash { animation: none; opacity: 0.6; }
+  .hero-glow, .hero-float-a, .hero-float-b, .brand-star, .hero-sweep, .dropdown-pop { animation: none; }
 }
