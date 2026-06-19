@@ -9,6 +9,7 @@ import {
   type ChatSurveyQuestion,
 } from '../api'
 import type { DiscoveredAccount } from './WorkspacePool'
+import { Dropdown } from './Dropdown'
 
 export const shellStyle: React.CSSProperties = { height: 'calc(100dvh - 168px)', minHeight: '420px' }
 
