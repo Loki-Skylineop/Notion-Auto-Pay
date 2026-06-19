@@ -1515,4 +1515,142 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
               value={agentId}
               onChange={setAgentId}
               disabled={!!activeThreadId}
-              ariaLabel="Аген
+              ariaLabel="Агент"
+              buttonClassName="rounded-md px-2.5 py-1.5 text-[12px]"
+              menuClassName="w-full"
+              options={agents.map((a) => ({ value: a.id, label: `${a.name}${a.kind === 'custom' ? ' · кастом' : ''}` }))}
+            />
+            {activeThreadId ? (
+              <div className="mt-1 px-0.5 text-[9px] text-text-muted leading-snug">
+                Агент зафиксирован для этого чата. Создайте новый чат, чтобы выбрать другого.
+              </div>
+            ) : null}
+          </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={startNewChat}
+          className="w-full flex items-center justify-center gap-1.5 py-2 mb-4 rounded-lg border border-white/[0.07] text-[11px] text-[#888] hover:bg-white/[0.04] hover:text-text-secondary hover:border-white/[0.12] transition-colors bg-transparent cursor-pointer"
+        >
+          <PlusIcon /> Новый чат
+        </button>
+
+        <div className="text-[9px] text-text-muted uppercase tracking-widest mb-2 px-0.5">История</div>
+        <div className="flex-1 min-h-0 overflow-y-auto space-y-px pr-1">
+          {threads.length === 0 ? (
+            <div className="text-[11px] text-text-muted py-2 px-0.5">Пока нет чатов</div>
+          ) : (
+            threads.map((t) => (
+              <div
+                key={t.id}
+                onClick={() => openThread(t)}
+                className={`group flex items-center justify-between px-2.5 py-2 rounded-md cursor-pointer transition-colors ${
+                  t.id === activeThreadId ? 'bg-white/[0.07] text-[#e8e8e8]' : 'text-[#666] hover:bg-white/[0.03] hover:text-[#999]'
+                }`}
+              >
+                <span className="text-[11px] truncate" title={t.title || 'Без названия'}>
+                  {t.title || 'Без названия'}
+                </span>
+                <button
+                  type="button"
+                  onClick={(e) => deleteThread(t, e)}
+                  title="Удалить чат"
+                  className="opacity-0 group-hover:opacity-100 focus:opacity-100 p-0.5 ml-1 text-[#444] hover:text-red-400 transition-all shrink-0 bg-transparent border-none cursor-pointer"
+                >
+                  <TrashIcon />
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+      </aside>
+
+      {/* Desktop-only splitter: drag to resize the sidebar / chat columns. */}
+      <div
+        onMouseDown={startSidebarResize}
+        title="Потяните, чтобы изменить ширину"
+        className="hidden md:block shrink-0 w-1 cursor-col-resize bg-white/[0.04] hover:bg-white/[0.14] active:bg-notion-blue/50 transition-colors"
+      />
+
+      <section className="relative flex-1 min-w-0 flex flex-col min-h-0 overflow-hidden bg-black">
+        <ParticleField active={showThinking} />
+
+        {/* Top bar — mobile only: menu + current thread + new chat */}
+        <div className="relative z-10 flex items-center gap-2 px-3 py-2 border-b border-white/[0.06] md:hidden">
+          <button
+            type="button"
+            onClick={() => setSidebarOpen(true)}
+            title="Чаты"
+            className="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-text-secondary hover:text-text-primary hover:bg-white/[0.05] bg-transparent border-none cursor-pointer"
+          >
+            <MenuIcon />
+          </button>
+          <div className="flex-1 min-w-0 truncate text-[12px] font-medium text-text-secondary">{activeThreadTitle}</div>
+          <button
+            type="button"
+            onClick={startNewChat}
+            title="Новый чат"
+            className="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-text-secondary hover:text-text-primary hover:bg-white/[0.05] bg-transparent border-none cursor-pointer"
+          >
+            <PlusIcon />
+          </button>
+        </div>
+
+        <div ref={logRef} onScroll={onLogScroll} className="relative z-10 flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden px-5 md:px-8 py-6 space-y-6">
+          {messages.length === 0 && !historyLoading && !showThinking ? (
+            <div className="h-full flex items-center justify-center text-center text-[#444] text-[12px] px-6">
+              {activeSpace
+                ? 'Напишите сообщение, чтобы начать диалог с агентом.'
+                : 'Выберите пространство с платным планом или включённой автооплатой.'}
+            </div>
+          ) : null}
+
+          {hiddenCount > 0 ? (
+            <div className="text-center text-[11px] text-text-muted py-1">
+              Прокрутите вверх, чтобы загрузить ещё · {hiddenCount}
+            </div>
+          ) : null}
+
+          {historyLoading ? (
+            <div className="flex items-center gap-2 text-text-muted text-[12px]">
+              <span className="inline-block w-3 h-3 rounded-full border-2 border-text-muted border-t-transparent animate-spin" />
+              Загружаю историю…
+            </div>
+          ) : null}
+
+          {visibleMessages.map((msg, idx) => (
+            <MessageRow key={hiddenCount + idx} role={msg.role} text={msg.text} steps={msg.steps} />
+          ))}
+
+          {showThinking ? <StreamingRow status={status} steps={liveSteps} liveText={liveText} /> : null}
+        </div>
+
+        {error ? (
+          <div className="relative z-10 px-4 py-2 text-[12px] text-red-400 border-t border-white/[0.06] bg-black/50">{error}</div>
+        ) : null}
+
+        <Composer
+          hasSpace={!!activeSpace}
+          sending={sending}
+          showModelPicker={showModelPicker}
+          models={models}
+          selectedModel={selectedModel}
+          onModelChange={setSelectedModel}
+          onSend={handleSend}
+          onStop={handleStop}
+          draftKey={viewKey}
+        />
+      </section>
+    </div>
+      {/* Desktop-only outer splitter: drag to widen/narrow the whole panel. */}
+      {isDesktop ? (
+        <div
+          onMouseDown={startOuterResize}
+          title="Потяните, чтобы изменить ширину панели чата"
+          className="absolute top-0 right-0 h-full w-1.5 cursor-col-resize bg-transparent hover:bg-white/[0.10] active:bg-notion-blue/40 transition-colors"
+        />
+      ) : null}
+    </div>
+  )
+}
