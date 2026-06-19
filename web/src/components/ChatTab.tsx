@@ -44,6 +44,7 @@ import {
   TrashIcon,
   MenuIcon,
   PlusIcon,
+  RefreshIcon,
   requestStopInference,
   CloseIcon,
   MessageRow,
@@ -76,6 +77,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const [liveText, setLiveText] = useState('')
   const [streamKey, setStreamKey] = useState<string | null>(null)
   const [historyLoading, setHistoryLoading] = useState(false)
+  const [threadsLoading, setThreadsLoading] = useState(false)
   const [error, setError] = useState('')
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
   const [sidebarOpen, setSidebarOpen] = useState(false)
@@ -91,6 +93,10 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const [remoteBusy, setRemoteBusy] = useState(false)
   const logRef = useRef<HTMLDivElement>(null)
   const instantScrollRef = useRef(false)
+  // While the user is lazily loading older messages (scrolling up) or a
+  // background poll refreshes the list, suppress the auto-follow so the
+  // view is never yanked back to the bottom mid-read.
+  const suppressAutoScrollRef = useRef(false)
   const viewKeyRef = useRef(NEW_KEY)
   const threadAgentsRef = useRef<Record<string, string>>(loadThreadAgents())
   const stopRef = useRef(false)
@@ -283,7 +289,14 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     if (!el) return
     if (instantScrollRef.current) {
       instantScrollRef.current = false
+      suppressAutoScrollRef.current = false
       el.scrollTop = el.scrollHeight
+      return
+    }
+    // A lazy history load or a background poll refresh must not re-pin the
+    // log to the bottom while the user is reading older messages.
+    if (suppressAutoScrollRef.current) {
+      suppressAutoScrollRef.current = false
       return
     }
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160
@@ -299,6 +312,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const onLogScroll = useCallback(() => {
     const el = logRef.current
     if (!el || el.scrollTop >= 40) return
+    suppressAutoScrollRef.current = true
     setVisibleCount((c) => {
       if (c >= messages.length) return c
       const prevHeight = el.scrollHeight
@@ -399,7 +413,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           continue
         }
         if (res.changed && res.messages && viewKeyRef.current === threadId) {
-          setMessages(res.messages.map((m) => ({ role: m.role, text: m.text, steps: m.steps })))
+          setMessages(res.messages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, survey: m.survey, pages: m.pages })))
         }
         if (res.version >= 0) pollVersionRef.current = res.version
         if (viewKeyRef.current === threadId) setRemoteBusy(!!res.running)
@@ -409,6 +423,26 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     }
     void loop()
   }, [])
+
+  // Reload the thread list for the active space on demand (the small refresh
+  // icon next to the «История» header). Best-effort: leaves the current list
+  // in place if the request fails.
+  const refreshThreads = useCallback(async () => {
+    if (!activeSpace || threadsLoading) return
+    setThreadsLoading(true)
+    try {
+      const t = await chatThreads({
+        token_v2: activeSpace.account.token_v2,
+        user_id: activeSpace.account.user_id,
+        space_id: activeSpace.spaceId,
+      })
+      setThreads(t)
+    } catch {
+      // ignore — keep the existing list on failure
+    } finally {
+      setThreadsLoading(false)
+    }
+  }, [activeSpace, threadsLoading])
 
   const startNewChat = useCallback(() => {
     stopPolling()
@@ -526,7 +560,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       })
       if (viewKeyRef.current !== threadId) return
       if (hist.length > 0 && hist[hist.length - 1].role === 'assistant') {
-        setMessages(hist.map((m) => ({ role: m.role, text: m.text, steps: m.steps })))
+        setMessages(hist.map((m) => ({ role: m.role, text: m.text, steps: m.steps, survey: m.survey, pages: m.pages })))
       }
     } catch {
       // ignore — reconciliation is best-effort
@@ -868,7 +902,18 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           <PlusIcon /> Новый чат
         </button>
 
-        <div className="text-[9px] text-text-muted uppercase tracking-widest mb-2 px-0.5">История</div>
+        <div className="flex items-center justify-between mb-2 px-0.5">
+          <span className="text-[9px] text-text-muted uppercase tracking-widest">История</span>
+          <button
+            type="button"
+            onClick={refreshThreads}
+            disabled={!activeSpace || threadsLoading}
+            title="Обновить список чатов"
+            className={`w-5 h-5 flex items-center justify-center rounded text-text-muted hover:text-text-secondary hover:bg-white/[0.05] bg-transparent border-none cursor-pointer disabled:opacity-30 disabled:cursor-not-allowed transition-colors ${threadsLoading ? 'animate-spin' : ''}`}
+          >
+            <RefreshIcon />
+          </button>
+        </div>
         <div className="flex-1 min-h-0 overflow-y-auto space-y-px pr-1">
           {threads.length === 0 ? (
             <div className="text-[11px] text-text-muted py-2 px-0.5">Пока нет чатов</div>

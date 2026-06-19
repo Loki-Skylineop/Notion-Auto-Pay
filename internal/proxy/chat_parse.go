@@ -92,11 +92,15 @@ type surveyQuestion struct {
 // flips to true once the user has answered (Responses maps questionId ->
 // answer, mirroring the persisted step.responses).
 type chatSurvey struct {
-	StepID    string                     `json:"step_id"`
+	// NOTE: JSON keys here must match the web client (ChatSurvey in api.ts):
+	// it reads `id` + `createdAt`, then sends them back as survey_step_id /
+	// created_at. Emitting step_id/created_at left survey.id undefined, which
+	// made the server reject the answer with "survey_step_id ... required".
+	StepID    string                     `json:"id"`
 	Questions []surveyQuestion           `json:"questions"`
 	Responses map[string]json.RawMessage `json:"responses,omitempty"`
 	Submitted bool                       `json:"submitted"`
-	CreatedAt string                     `json:"created_at,omitempty"`
+	CreatedAt string                     `json:"createdAt,omitempty"`
 }
 
 // chatPageRef is one page the agent created/edited this turn, surfaced as an

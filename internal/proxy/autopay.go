@@ -637,7 +637,7 @@ func createStripePaymentMethod(stripeKey, country string, card AutoPaySavedCard)
 	}
 	_ = json.Unmarshal(body, &out)
 	if out.Error != nil && out.Error.Message != "" {
-		return "", fmt.Errorf(out.Error.Message)
+		return "", fmt.Errorf("%s", out.Error.Message)
 	}
 	if resp.StatusCode != 200 || out.ID == "" {
 		return "", fmt.Errorf("stripe error %d: %s", resp.StatusCode, truncate(string(body), 200))
