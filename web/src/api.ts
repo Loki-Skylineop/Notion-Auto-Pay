@@ -482,11 +482,47 @@ export interface ChatStep {
   result?: string
 }
 
+// One option the user can pick in an agent survey.
+export interface ChatSurveyOption {
+  id: string
+  label: string
+  pageId?: string
+}
+
+// One question of an agent survey («Уточню пару деталей…»). The user picks an
+// option, or types a free-text answer when allowOther is set («свой вариант»).
+export interface ChatSurveyQuestion {
+  id: string
+  prompt: string
+  options: ChatSurveyOption[]
+  allowOther?: boolean
+  allowMultiple?: boolean
+}
+
+// An agent survey attached to an assistant message: a set of questions the
+// user answers to continue the same turn (see chatSurvey).
+export interface ChatSurvey {
+  id: string
+  questions: ChatSurveyQuestion[]
+  createdAt?: string
+  submitted?: boolean
+  responses?: Record<string, unknown>
+}
+
+// A page the agent created or shared this turn, rendered as a clickable
+// open-page card (the agent references it via <edit_reference> in its text).
+export interface ChatPageRef {
+  name: string
+  url: string
+}
+
 // One rendered message of a thread's history.
 export interface ChatHistoryMessage {
   role: 'user' | 'assistant'
   text: string
   steps?: ChatStep[]
+  survey?: ChatSurvey
+  pages?: ChatPageRef[]
 }
 
 export interface ChatAccountRef {
@@ -564,6 +600,8 @@ export interface ChatSendResult {
   title?: string
   text: string
   steps?: ChatStep[]
+  survey?: ChatSurvey
+  pages?: ChatPageRef[]
 }
 
 // Live status emitted while the agent is working. `kind` distinguishes
@@ -615,6 +653,15 @@ export async function chatStream(params: ChatSendParams, onStatus: (s: ChatStatu
     // Fall back to the synchronous endpoint if streaming is unavailable.
     return chatSend(params)
   }
+  return readChatNdjson(resp, onStatus)
+}
+
+// readChatNdjson consumes the server's newline-delimited JSON event stream,
+// shared by chatStream + chatSurvey: {event:"status"} rows drive the live
+// agent step tree, the final {event:"done"} carries the answer plus any
+// follow-up survey and the pages the agent created/shared this turn.
+async function readChatNdjson(resp: Response, onStatus: (s: ChatStatus) => void): Promise<ChatSendResult> {
+  if (!resp.body) throw new Error('Пустой ответ от сервера')
   const reader = resp.body.getReader()
   const decoder = new TextDecoder()
   let buffer = ''
@@ -641,7 +688,7 @@ export async function chatStream(params: ChatSendParams, onStatus: (s: ChatStatu
               result: ev.result || '',
             })
           } else if (ev.event === 'done') {
-            result = { thread_id: ev.thread_id, title: ev.title, text: ev.text, steps: ev.steps }
+            result = { thread_id: ev.thread_id, title: ev.title, text: ev.text, steps: ev.steps, survey: ev.survey || undefined, pages: ev.pages || undefined }
           } else if (ev.event === 'error') {
             streamError = ev.error || 'Ошибка потока'
           }
@@ -654,4 +701,42 @@ export async function chatStream(params: ChatSendParams, onStatus: (s: ChatStatu
   if (streamError && !result) throw new Error(streamError)
   if (!result) throw new Error('Пустой ответ от сервера')
   return result
+}
+
+// One answer to a survey question: the chosen option label, plus a free-text
+// value when the user picked «свой вариант» (allowOther).
+export interface ChatSurveyAnswer {
+  qid: string
+  prompt: string
+  label: string
+  value?: unknown
+}
+
+export type ChatSurveyParams = ChatAccountRef & {
+  timezone?: string
+  agent: string
+  model?: string
+  thread_id: string
+  survey_step_id: string
+  questions?: ChatSurveyQuestion[]
+  created_at?: string
+  answers: ChatSurveyAnswer[]
+}
+
+// chatSurvey submits the user's answers to an agent survey and continues the
+// same turn, streaming the agent's reply exactly like chatStream.
+export async function chatSurvey(params: ChatSurveyParams, onStatus: (s: ChatStatus) => void): Promise<ChatSendResult> {
+  const resp = await fetch('/admin/chat/survey', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
+    credentials: 'same-origin',
+    body: JSON.stringify(params),
+  })
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '')
+    let msg = `HTTP ${resp.status}`
+    if (text) { try { const d = JSON.parse(text); if (d?.error) msg = d.error } catch { /* ignore */ } }
+    throw new Error(msg)
+  }
+  return readChatNdjson(resp, onStatus)
 }
