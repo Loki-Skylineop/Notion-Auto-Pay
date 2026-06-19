@@ -112,6 +112,9 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	// Lightweight, version-gated poll of one thread's live state (running turn
 	// + advanced messages), mirroring the web client's syncRecordValues poll.
 	mux.HandleFunc("/admin/chat/sync", proxy.HandleChatSync(dashAuth))
+	// Submit the user's answers to an agent survey (Уточню пару деталей…)
+	// and continue the turn, streaming the agent's reply just like /stream.
+	mux.HandleFunc("/admin/chat/survey", proxy.HandleChatSurvey(dashAuth))
 
 	// Server-side auto-pay config + manual trigger. The actual paying is done
 	// by the background scheduler (AutoPayManager.Start) so it keeps running
@@ -303,6 +306,7 @@ func main() {
 	log.Printf("  POST /admin/chat/stream           (run one chat turn, live status)")
 	log.Printf("  POST /admin/chat/stop             (stop an in-flight chat turn)")
 	log.Printf("  POST /admin/chat/sync             (poll a thread's live state)")
+	log.Printf("  POST /admin/chat/survey           (submit survey answers + continue)")
 	log.Printf("  GET  /admin/autopay               (server auto-pay config)")
 	log.Printf("  POST /admin/autopay/run           (trigger auto-pay scan now)")
 	log.Printf("  POST /admin/autopay/pay-space     (pay one workspace with saved card)")
