@@ -364,11 +364,16 @@ type chatStep struct {
 	Result string `json:"result,omitempty"` // pretty-printed tool result
 }
 
-// chatHistMsg is one rendered message of a past conversation.
+// chatHistMsg is one rendered message of a past conversation. Survey is set on
+// an assistant message when the agent is asking the user to pick options
+// ("Уточню пару деталей…"); Pages lists any pages the agent created/edited
+// this turn (the open-page cards).
 type chatHistMsg struct {
-	Role  string     `json:"role"` // "user" | "assistant"
-	Text  string     `json:"text"`
-	Steps []chatStep `json:"steps,omitempty"`
+	Role   string        `json:"role"` // "user" | "assistant"
+	Text   string        `json:"text"`
+	Steps  []chatStep    `json:"steps,omitempty"`
+	Survey *chatSurvey   `json:"survey,omitempty"`
+	Pages  []chatPageRef `json:"pages,omitempty"`
 }
 
 // syncRecordValues fetches one or more records by pointer through the private
@@ -468,7 +473,9 @@ func HandleChatHistory(auth *DashboardAuth) http.HandlerFunc {
 	}
 }
 
-// buildHistory walks the thread's messages[] in canonical order.
+// buildHistory walks the thread's messages[] in canonical order. user-injected
+// steps (survey answers) render as user messages; survey steps attach to the
+// current assistant message; editReferenceMap pages attach as open-page cards.
 func buildHistory(rm recordMapShape, order []string) []chatHistMsg {
 	out := []chatHistMsg{}
 	var cur *chatHistMsg
@@ -476,6 +483,11 @@ func buildHistory(rm recordMapShape, order []string) []chatHistMsg {
 		if cur != nil {
 			out = append(out, *cur)
 			cur = nil
+		}
+	}
+	ensure := func() {
+		if cur == nil {
+			cur = &chatHistMsg{Role: "assistant"}
 		}
 	}
 	for _, id := range order {
@@ -488,18 +500,25 @@ func buildHistory(rm recordMapShape, order []string) []chatHistMsg {
 		case "user":
 			flush()
 			out = append(out, chatHistMsg{Role: "user", Text: parseUserText(step.Value)})
+		case "user-injected":
+			flush()
+			out = append(out, chatHistMsg{Role: "user", Text: parseInjectedUserText(step)})
 		case "agent-inference":
 			st, t := parseInferenceParts(step.Value)
-			if cur == nil {
-				cur = &chatHistMsg{Role: "assistant"}
-			}
+			ensure()
 			cur.Steps = append(cur.Steps, st...)
 			cur.Text += t
-		case "agent-tool-result":
-			if cur == nil {
-				cur = &chatHistMsg{Role: "assistant"}
+			if pr := parseEditReferenceMap(step.EditReferenceMap); len(pr) > 0 {
+				cur.Pages = append(cur.Pages, pr...)
 			}
+		case "agent-tool-result":
+			ensure()
 			cur.Steps = append(cur.Steps, parseToolResultStep(step))
+		case "survey":
+			ensure()
+			if sv := parseSurveyStep(step); sv != nil {
+				cur.Survey = sv
+			}
 		}
 	}
 	flush()
@@ -719,7 +738,7 @@ func HandleChatSend(auth *DashboardAuth) http.HandlerFunc {
 			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("notion error %d: %s", resp.StatusCode, truncate(string(raw), 200))})
 			return
 		}
-		text, title, steps := parseInferenceStream(raw)
+		text, title, steps, survey, pages := parseInferenceStream(raw)
 		if strings.TrimSpace(text) == "" {
 			text = "(агент не вернул текстового ответа)"
 		}
@@ -728,6 +747,8 @@ func HandleChatSend(auth *DashboardAuth) http.HandlerFunc {
 			"title":     title,
 			"text":      text,
 			"steps":     steps,
+			"survey":    survey,
+			"pages":     pages,
 		})
 	}
 }
@@ -888,6 +909,64 @@ func processStreamLine(line []byte, sItems *[]sMeta, answer *strings.Builder, em
 	}
 }
 
+// streamInference issues runInferenceTranscript and forwards the live agent
+// state (thinking / tool calls / answer deltas) to w as newline-delimited JSON,
+// ending with a "done" event carrying the full answer + any survey/pages.
+// threadID is echoed back so the frontend can adopt a freshly minted thread.
+func streamInference(w http.ResponseWriter, tokenV2, userID, spaceID, threadID string, payload map[string]interface{}) {
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
+	flusher, _ := w.(http.Flusher)
+	emit := func(obj map[string]interface{}) {
+		b, _ := json.Marshal(obj)
+		w.Write(b)
+		w.Write([]byte("\n"))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	reqBody, _ := json.Marshal(payload)
+	resp, err := notionChatRequest(tokenV2, userID, spaceID, "runInferenceTranscript", reqBody, "application/x-ndjson", 600*time.Second)
+	if err != nil {
+		emit(map[string]interface{}{"event": "error", "error": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		raw, _ := io.ReadAll(resp.Body)
+		log.Printf("[chat] stream %d: %s", resp.StatusCode, truncate(string(raw), 300))
+		emit(map[string]interface{}{"event": "error", "error": fmt.Sprintf("notion error %d", resp.StatusCode)})
+		return
+	}
+	var acc bytes.Buffer
+	var sItems []sMeta
+	var answer strings.Builder
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 1024*1024), 32*1024*1024)
+	for sc.Scan() {
+		line := sc.Bytes()
+		acc.Write(line)
+		acc.WriteByte('\n')
+		lineCopy := make([]byte, len(line))
+		copy(lineCopy, line)
+		processStreamLine(lineCopy, &sItems, &answer, emit)
+	}
+	text, title, steps, survey, pages := parseInferenceStream(acc.Bytes())
+	if strings.TrimSpace(text) == "" {
+		text = "(агент не вернул текстового ответа)"
+	}
+	emit(map[string]interface{}{
+		"event":     "done",
+		"thread_id": threadID,
+		"title":     title,
+		"text":      text,
+		"steps":     steps,
+		"survey":    survey,
+		"pages":     pages,
+	})
+}
+
 // HandleChatStream is the streaming counterpart of HandleChatSend. It forwards
 // the live agent state (thinking / tool calls) to the browser as newline-
 // delimited JSON events, then a final "done" event with the full answer.
@@ -908,57 +987,204 @@ func HandleChatStream(auth *DashboardAuth) http.HandlerFunc {
 			http.Error(w, `{"error":"token_v2, space_id and message are required"}`, http.StatusBadRequest)
 			return
 		}
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("X-Accel-Buffering", "no")
-		flusher, _ := w.(http.Flusher)
-		emit := func(obj map[string]interface{}) {
-			b, _ := json.Marshal(obj)
-			w.Write(b)
-			w.Write([]byte("\n"))
-			if flusher != nil {
-				flusher.Flush()
+		payload, threadID := buildSendPayload(body)
+		streamInference(w, body.TokenV2, body.UserID, body.SpaceID, threadID, payload)
+	}
+}
+
+// ---- Survey answers ----
+
+// chatSurveyBody is the request for submitting the user's survey answers and
+// re-running the agent so it continues the turn with those choices.
+type chatSurveyBody struct {
+	TokenV2      string          `json:"token_v2"`
+	UserID       string          `json:"user_id"`
+	UserName     string          `json:"user_name"`
+	UserEmail    string          `json:"user_email"`
+	SpaceID      string          `json:"space_id"`
+	SpaceViewID  string          `json:"space_view_id"`
+	SpaceName    string          `json:"space_name"`
+	Timezone     string          `json:"timezone"`
+	Agent        string          `json:"agent"`
+	Model        string          `json:"model"`
+	ThreadID     string          `json:"thread_id"`
+	SurveyStepID string          `json:"survey_step_id"`
+	Questions    json.RawMessage `json:"questions"`
+	CreatedAt    string          `json:"created_at"`
+	Answers      []struct {
+		QID    string          `json:"qid"`
+		Prompt string          `json:"prompt"`
+		Label  string          `json:"label"`
+		Value  json.RawMessage `json:"value"`
+	} `json:"answers"`
+}
+
+// HandleChatSurvey persists the user's survey answers and re-runs the agent.
+// It mirrors the web client's two-transaction saveTransactionsFanout
+// (submitSurveyResponses + addStepsToExistingThreadAndRun) and then streams the
+// continued turn just like HandleChatStream.
+func HandleChatSurvey(auth *DashboardAuth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !chatAuthOK(auth, w, r) {
+			return
+		}
+		var body chatSurveyBody
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+		body.TokenV2 = strings.TrimSpace(body.TokenV2)
+		body.SpaceID = strings.TrimSpace(body.SpaceID)
+		body.ThreadID = strings.TrimSpace(body.ThreadID)
+		body.SurveyStepID = strings.TrimSpace(body.SurveyStepID)
+		if body.TokenV2 == "" || body.SpaceID == "" || body.ThreadID == "" || body.SurveyStepID == "" || len(body.Answers) == 0 {
+			http.Error(w, `{"error":"token_v2, space_id, thread_id, survey_step_id and answers are required"}`, http.StatusBadRequest)
+			return
+		}
+
+		isCustom := body.Agent != "" && body.Agent != "default"
+		createdSource := "ai_module"
+		if isCustom {
+			createdSource = "custom_agent"
+		}
+
+		// responses maps questionId -> chosen value (option id, custom string or
+		// an array for multi-select), mirroring the persisted step.responses.
+		responses := map[string]json.RawMessage{}
+		var actual [][]string
+		for i, a := range body.Answers {
+			if len(a.Value) > 0 {
+				responses[a.QID] = a.Value
+			} else {
+				b, _ := json.Marshal(a.Label)
+				responses[a.QID] = b
+			}
+			actual = append(actual, []string{a.Prompt + ": "})
+			actual = append(actual, []string{a.Label})
+			if i < len(body.Answers)-1 {
+				actual = append(actual, []string{"\n"})
+			} else {
+				actual = append(actual, []string{""})
 			}
 		}
 
-		payload, threadID := buildSendPayload(body)
-		reqBody, _ := json.Marshal(payload)
-		resp, err := notionChatRequest(body.TokenV2, body.UserID, body.SpaceID, "runInferenceTranscript", reqBody, "application/x-ndjson", 600*time.Second)
+		// TX1: update the survey step with the answers + submitted=true.
+		surveyArgs := map[string]interface{}{
+			"id":        body.SurveyStepID,
+			"type":      "survey",
+			"responses": responses,
+			"submitted": true,
+		}
+		if isMeaningful(body.Questions) {
+			surveyArgs["questions"] = body.Questions
+		}
+		if body.CreatedAt != "" {
+			surveyArgs["createdAt"] = body.CreatedAt
+		}
+		tx1op := map[string]interface{}{
+			"pointer": map[string]string{"table": "thread_message", "id": body.SurveyStepID, "spaceId": body.SpaceID},
+			"path":    []string{"step"},
+			"command": "update",
+			"args":    surveyArgs,
+		}
+		tx1 := map[string]interface{}{
+			"id":         generateUUIDv4(),
+			"spaceId":    body.SpaceID,
+			"debug":      map[string]string{"userAction": "submitSurveyResponses"},
+			"operations": []interface{}{tx1op},
+		}
+
+		// TX2: inject the user's reply as a user-injected message + advance the
+		// thread's messages[] list so the re-run picks it up.
+		injID := generateUUIDv4()
+		nowMs := time.Now().UnixMilli()
+		injStep := map[string]interface{}{
+			"id":             injID,
+			"type":           "user-injected",
+			"actualMessage":  actual,
+			"displayMessage": [][]string{ {"These are my answers"} },
+			"userId":         body.UserID,
+			"createdAt":      time.Now().Format("2006-01-02T15:04:05.000-07:00"),
+			"surveyStepId":   body.SurveyStepID,
+		}
+		tx2opA := map[string]interface{}{
+			"pointer": map[string]string{"table": "thread_message", "id": injID, "spaceId": body.SpaceID},
+			"path":    []string{},
+			"command": "set",
+			"args": map[string]interface{}{
+				"id":               injID,
+				"version":          1,
+				"step":             injStep,
+				"parent_id":        body.ThreadID,
+				"parent_table":     "thread",
+				"space_id":         body.SpaceID,
+				"created_time":     nowMs,
+				"created_by_id":    body.UserID,
+				"created_by_table": "notion_user",
+			},
+		}
+		tx2opB := map[string]interface{}{
+			"pointer": map[string]string{"table": "thread", "id": body.ThreadID, "spaceId": body.SpaceID},
+			"path":    []string{"messages"},
+			"command": "listAfterMulti",
+			"args":    map[string]interface{}{"ids": []string{injID}},
+		}
+		tx2 := map[string]interface{}{
+			"id":         generateUUIDv4(),
+			"spaceId":    body.SpaceID,
+			"debug":      map[string]string{"userAction": "WorkflowActions.addStepsToExistingThreadAndRun"},
+			"operations": []interface{}{tx2opA, tx2opB},
+		}
+
+		saveBody, _ := json.Marshal(map[string]interface{}{
+			"requestId":    generateUUIDv4(),
+			"transactions": []interface{}{tx1, tx2},
+		})
+
+		writeStreamErr := func(msg string) {
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			b, _ := json.Marshal(map[string]interface{}{"event": "error", "error": msg})
+			w.Write(b)
+			w.Write([]byte("\n"))
+		}
+
+		saveResp, err := notionChatRequest(body.TokenV2, body.UserID, body.SpaceID, "saveTransactionsFanout", saveBody, "application/json", chatAPITimeout())
 		if err != nil {
-			emit(map[string]interface{}{"event": "error", "error": err.Error()})
+			writeStreamErr(err.Error())
 			return
 		}
-		defer resp.Body.Close()
-		if resp.StatusCode != 200 {
-			raw, _ := io.ReadAll(resp.Body)
-			log.Printf("[chat] stream %d: %s", resp.StatusCode, truncate(string(raw), 300))
-			emit(map[string]interface{}{"event": "error", "error": fmt.Sprintf("notion error %d", resp.StatusCode)})
+		io.ReadAll(saveResp.Body)
+		saveResp.Body.Close()
+		if saveResp.StatusCode != 200 {
+			writeStreamErr(fmt.Sprintf("notion %d", saveResp.StatusCode))
 			return
 		}
 
-		var acc bytes.Buffer
-		var sItems []sMeta
-		var answer strings.Builder
-		sc := bufio.NewScanner(resp.Body)
-		sc.Buffer(make([]byte, 1024*1024), 32*1024*1024)
-		for sc.Scan() {
-			line := sc.Bytes()
-			acc.Write(line)
-			acc.WriteByte('\n')
-			lineCopy := make([]byte, len(line))
-			copy(lineCopy, line)
-			processStreamLine(lineCopy, &sItems, &answer, emit)
+		// Re-run the agent so it continues with the answers. The transcript is
+		// empty: the thread already holds the config + the injected reply.
+		runPayload := map[string]interface{}{
+			"traceId":      generateUUIDv4(),
+			"spaceId":      body.SpaceID,
+			"transcript":   []interface{}{},
+			"threadId":     body.ThreadID,
+			"createThread": false,
+			"debugOverrides": map[string]interface{}{
+				"emitAgentSearchExtractedResults": true,
+				"cachedInferences":                map[string]interface{}{},
+				"annotationInferences":            map[string]interface{}{},
+				"emitInferences":                  false,
+			},
+			"generateTitle":                 false,
+			"saveAllThreadOperations":       true,
+			"setUnreadState":                true,
+			"createdSource":                 createdSource,
+			"threadType":                    "workflow",
+			"isPartialTranscript":           true,
+			"asPatchResponse":               true,
+			"patchResponseVersion":          2,
+			"isUserInAnySalesAssistedSpace": false,
+			"isSpaceSalesAssisted":          false,
 		}
-		text, title, steps := parseInferenceStream(acc.Bytes())
-		if strings.TrimSpace(text) == "" {
-			text = "(агент не вернул текстового ответа)"
-		}
-		emit(map[string]interface{}{
-			"event":     "done",
-			"thread_id": threadID,
-			"title":     title,
-			"text":      text,
-			"steps":     steps,
-		})
+		streamInference(w, body.TokenV2, body.UserID, body.SpaceID, body.ThreadID, runPayload)
 	}
 }
