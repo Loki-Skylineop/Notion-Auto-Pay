@@ -19,6 +19,21 @@ type tmStep struct {
 	Input    json.RawMessage `json:"input"`
 	Output   json.RawMessage `json:"output"`
 	Result   json.RawMessage `json:"result"`
+	// Survey steps (type=="survey") carry their definition inline on the step
+	// rather than under Value: an id, the questions[] and (once answered) the
+	// responses map + submitted flag.
+	ID        string          `json:"id"`
+	Questions json.RawMessage `json:"questions"`
+	Responses json.RawMessage `json:"responses"`
+	Submitted bool            `json:"submitted"`
+	CreatedAt string          `json:"createdAt"`
+	// User-injected steps (type=="user-injected") are the user's survey answers
+	// rendered back into the transcript as a pseudo user message.
+	ActualMessage  json.RawMessage `json:"actualMessage"`
+	DisplayMessage json.RawMessage `json:"displayMessage"`
+	// Agent-inference steps may carry an editReferenceMap describing the pages
+	// the agent created or edited this turn (powers the open-page cards).
+	EditReferenceMap json.RawMessage `json:"editReferenceMap"`
 }
 
 type tmInner struct {
@@ -51,6 +66,147 @@ func sortedThreadMessages(rm recordMapShape) []orderedTM {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].created < out[j].created })
 	return out
+}
+
+// ---- survey + open-page shapes ----
+
+// surveyOption is one selectable answer of a survey question. PageID is set when
+// the option references a Notion page.
+type surveyOption struct {
+	ID     string `json:"id"`
+	Label  string `json:"label"`
+	PageID string `json:"pageId,omitempty"`
+}
+
+// surveyQuestion is one question of an agent-issued survey ("Уточню пару
+// деталей…").
+type surveyQuestion struct {
+	ID            string         `json:"id"`
+	Prompt        string         `json:"prompt"`
+	Options       []surveyOption `json:"options"`
+	AllowOther    bool           `json:"allowOther,omitempty"`
+	AllowMultiple bool           `json:"allowMultiple,omitempty"`
+}
+
+// chatSurvey is the rendered survey attached to an assistant message. Submitted
+// flips to true once the user has answered (Responses maps questionId ->
+// answer, mirroring the persisted step.responses).
+type chatSurvey struct {
+	StepID    string                     `json:"step_id"`
+	Questions []surveyQuestion           `json:"questions"`
+	Responses map[string]json.RawMessage `json:"responses,omitempty"`
+	Submitted bool                       `json:"submitted"`
+	CreatedAt string                     `json:"created_at,omitempty"`
+}
+
+// chatPageRef is one page the agent created/edited this turn, surfaced as an
+// open-page card. Name is the editReferenceMap variable name; URL is a
+// ready-to-open notion.so link.
+type chatPageRef struct {
+	Name   string `json:"name"`
+	Label  string `json:"label,omitempty"`
+	PageID string `json:"page_id"`
+	URL    string `json:"url"`
+	Reason string `json:"reason,omitempty"`
+}
+
+// parseSurveyStep builds a chatSurvey from a survey thread_message step.
+func parseSurveyStep(s tmStep) *chatSurvey {
+	if !isMeaningful(s.Questions) {
+		return nil
+	}
+	var qs []surveyQuestion
+	if json.Unmarshal(s.Questions, &qs) != nil || len(qs) == 0 {
+		return nil
+	}
+	sv := &chatSurvey{
+		StepID:    s.ID,
+		Questions: qs,
+		Submitted: s.Submitted,
+		CreatedAt: s.CreatedAt,
+	}
+	if isMeaningful(s.Responses) {
+		var r map[string]json.RawMessage
+		if json.Unmarshal(s.Responses, &r) == nil && len(r) > 0 {
+			sv.Responses = r
+			sv.Submitted = true
+		}
+	}
+	return sv
+}
+
+// notionPageURL turns a 32-char (dashed or not) block/page id into a notion.so
+// URL the dashboard can open in a new tab.
+func notionPageURL(id string) string {
+	clean := strings.ReplaceAll(strings.TrimSpace(id), "-", "")
+	if clean == "" {
+		return ""
+	}
+	return "https://www.notion.so/" + clean
+}
+
+// parseEditReferenceMap turns an agent-inference step's editReferenceMap into a
+// list of open-page references. Only page parents are kept; the map key is used
+// as the reference name so inline <edit_reference variableNames="…"> tags can be
+// matched to a card on the frontend.
+func parseEditReferenceMap(raw json.RawMessage) []chatPageRef {
+	if !isMeaningful(raw) {
+		return nil
+	}
+	var m map[string]struct {
+		EditReason    string `json:"editReason"`
+		ToolCallID    string `json:"toolCallId"`
+		ParentsEdited []struct {
+			Type          string `json:"type"`
+			RecordPointer struct {
+				ID    string `json:"id"`
+				Table string `json:"table"`
+			} `json:"recordPointer"`
+		} `json:"parentsEdited"`
+	}
+	if json.Unmarshal(raw, &m) != nil {
+		return nil
+	}
+	names := make([]string, 0, len(m))
+	for k := range m {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	var out []chatPageRef
+	for _, name := range names {
+		v := m[name]
+		for _, p := range v.ParentsEdited {
+			if p.Type != "page" {
+				continue
+			}
+			id := strings.TrimSpace(p.RecordPointer.ID)
+			if id == "" {
+				continue
+			}
+			out = append(out, chatPageRef{
+				Name:   name,
+				PageID: id,
+				URL:    notionPageURL(id),
+				Reason: v.EditReason,
+			})
+			break
+		}
+	}
+	return out
+}
+
+// parseInjectedUserText renders a user-injected step (survey answers) as plain
+// text by joining its actualMessage segments (falling back to displayMessage).
+func parseInjectedUserText(s tmStep) string {
+	if len(s.ActualMessage) > 0 {
+		if t := parseUserText(s.ActualMessage); strings.TrimSpace(t) != "" {
+			return t
+		}
+	}
+	if len(s.DisplayMessage) > 0 {
+		return parseUserText(s.DisplayMessage)
+	}
+	return ""
 }
 
 // ---- tool-call presentation helpers ----
@@ -256,9 +412,10 @@ func parseUserText(raw json.RawMessage) string {
 }
 
 // extractTurn folds a record-map (ordered by created_time) into the latest
-// assistant turn: its concatenated text, the title and the visible steps
-// (thoughts interleaved with tool calls).
-func extractTurn(rm recordMapShape) (text, title string, steps []chatStep) {
+// assistant turn: its concatenated text, the title, the visible steps (thoughts
+// interleaved with tool calls), the trailing survey (if the agent is asking for
+// details) and any pages it created/edited this turn.
+func extractTurn(rm recordMapShape) (text, title string, steps []chatStep, survey *chatSurvey, pages []chatPageRef) {
 	for _, m := range sortedThreadMessages(rm) {
 		switch m.step.Type {
 		case "title":
@@ -270,18 +427,26 @@ func extractTurn(rm recordMapShape) (text, title string, steps []chatStep) {
 			st, t := parseInferenceParts(m.step.Value)
 			steps = append(steps, st...)
 			text += t
+			if pr := parseEditReferenceMap(m.step.EditReferenceMap); len(pr) > 0 {
+				pages = append(pages, pr...)
+			}
 		case "agent-tool-result":
 			steps = append(steps, parseToolResultStep(m.step))
+		case "survey":
+			if sv := parseSurveyStep(m.step); sv != nil {
+				survey = sv
+			}
 		}
 	}
-	return text, title, steps
+	return text, title, steps, survey, pages
 }
 
 // parseInferenceStream walks the ndjson patch stream. It prefers the final,
 // authoritative record-map; if none is present it falls back to concatenating
 // the streamed answer-text deltas (thinking deltas are excluded so the answer
-// body never contains the model's reasoning).
-func parseInferenceStream(raw []byte) (text, title string, steps []chatStep) {
+// body never contains the model's reasoning). It also surfaces the trailing
+// survey + open-page references from the record-map.
+func parseInferenceStream(raw []byte) (text, title string, steps []chatStep, survey *chatSurvey, pages []chatPageRef) {
 	var fallback strings.Builder
 	var sItems []sMeta
 	for _, line := range strings.Split(string(raw), "\n") {
@@ -333,7 +498,7 @@ func parseInferenceStream(raw []byte) (text, title string, steps []chatStep) {
 				if len(c.ThreadMessage) == 0 {
 					continue
 				}
-				t, ti, st := extractTurn(c)
+				t, ti, st, sv, pg := extractTurn(c)
 				if t != "" {
 					text = t
 				}
@@ -342,6 +507,12 @@ func parseInferenceStream(raw []byte) (text, title string, steps []chatStep) {
 				}
 				if len(st) > 0 {
 					steps = st
+				}
+				if sv != nil {
+					survey = sv
+				}
+				if len(pg) > 0 {
+					pages = pg
 				}
 			}
 		case "patch":
@@ -391,5 +562,5 @@ func parseInferenceStream(raw []byte) (text, title string, steps []chatStep) {
 	if strings.TrimSpace(text) == "" {
 		text = strings.TrimSpace(fallback.String())
 	}
-	return text, title, steps
+	return text, title, steps, survey, pages
 }
