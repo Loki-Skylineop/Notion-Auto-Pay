@@ -5,11 +5,16 @@ import {
   chatHistory,
   chatModels,
   chatStream,
+  chatSurvey,
   chatThreads,
   type ChatAgent,
   type ChatModel,
+  type ChatPageRef,
   type ChatStatus,
   type ChatStep,
+  type ChatSurvey,
+  type ChatSurveyAnswer,
+  type ChatSurveyQuestion,
   type ChatThread,
 } from '../api'
 import { fetchAutoPayConfig, type ServerAutoPayConfig } from '../autopay'
@@ -111,6 +116,68 @@ function saveDraft(key: string, text: string): void {
   }
 }
 
+// Per-thread history cache. The rendered messages of each opened thread are
+// stored in localStorage so re-opening a chat paints instantly instead of
+// waiting on the network. A cheap content hash lets us skip a needless
+// re-render when the freshly-fetched history matches the cache, and reconcile
+// only when it actually changed.
+const HISTORY_CACHE_KEY = 'nmp_chat_hist_cache'
+const HISTORY_CACHE_MAX = 40
+
+interface CachedHistory {
+  hash: string
+  messages: ChatMessage[]
+  at: number
+}
+
+function hashMessages(messages: ChatMessage[]): string {
+  let h = 0
+  const basis = messages
+    .map(
+      (m) =>
+        `${m.role}|${m.text}|${m.steps?.length || 0}|${m.survey?.id || ''}|${m.survey?.submitted ? 1 : 0}|${(m.pages || []).map((p) => p.url).join(',')}`,
+    )
+    .join('\u0001')
+  for (let i = 0; i < basis.length; i += 1) {
+    h = (Math.imul(h, 31) + basis.charCodeAt(i)) | 0
+  }
+  return `${messages.length}:${(h >>> 0).toString(16)}`
+}
+
+function loadHistoryCache(): Record<string, CachedHistory> {
+  try {
+    const raw = localStorage.getItem(HISTORY_CACHE_KEY)
+    return raw ? (JSON.parse(raw) as Record<string, CachedHistory>) : {}
+  } catch {
+    return {}
+  }
+}
+
+function readCachedHistory(threadId: string): CachedHistory | null {
+  if (!threadId) return null
+  return loadHistoryCache()[threadId] || null
+}
+
+function writeCachedHistory(threadId: string, messages: ChatMessage[]): string {
+  const hash = hashMessages(messages)
+  if (!threadId) return hash
+  try {
+    const all = loadHistoryCache()
+    all[threadId] = { hash, messages, at: Date.now() }
+    const keys = Object.keys(all)
+    if (keys.length > HISTORY_CACHE_MAX) {
+      keys
+        .sort((a, b) => (all[a].at || 0) - (all[b].at || 0))
+        .slice(0, keys.length - HISTORY_CACHE_MAX)
+        .forEach((k) => delete all[k])
+    }
+    localStorage.setItem(HISTORY_CACHE_KEY, JSON.stringify(all))
+  } catch {
+    // ignore quota / privacy-mode failures
+  }
+  return hash
+}
+
 interface SpaceOption {
   key: string
   account: DiscoveredAccount
@@ -124,6 +191,8 @@ interface ChatMessage {
   role: 'user' | 'assistant'
   text: string
   steps?: ChatStep[]
+  survey?: ChatSurvey
+  pages?: ChatPageRef[]
 }
 
 function browserTimezone(): string {
@@ -402,36 +471,63 @@ function StepRow({ step }: { step: ChatStep }) {
   )
 }
 
+// Tool steps that are framework-internal housekeeping (the agent reading its
+// own files or loading Notion records to orient itself). Real Notion hides
+// these from the visible step list, so we do too — leaving only meaningful
+// actions like connector calls and web searches.
+function isInternalTool(step: ChatStep): boolean {
+  if (step.kind !== 'tool') return false
+  const t = (step.tool || step.text || '').toLowerCase().replace(/\s+/g, '')
+  if (!t) return false
+  if (t.startsWith('fs.') || t.includes('connections.fs.') || t.includes('.fs.read')) return true
+  return /(listuserconnections|loadagent|loaduser|loadpage|loaddatabase|loaddatasource|readfiles|readdir|readfile)/.test(t)
+}
+
+// visibleSteps drops housekeeping tool calls so the rendered list reads like
+// Notion's: one meaningful action per line.
+function visibleSteps(steps: ChatStep[]): ChatStep[] {
+  return (steps || []).filter((s) => !isInternalTool(s))
+}
+
+function stepCountWord(n: number): string {
+  const m10 = n % 10
+  const m100 = n % 100
+  if (m10 === 1 && m100 !== 11) return 'шаг'
+  if (m10 >= 2 && m10 <= 4 && (m100 < 10 || m100 >= 20)) return 'шага'
+  return 'шагов'
+}
+
 function StepsTree({ steps }: { steps: ChatStep[] }) {
-  if (!steps || steps.length === 0) return null
+  const shown = visibleSteps(steps)
+  if (shown.length === 0) return null
   return (
     <div className="border-l border-white/[0.08] pl-3 ml-1 space-y-0.5 min-w-0">
-      {steps.map((s, i) => (
+      {shown.map((s, i) => (
         <StepRow key={i} step={s} />
       ))}
     </div>
   )
 }
 
-// Collapsible "Шаги агента" panel — collapsed by default.
+// Agent steps as a clean vertical list — one action per line, shown between the
+// user's turn and the answer, mirroring how Notion renders its steps. Expanded
+// by default; the small header folds long lists away. (Replaces the old
+// collapsed-by-default "Шаги агента · N" blob.)
 function StepsBlock({ steps }: { steps: ChatStep[] }) {
-  const [open, setOpen] = useState(false)
-  if (!steps || steps.length === 0) return null
+  const shown = visibleSteps(steps)
+  const [open, setOpen] = useState(true)
+  if (shown.length === 0) return null
   return (
-    <div className="mb-2 rounded-lg border border-white/[0.07] bg-white/[0.02] overflow-hidden min-w-0">
+    <div className="mb-2.5 min-w-0">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center justify-between px-2.5 py-1.5 text-[11px] font-medium uppercase tracking-wide text-text-muted hover:text-text-secondary bg-transparent border-none cursor-pointer"
+        className="inline-flex items-center gap-1.5 mb-1 text-[11px] font-medium text-text-muted hover:text-text-secondary bg-transparent border-none cursor-pointer p-0"
       >
-        <span>Шаги агента · {steps.length}</span>
-        <span>{open ? '▾' : '▸'}</span>
+        <span className="inline-block w-3 text-[10px]">{open ? '▾' : '▸'}</span>
+        <span>{shown.length} {stepCountWord(shown.length)}</span>
       </button>
-      {open && (
-        <div className="px-2.5 pb-2 pt-1">
-          <StepsTree steps={steps} />
-        </div>
-      )}
+      {open ? <StepsTree steps={shown} /> : null}
     </div>
   )
 }
@@ -635,15 +731,48 @@ function renderBlocks(text: string): React.ReactNode[] {
   return blocks
 }
 
+// Strip the agent's <edit_reference …>…</edit_reference> open-page markers from
+// the prose — the referenced pages are rendered as clickable cards instead.
+function stripEditReferences(text: string): string {
+  return text
+    .replace(/<edit_reference[^>]*>[\s\S]*?<\/edit_reference>/g, '')
+    .replace(/<edit_reference[^>]*\/>/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trimEnd()
+}
+
 function MessageBody({ text }: { text: string }) {
-  return <div className="space-y-0.5 min-w-0">{renderBlocks(text)}</div>
+  return <div className="space-y-0.5 min-w-0">{renderBlocks(stripEditReferences(text))}</div>
+}
+
+// A clickable card linking to a page the agent created or shared this turn.
+function PageCards({ pages }: { pages: ChatPageRef[] }) {
+  const items = (pages || []).filter((p) => p && p.url)
+  if (items.length === 0) return null
+  return (
+    <div className="mt-2.5 space-y-1.5 min-w-0">
+      {items.map((p, i) => (
+        <a
+          key={i}
+          href={p.url}
+          target="_blank"
+          rel="noreferrer"
+          className="group flex items-center gap-2.5 px-3 py-2 rounded-lg border border-white/[0.08] bg-white/[0.02] hover:bg-white/[0.05] hover:border-white/[0.14] transition-colors no-underline min-w-0"
+        >
+          <span className="shrink-0 w-6 h-6 flex items-center justify-center rounded-md bg-white/[0.05] border border-white/[0.08] text-[13px]">📄</span>
+          <span className="min-w-0 flex-1 truncate text-[13px] text-[#d4d4d4]">{p.name || 'Страница Notion'}</span>
+          <span className="shrink-0 text-[11px] text-text-muted group-hover:text-text-secondary">Открыть ↗</span>
+        </a>
+      ))}
+    </div>
+  )
 }
 
 // A single rendered message. Memoised so typing in the composer (which lives in
 // its own component) never re-runs the markdown renderer for the whole log.
 // Mockup layout: user turns sit in a compact right-aligned bubble, assistant
 // turns are full-width with a small ✦ avatar and dimmed body text.
-const MessageRow = memo(function MessageRow({ role, text, steps }: { role: 'user' | 'assistant'; text: string; steps?: ChatStep[] }) {
+const MessageRow = memo(function MessageRow({ role, text, steps, pages }: { role: 'user' | 'assistant'; text: string; steps?: ChatStep[]; pages?: ChatPageRef[] }) {
   if (role === 'user') {
     return (
       <div className="flex justify-end min-w-0">
@@ -663,6 +792,7 @@ const MessageRow = memo(function MessageRow({ role, text, steps }: { role: 'user
         <div className="text-[13.5px] leading-relaxed text-[#8a8a8a]">
           <MessageBody text={text} />
         </div>
+        {pages && pages.length > 0 ? <PageCards pages={pages} /> : null}
         <CopyButton text={text} />
       </div>
     </div>
@@ -827,6 +957,109 @@ const Composer = memo(function Composer({
   )
 })
 
+// --- agent survey (todo-list style follow-up questions) ---
+
+// SurveyCard renders an agent survey near the composer: one question at a time
+// («1 / 3»), each with its option buttons plus a «свой вариант» free-text box.
+// Answering the final question calls onSubmit with every collected answer,
+// which continues the same agent turn (see chatSurvey).
+function SurveyCard({
+  survey,
+  busy,
+  onSubmit,
+}: {
+  survey: ChatSurvey
+  busy: boolean
+  onSubmit: (answers: ChatSurveyAnswer[]) => void
+}) {
+  const questions = useMemo(() => survey.questions || [], [survey])
+  const [step, setStep] = useState(0)
+  const [answers, setAnswers] = useState<ChatSurveyAnswer[]>([])
+  const [other, setOther] = useState('')
+
+  // Restart from the first question whenever a different survey arrives.
+  useEffect(() => {
+    setStep(0)
+    setAnswers([])
+    setOther('')
+  }, [survey.id])
+
+  const total = questions.length
+  const q: ChatSurveyQuestion | undefined = questions[step]
+  if (!q || total === 0) return null
+
+  const commit = (label: string, value?: unknown) => {
+    const clean = label.trim()
+    if (!clean || busy) return
+    const ans: ChatSurveyAnswer = { qid: q.id, prompt: q.prompt, label: clean, value }
+    const next = [...answers.filter((a) => a.qid !== q.id), ans]
+    setAnswers(next)
+    setOther('')
+    if (step + 1 < total) setStep(step + 1)
+    else onSubmit(next)
+  }
+
+  return (
+    <div className="relative z-10 mx-4 md:mx-6 mb-2 rounded-xl border border-white/[0.10] bg-[#0c0c0c] p-3.5">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Уточню пару деталей</span>
+        <span className="text-[11px] text-text-muted">{step + 1} / {total}</span>
+      </div>
+      <div className="text-[13.5px] text-[#e8e8e8] mb-2.5 leading-snug">{q.prompt}</div>
+      <div className="space-y-1.5">
+        {q.options.map((opt) => (
+          <button
+            key={opt.id}
+            type="button"
+            disabled={busy}
+            onClick={() => commit(opt.label, opt.pageId ? { pageId: opt.pageId } : undefined)}
+            className="w-full text-left px-3 py-2 rounded-lg border border-white/[0.08] bg-white/[0.02] text-[13px] text-[#d4d4d4] hover:bg-white/[0.06] hover:border-white/[0.16] transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {opt.label}
+          </button>
+        ))}
+      </div>
+      {q.allowOther ? (
+        <div className="mt-2 flex items-center gap-2 rounded-lg border border-white/[0.08] bg-[#080808] px-3 py-2 focus-within:border-white/[0.18] transition-colors">
+          <input
+            type="text"
+            value={other}
+            disabled={busy}
+            onChange={(e) => setOther(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') {
+                e.preventDefault()
+                commit(other)
+              }
+            }}
+            placeholder="свой вариант…"
+            className="flex-1 min-w-0 bg-transparent border-none outline-none text-[#e8e8e8] text-[13px] placeholder-[#444]"
+          />
+          <button
+            type="button"
+            disabled={busy || other.trim() === ''}
+            onClick={() => commit(other)}
+            title="Ответить"
+            className="shrink-0 w-6 h-6 flex items-center justify-center rounded-full bg-white text-black hover:bg-[#f0f0f0] transition-colors disabled:opacity-25 disabled:cursor-not-allowed border-none cursor-pointer"
+          >
+            <SendIcon />
+          </button>
+        </div>
+      ) : null}
+      {step > 0 ? (
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => setStep(step - 1)}
+          className="mt-2 text-[11px] text-text-muted hover:text-text-secondary bg-transparent border-none cursor-pointer p-0"
+        >
+          ← Назад
+        </button>
+      ) : null}
+    </div>
+  )
+}
+
 // --- main component ---
 
 export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
@@ -943,6 +1176,14 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       // ignore
     }
   }, [activeThreadId])
+
+  // Persist the active thread's settled messages so re-opening it is instant.
+  // Skipped while a turn is in flight so we never cache a half-streamed state.
+  useEffect(() => {
+    if (!activeThreadId || sending || remoteBusy) return
+    if (messages.length === 0) return
+    writeCachedHistory(activeThreadId, messages)
+  }, [activeThreadId, messages, sending, remoteBusy])
 
   const spaceOptions = useMemo<SpaceOption[]>(() => {
     const out: SpaceOption[] = []
@@ -1202,9 +1443,18 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       const remembered = threadAgentsRef.current[t.id]
       setAgentId(remembered && agents.some((a) => a.id === remembered) ? remembered : 'default')
       setError('')
-      setMessages([])
+      // Cache-first: paint the last-seen history immediately so switching
+      // chats is instant, then revalidate against the server in parallel and
+      // reconcile only if the content hash actually changed.
+      const cached = readCachedHistory(t.id)
+      if (cached) {
+        setMessages(cached.messages)
+        setHistoryLoading(false)
+      } else {
+        setMessages([])
+        setHistoryLoading(true)
+      }
       setVisibleCount(PAGE_SIZE)
-      setHistoryLoading(true)
       try {
         const hist = await chatHistory({
           token_v2: activeSpace.account.token_v2,
@@ -1212,7 +1462,11 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           space_id: activeSpace.spaceId,
           thread_id: t.id,
         })
-        setMessages(hist.map((m) => ({ role: m.role, text: m.text, steps: m.steps })))
+        const mapped: ChatMessage[] = hist.map((m) => ({ role: m.role, text: m.text, steps: m.steps, survey: m.survey, pages: m.pages }))
+        if (viewKeyRef.current === t.id && (!cached || cached.hash !== hashMessages(mapped))) {
+          setMessages(mapped)
+        }
+        writeCachedHistory(t.id, mapped)
         // Keep mirroring the server while the thread is open so a turn that is
         // still running (or was started elsewhere) streams in, and the final
         // state lands without a manual reopen. The loop stops itself once the
@@ -1318,6 +1572,58 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     }
   }, [sending, liveText, liveSteps, activeSpace, reconcileFromServer, stopPolling])
 
+  // Shared live-status reducer for both chatStream (handleSend) and chatSurvey
+  // (handleSurveySubmit). The backend tags every event with a kind: "tool" (a
+  // connector call, carrying label/server/input/result), "thought" (streamed
+  // reasoning) or "text" (the answer itself, carrying the cumulative text as it
+  // is written). We fold tool + thought events into liveSteps so the live tree
+  // mirrors the finished message, and mirror text into liveText so the reply
+  // types out in place.
+  const onStatus = useCallback((s: ChatStatus) => {
+    setStatus(s)
+    if (s.kind === 'text') {
+      if (s.detail) setLiveText(s.detail)
+      return
+    }
+    setLiveSteps((prev) => {
+      if (s.kind === 'tool') {
+        const label = (s.tool || s.detail || '').trim()
+        if (!label) return prev
+        const next: ChatStep = {
+          kind: 'tool',
+          text: label,
+          tool: label,
+          server: s.server || '',
+          input: s.input || '',
+          result: s.result || '',
+        }
+        const last = prev[prev.length - 1]
+        if (last && last.kind === 'tool' && last.tool === label) {
+          return [
+            ...prev.slice(0, -1),
+            {
+              ...last,
+              server: next.server || last.server,
+              input: next.input || last.input,
+              result: next.result || last.result,
+            },
+          ]
+        }
+        return [...prev, next]
+      }
+      if (s.kind === 'thought') {
+        const thought = s.detail || ''
+        const last = prev[prev.length - 1]
+        if (last && last.kind === 'thought') {
+          return [...prev.slice(0, -1), { kind: 'thought', text: thought }]
+        }
+        if (thought.trim() === '') return prev
+        return [...prev, { kind: 'thought', text: thought }]
+      }
+      return prev
+    })
+  }, [])
+
   const handleSend = useCallback(
     async (msg: string) => {
       const text = msg.trim()
@@ -1339,57 +1645,6 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       setStatus(null)
       setLiveSteps([])
       setLiveText('')
-
-      // Live status reducer. The backend tags every event with a kind:
-      // "tool" (a connector call, carrying label/server/input/result),
-      // "thought" (streamed reasoning) or "text" (the answer itself, now
-      // carrying the cumulative text as it is written). We fold tool + thought
-      // events into liveSteps so the live tree mirrors the finished message,
-      // and mirror text into liveText so the reply types out in place.
-      const onStatus = (s: ChatStatus) => {
-        setStatus(s)
-        if (s.kind === 'text') {
-          if (s.detail) setLiveText(s.detail)
-          return
-        }
-        setLiveSteps((prev) => {
-          if (s.kind === 'tool') {
-            const label = (s.tool || s.detail || '').trim()
-            if (!label) return prev
-            const next: ChatStep = {
-              kind: 'tool',
-              text: label,
-              tool: label,
-              server: s.server || '',
-              input: s.input || '',
-              result: s.result || '',
-            }
-            const last = prev[prev.length - 1]
-            if (last && last.kind === 'tool' && last.tool === label) {
-              return [
-                ...prev.slice(0, -1),
-                {
-                  ...last,
-                  server: next.server || last.server,
-                  input: next.input || last.input,
-                  result: next.result || last.result,
-                },
-              ]
-            }
-            return [...prev, next]
-          }
-          if (s.kind === 'thought') {
-            const thought = s.detail || ''
-            const last = prev[prev.length - 1]
-            if (last && last.kind === 'thought') {
-              return [...prev.slice(0, -1), { kind: 'thought', text: thought }]
-            }
-            if (thought.trim() === '') return prev
-            return [...prev, { kind: 'thought', text: thought }]
-          }
-          return prev
-        })
-      }
 
       try {
         const res = await chatStream(
@@ -1425,7 +1680,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           if (res.thread_id && res.thread_id !== activeThreadId) setActiveThreadId(res.thread_id)
           setMessages((prev) => [
             ...prev,
-            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps },
+            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, survey: res.survey, pages: res.pages },
           ])
         }
         // Keep polling the freshly persisted thread state so the message list
@@ -1449,7 +1704,87 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         }
       }
     },
-    [activeSpace, sending, activeThreadId, agentId, selectedModel, rememberThreadAgent, startPolling],
+    [activeSpace, sending, activeThreadId, agentId, selectedModel, onStatus, rememberThreadAgent, startPolling],
+  )
+
+  // Continue a turn by answering the agent's survey. Mirrors handleSend, but
+  // posts the collected answers to chatSurvey instead of a free-text message.
+  const handleSurveySubmit = useCallback(
+    async (survey: ChatSurvey, answers: ChatSurveyAnswer[]) => {
+      if (!activeSpace || sending) return
+      const tid = activeThreadId
+      if (!tid || !survey || survey.submitted) return
+      const originKey = tid
+      const agentUsed = agentId
+      const myTurn = ++turnSeqRef.current
+      stopRef.current = false
+      streamThreadIdRef.current = tid
+      instantScrollRef.current = true
+      setError('')
+      // Mark the survey answered and echo the chosen answers as a user turn.
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.survey && m.survey.id === survey.id ? { ...m, survey: { ...m.survey, submitted: true } } : m,
+        ),
+      )
+      setMessages((prev) => [
+        ...prev,
+        { role: 'user', text: answers.map((a) => `${a.prompt}\n— ${a.label}`).join('\n\n') },
+      ])
+      setSending(true)
+      setStreamKey(originKey)
+      setStatus(null)
+      setLiveSteps([])
+      setLiveText('')
+      startPolling(activeSpace, tid)
+      try {
+        const res = await chatSurvey(
+          {
+            token_v2: activeSpace.account.token_v2,
+            user_id: activeSpace.account.user_id,
+            user_name: activeSpace.account.user_name,
+            user_email: activeSpace.account.user_email,
+            space_id: activeSpace.spaceId,
+            space_view_id: activeSpace.spaceViewId,
+            space_name: activeSpace.spaceName,
+            timezone: browserTimezone(),
+            agent: agentUsed,
+            model: agentUsed === 'default' ? selectedModel || undefined : undefined,
+            thread_id: tid,
+            survey_step_id: survey.id,
+            questions: survey.questions,
+            created_at: survey.createdAt,
+            answers,
+          },
+          onStatus,
+        )
+        if (res.thread_id) {
+          streamThreadIdRef.current = res.thread_id
+          rememberThreadAgent(res.thread_id, agentUsed)
+        }
+        if (viewKeyRef.current === originKey && !stopRef.current) {
+          setMessages((prev) => [
+            ...prev,
+            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, survey: res.survey, pages: res.pages },
+          ])
+        }
+        if (res.thread_id) startPolling(activeSpace, res.thread_id)
+      } catch (e) {
+        if (viewKeyRef.current === originKey && !stopRef.current) {
+          setError(e instanceof Error ? e.message : 'Ошибка отправки')
+          setMessages((prev) => [...prev, { role: 'assistant', text: '⚠️ Не удалось отправить ответы. Попробуйте ещё раз.' }])
+        }
+      } finally {
+        if (turnSeqRef.current === myTurn) {
+          setSending(false)
+          setStatus(null)
+          setLiveSteps([])
+          setLiveText('')
+          setStreamKey(null)
+        }
+      }
+    },
+    [activeSpace, sending, activeThreadId, agentId, selectedModel, onStatus, rememberThreadAgent, startPolling],
   )
 
   if (accounts.length === 0) {
@@ -1464,6 +1799,11 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const showThinking = (sending && streamKey === viewKey) || (remoteBusy && !sending)
   const showModelPicker = agentId === 'default' && models.filter((m) => !m.disabled).length > 0
   const activeThreadTitle = threads.find((t) => t.id === activeThreadId)?.title || 'Новый чат'
+  const lastMessage = messages[messages.length - 1]
+  const pendingSurvey =
+    !showThinking && lastMessage && lastMessage.role === 'assistant' && lastMessage.survey && !lastMessage.survey.submitted
+      ? lastMessage.survey
+      : null
 
   return (
     <div className="relative mx-auto" style={isDesktop ? { width: outerWidth, maxWidth: '100%' } : undefined}>
@@ -1522,135 +1862,4 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
             />
             {activeThreadId ? (
               <div className="mt-1 px-0.5 text-[9px] text-text-muted leading-snug">
-                Агент зафиксирован для этого чата. Создайте новый чат, чтобы выбрать другого.
-              </div>
-            ) : null}
-          </div>
-        </div>
-
-        <button
-          type="button"
-          onClick={startNewChat}
-          className="w-full flex items-center justify-center gap-1.5 py-2 mb-4 rounded-lg border border-white/[0.07] text-[11px] text-[#888] hover:bg-white/[0.04] hover:text-text-secondary hover:border-white/[0.12] transition-colors bg-transparent cursor-pointer"
-        >
-          <PlusIcon /> Новый чат
-        </button>
-
-        <div className="text-[9px] text-text-muted uppercase tracking-widest mb-2 px-0.5">История</div>
-        <div className="flex-1 min-h-0 overflow-y-auto space-y-px pr-1">
-          {threads.length === 0 ? (
-            <div className="text-[11px] text-text-muted py-2 px-0.5">Пока нет чатов</div>
-          ) : (
-            threads.map((t) => (
-              <div
-                key={t.id}
-                onClick={() => openThread(t)}
-                className={`group flex items-center justify-between px-2.5 py-2 rounded-md cursor-pointer transition-colors ${
-                  t.id === activeThreadId ? 'bg-white/[0.07] text-[#e8e8e8]' : 'text-[#666] hover:bg-white/[0.03] hover:text-[#999]'
-                }`}
-              >
-                <span className="text-[11px] truncate" title={t.title || 'Без названия'}>
-                  {t.title || 'Без названия'}
-                </span>
-                <button
-                  type="button"
-                  onClick={(e) => deleteThread(t, e)}
-                  title="Удалить чат"
-                  className="opacity-0 group-hover:opacity-100 focus:opacity-100 p-0.5 ml-1 text-[#444] hover:text-red-400 transition-all shrink-0 bg-transparent border-none cursor-pointer"
-                >
-                  <TrashIcon />
-                </button>
-              </div>
-            ))
-          )}
-        </div>
-      </aside>
-
-      {/* Desktop-only splitter: drag to resize the sidebar / chat columns. */}
-      <div
-        onMouseDown={startSidebarResize}
-        title="Потяните, чтобы изменить ширину"
-        className="hidden md:block shrink-0 w-1 cursor-col-resize bg-white/[0.04] hover:bg-white/[0.14] active:bg-notion-blue/50 transition-colors"
-      />
-
-      <section className="relative flex-1 min-w-0 flex flex-col min-h-0 overflow-hidden bg-black">
-        <ParticleField active={showThinking} />
-
-        {/* Top bar — mobile only: menu + current thread + new chat */}
-        <div className="relative z-10 flex items-center gap-2 px-3 py-2 border-b border-white/[0.06] md:hidden">
-          <button
-            type="button"
-            onClick={() => setSidebarOpen(true)}
-            title="Чаты"
-            className="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-text-secondary hover:text-text-primary hover:bg-white/[0.05] bg-transparent border-none cursor-pointer"
-          >
-            <MenuIcon />
-          </button>
-          <div className="flex-1 min-w-0 truncate text-[12px] font-medium text-text-secondary">{activeThreadTitle}</div>
-          <button
-            type="button"
-            onClick={startNewChat}
-            title="Новый чат"
-            className="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-text-secondary hover:text-text-primary hover:bg-white/[0.05] bg-transparent border-none cursor-pointer"
-          >
-            <PlusIcon />
-          </button>
-        </div>
-
-        <div ref={logRef} onScroll={onLogScroll} className="relative z-10 flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden px-5 md:px-8 py-6 space-y-6">
-          {messages.length === 0 && !historyLoading && !showThinking ? (
-            <div className="h-full flex items-center justify-center text-center text-[#444] text-[12px] px-6">
-              {activeSpace
-                ? 'Напишите сообщение, чтобы начать диалог с агентом.'
-                : 'Выберите пространство с платным планом или включённой автооплатой.'}
-            </div>
-          ) : null}
-
-          {hiddenCount > 0 ? (
-            <div className="text-center text-[11px] text-text-muted py-1">
-              Прокрутите вверх, чтобы загрузить ещё · {hiddenCount}
-            </div>
-          ) : null}
-
-          {historyLoading ? (
-            <div className="flex items-center gap-2 text-text-muted text-[12px]">
-              <span className="inline-block w-3 h-3 rounded-full border-2 border-text-muted border-t-transparent animate-spin" />
-              Загружаю историю…
-            </div>
-          ) : null}
-
-          {visibleMessages.map((msg, idx) => (
-            <MessageRow key={hiddenCount + idx} role={msg.role} text={msg.text} steps={msg.steps} />
-          ))}
-
-          {showThinking ? <StreamingRow status={status} steps={liveSteps} liveText={liveText} /> : null}
-        </div>
-
-        {error ? (
-          <div className="relative z-10 px-4 py-2 text-[12px] text-red-400 border-t border-white/[0.06] bg-black/50">{error}</div>
-        ) : null}
-
-        <Composer
-          hasSpace={!!activeSpace}
-          sending={sending}
-          showModelPicker={showModelPicker}
-          models={models}
-          selectedModel={selectedModel}
-          onModelChange={setSelectedModel}
-          onSend={handleSend}
-          onStop={handleStop}
-          draftKey={viewKey}
-        />
-      </section>
-    </div>
-      {/* Desktop-only outer splitter: drag to widen/narrow the whole panel. */}
-      {isDesktop ? (
-        <div
-          onMouseDown={startOuterResize}
-          title="Потяните, чтобы изменить ширину панели чата"
-          className="absolute top-0 right-0 h-full w-1.5 cursor-col-resize bg-transparent hover:bg-white/[0.10] active:bg-notion-blue/40 transition-colors"
-        />
-      ) : null}
-    </div>
-  )
-}
+                Агент зафиксиро
