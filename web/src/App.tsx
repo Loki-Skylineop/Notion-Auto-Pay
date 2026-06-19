@@ -382,7 +382,13 @@ function AddAccountModal({ onClose, onDiscovered }: { onClose: () => void; onDis
 
 function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const [showAddModal, setShowAddModal] = useState(false)
-  const [tab, setTab] = useState<'pay' | 'chat'>('pay')
+  const [tab, setTab] = useState<'pay' | 'chat'>(() => {
+    try {
+      return localStorage.getItem('nmp_active_tab') === 'chat' ? 'chat' : 'pay'
+    } catch {
+      return 'pay'
+    }
+  })
   const [headerCollapsed, setHeaderCollapsed] = useState(false)
   const [discovered, setDiscovered] = useState<DiscoveredAccount[]>(() => {
     try {
@@ -397,6 +403,13 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
       localStorage.setItem('nmp_discovered_workspaces', JSON.stringify(discovered))
     } catch { /* ignore */ }
   }, [discovered])
+
+  // Remember which tab the user was on so a reload reopens the same one.
+  useEffect(() => {
+    try {
+      localStorage.setItem('nmp_active_tab', tab)
+    } catch { /* ignore */ }
+  }, [tab])
 
   const [hydrating, setHydrating] = useState(true)
   useEffect(() => {
@@ -443,7 +456,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         onToggleCollapse={() => setHeaderCollapsed(v => !v)}
       />
 
-      <main className="max-w-4xl mx-auto px-5 sm:px-8 py-7">
+      <main className={`px-5 sm:px-8 py-7 ${tab === 'chat' ? 'w-full' : 'max-w-4xl mx-auto'}`}>
         {tab === 'pay' ? (
           discovered.length === 0 ? (
             hydrating ? (

@@ -58,6 +58,59 @@ function loadSidebarWidth(): number {
   return SIDEBAR_DEFAULT
 }
 
+// Desktop-only: the whole chat panel (both columns together) can be widened by
+// dragging its right edge. Remembered across sessions, clamped, and centered.
+const OUTER_WIDTH_KEY = 'nmp_chat_outer_w'
+const OUTER_MIN = 640
+const OUTER_MAX = 2400
+const OUTER_DEFAULT = 896
+
+function loadOuterWidth(): number {
+  try {
+    const n = parseInt(localStorage.getItem(OUTER_WIDTH_KEY) || '', 10)
+    if (Number.isFinite(n)) return Math.min(OUTER_MAX, Math.max(OUTER_MIN, n))
+  } catch {
+    // ignore privacy-mode / parse failures
+  }
+  return OUTER_DEFAULT
+}
+
+// Remember which space + thread the user was last viewing so a reload drops
+// them right back where they were.
+const ACTIVE_SPACE_KEY = 'nmp_chat_active_space'
+const ACTIVE_THREAD_KEY = 'nmp_chat_active_thread'
+
+// Per-view composer drafts: whatever the user typed but didn't send is kept
+// locally per chat (keyed by thread id, or the "new chat" sentinel) so it
+// survives switching chats and reloads. Clearing the box clears the draft.
+const CHAT_DRAFTS_KEY = 'nmp_chat_drafts'
+
+function loadDrafts(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(CHAT_DRAFTS_KEY)
+    return raw ? (JSON.parse(raw) as Record<string, string>) : {}
+  } catch {
+    return {}
+  }
+}
+
+function getDraft(key: string): string {
+  if (!key) return ''
+  return loadDrafts()[key] || ''
+}
+
+function saveDraft(key: string, text: string): void {
+  if (!key) return
+  try {
+    const all = loadDrafts()
+    if (text) all[key] = text
+    else delete all[key]
+    localStorage.setItem(CHAT_DRAFTS_KEY, JSON.stringify(all))
+  } catch {
+    // ignore quota / privacy-mode failures
+  }
+}
+
 interface SpaceOption {
   key: string
   account: DiscoveredAccount
@@ -663,6 +716,7 @@ const Composer = memo(function Composer({
   onModelChange,
   onSend,
   onStop,
+  draftKey,
 }: {
   hasSpace: boolean
   sending: boolean
@@ -672,8 +726,9 @@ const Composer = memo(function Composer({
   onModelChange: (id: string) => void
   onSend: (text: string) => void
   onStop: () => void
+  draftKey: string
 }) {
-  const [text, setText] = useState('')
+  const [text, setText] = useState(() => getDraft(draftKey))
   const taRef = useRef<HTMLTextAreaElement>(null)
 
   const resize = useCallback(() => {
@@ -687,16 +742,23 @@ const Composer = memo(function Composer({
     resize()
   }, [text, resize])
 
+  // Swap the composer to the active chat's saved draft whenever the chat
+  // changes (switching threads, opening a new chat, or reloading the page).
+  useEffect(() => {
+    setText(getDraft(draftKey))
+  }, [draftKey])
+
   const submit = useCallback(() => {
     const t = text.trim()
     if (!t || !hasSpace || sending) return
     onSend(t)
     setText('')
+    saveDraft(draftKey, '')
     requestAnimationFrame(() => {
       const el = taRef.current
       if (el) el.style.height = 'auto'
     })
-  }, [text, hasSpace, sending, onSend])
+  }, [text, hasSpace, sending, onSend, draftKey])
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -714,7 +776,11 @@ const Composer = memo(function Composer({
         <textarea
           ref={taRef}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            const v = e.target.value
+            setText(v)
+            saveDraft(draftKey, v)
+          }}
           onKeyDown={onKeyDown}
           rows={1}
           placeholder={hasSpace ? 'Напишите сообщение…' : 'Сначала выберите пространство'}
@@ -765,7 +831,13 @@ const Composer = memo(function Composer({
 
 export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const [autoCfg, setAutoCfg] = useState<ServerAutoPayConfig | null>(null)
-  const [spaceKey, setSpaceKey] = useState('')
+  const [spaceKey, setSpaceKey] = useState(() => {
+    try {
+      return localStorage.getItem(ACTIVE_SPACE_KEY) || ''
+    } catch {
+      return ''
+    }
+  })
   const [agents, setAgents] = useState<ChatAgent[]>([])
   const [agentId, setAgentId] = useState('default')
   const [models, setModels] = useState<ChatModel[]>([])
@@ -787,6 +859,11 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     () => typeof window !== 'undefined' && window.matchMedia('(min-width: 768px)').matches,
   )
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth)
+  const [outerWidth, setOuterWidth] = useState(loadOuterWidth)
+  // True when the server reports an in-flight turn for the open thread that
+  // this client didn't start (e.g. after a reload, or a turn running on another
+  // device) -- drives the "agent is working" indicator on reopen.
+  const [remoteBusy, setRemoteBusy] = useState(false)
   const logRef = useRef<HTMLDivElement>(null)
   const instantScrollRef = useRef(false)
   const viewKeyRef = useRef(NEW_KEY)
@@ -799,6 +876,8 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   // switches threads; pollVersionRef holds the last applied thread version.
   const pollTokenRef = useRef(0)
   const pollVersionRef = useRef(-1)
+  // Guards the one-time "restore last open thread on reload" effect.
+  const restoredThreadRef = useRef(false)
 
   useEffect(() => {
     viewKeyRef.current = activeThreadId || NEW_KEY
@@ -836,6 +915,34 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       // ignore quota / privacy-mode failures
     }
   }, [sidebarWidth])
+
+  // Persist the chosen panel width across sessions.
+  useEffect(() => {
+    try {
+      localStorage.setItem(OUTER_WIDTH_KEY, String(outerWidth))
+    } catch {
+      // ignore quota / privacy-mode failures
+    }
+  }, [outerWidth])
+
+  // Remember the active space so a reload restores the same selection.
+  useEffect(() => {
+    try {
+      if (spaceKey) localStorage.setItem(ACTIVE_SPACE_KEY, spaceKey)
+    } catch {
+      // ignore
+    }
+  }, [spaceKey])
+
+  // Remember the active thread (cleared when on a new chat) for reload restore.
+  useEffect(() => {
+    try {
+      if (activeThreadId) localStorage.setItem(ACTIVE_THREAD_KEY, activeThreadId)
+      else localStorage.removeItem(ACTIVE_THREAD_KEY)
+    } catch {
+      // ignore
+    }
+  }, [activeThreadId])
 
   const spaceOptions = useMemo<SpaceOption[]>(() => {
     const out: SpaceOption[] = []
@@ -1000,6 +1107,32 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     [sidebarWidth],
   )
 
+  // Desktop: drag the right edge to widen/narrow the whole chat panel. It is
+  // centered, so we grow it at twice the cursor delta to keep the dragged edge
+  // under the pointer.
+  const startOuterResize = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault()
+      const startX = e.clientX
+      const startW = outerWidth
+      const onMove = (ev: MouseEvent) => {
+        const next = Math.min(OUTER_MAX, Math.max(OUTER_MIN, startW + (ev.clientX - startX) * 2))
+        setOuterWidth(next)
+      }
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove)
+        document.removeEventListener('mouseup', onUp)
+        document.body.style.userSelect = ''
+        document.body.style.cursor = ''
+      }
+      document.addEventListener('mousemove', onMove)
+      document.addEventListener('mouseup', onUp)
+      document.body.style.userSelect = 'none'
+      document.body.style.cursor = 'col-resize'
+    },
+    [outerWidth],
+  )
+
   // startPolling is the faithful port of the Notion web client's continuous
   // syncRecordValuesSpaceInitial polling. While a turn is in-flight -- whether
   // started here or on another device, and even if the stream connection has
@@ -1036,6 +1169,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           setMessages(res.messages.map((m) => ({ role: m.role, text: m.text, steps: m.steps })))
         }
         if (res.version >= 0) pollVersionRef.current = res.version
+        if (viewKeyRef.current === threadId) setRemoteBusy(!!res.running)
         if (!res.running) return
         await sleep(1500)
       }
@@ -1045,6 +1179,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
 
   const startNewChat = useCallback(() => {
     stopPolling()
+    setRemoteBusy(false)
     instantScrollRef.current = true
     setActiveThreadId('')
     setMessages([])
@@ -1057,6 +1192,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     async (t: ChatThread) => {
       if (!activeSpace) return
       stopPolling()
+      setRemoteBusy(false)
       instantScrollRef.current = true
       setActiveThreadId(t.id)
       setSidebarOpen(false)
@@ -1091,6 +1227,24 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     },
     [activeSpace, agents, startPolling, stopPolling],
   )
+
+  // On first load, reopen the chat the user was last viewing -- restoring its
+  // history and, through polling, whether the agent is still working there.
+  useEffect(() => {
+    if (restoredThreadRef.current) return
+    if (!activeSpace || agents.length === 0 || threads.length === 0) return
+    restoredThreadRef.current = true
+    if (viewKeyRef.current !== NEW_KEY) return
+    let saved = ''
+    try {
+      saved = localStorage.getItem(ACTIVE_THREAD_KEY) || ''
+    } catch {
+      saved = ''
+    }
+    if (!saved) return
+    const t = threads.find((x) => x.id === saved)
+    if (t) void openThread(t)
+  }, [activeSpace, agents, threads, openThread])
 
   const deleteThread = useCallback(
     async (t: ChatThread, e: React.MouseEvent) => {
@@ -1136,6 +1290,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const handleStop = useCallback(() => {
     if (!sending) return
     stopPolling()
+    setRemoteBusy(false)
     stopRef.current = true
     const partial = liveText.trim()
     const carriedSteps = liveSteps
@@ -1306,11 +1461,12 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   }
 
   const viewKey = activeThreadId || NEW_KEY
-  const showThinking = sending && streamKey === viewKey
+  const showThinking = (sending && streamKey === viewKey) || (remoteBusy && !sending)
   const showModelPicker = agentId === 'default' && models.filter((m) => !m.disabled).length > 0
   const activeThreadTitle = threads.find((t) => t.id === activeThreadId)?.title || 'Новый чат'
 
   return (
+    <div className="relative mx-auto" style={isDesktop ? { width: outerWidth, maxWidth: '100%' } : undefined}>
     <div className="relative flex min-h-0 overflow-hidden rounded-xl border border-white/[0.08]" style={shellStyle}>
       {/* Mobile drawer backdrop */}
       {sidebarOpen ? (
@@ -1359,132 +1515,4 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
               value={agentId}
               onChange={setAgentId}
               disabled={!!activeThreadId}
-              ariaLabel="Агент"
-              buttonClassName="rounded-md px-2.5 py-1.5 text-[12px]"
-              menuClassName="w-full"
-              options={agents.map((a) => ({ value: a.id, label: `${a.name}${a.kind === 'custom' ? ' · кастом' : ''}` }))}
-            />
-            {activeThreadId ? (
-              <div className="mt-1 px-0.5 text-[9px] text-text-muted leading-snug">
-                Агент зафиксирован для этого чата. Создайте новый чат, чтобы выбрать другого.
-              </div>
-            ) : null}
-          </div>
-        </div>
-
-        <button
-          type="button"
-          onClick={startNewChat}
-          className="w-full flex items-center justify-center gap-1.5 py-2 mb-4 rounded-lg border border-white/[0.07] text-[11px] text-[#888] hover:bg-white/[0.04] hover:text-text-secondary hover:border-white/[0.12] transition-colors bg-transparent cursor-pointer"
-        >
-          <PlusIcon /> Новый чат
-        </button>
-
-        <div className="text-[9px] text-text-muted uppercase tracking-widest mb-2 px-0.5">История</div>
-        <div className="flex-1 min-h-0 overflow-y-auto space-y-px pr-1">
-          {threads.length === 0 ? (
-            <div className="text-[11px] text-text-muted py-2 px-0.5">Пока нет чатов</div>
-          ) : (
-            threads.map((t) => (
-              <div
-                key={t.id}
-                onClick={() => openThread(t)}
-                className={`group flex items-center justify-between px-2.5 py-2 rounded-md cursor-pointer transition-colors ${
-                  t.id === activeThreadId ? 'bg-white/[0.07] text-[#e8e8e8]' : 'text-[#666] hover:bg-white/[0.03] hover:text-[#999]'
-                }`}
-              >
-                <span className="text-[11px] truncate" title={t.title || 'Без названия'}>
-                  {t.title || 'Без названия'}
-                </span>
-                <button
-                  type="button"
-                  onClick={(e) => deleteThread(t, e)}
-                  title="Удалить чат"
-                  className="opacity-0 group-hover:opacity-100 focus:opacity-100 p-0.5 ml-1 text-[#444] hover:text-red-400 transition-all shrink-0 bg-transparent border-none cursor-pointer"
-                >
-                  <TrashIcon />
-                </button>
-              </div>
-            ))
-          )}
-        </div>
-      </aside>
-
-      {/* Desktop-only splitter: drag to resize the sidebar / chat columns. */}
-      <div
-        onMouseDown={startSidebarResize}
-        title="Потяните, чтобы изменить ширину"
-        className="hidden md:block shrink-0 w-1 cursor-col-resize bg-white/[0.04] hover:bg-white/[0.14] active:bg-notion-blue/50 transition-colors"
-      />
-
-      <section className="relative flex-1 min-w-0 flex flex-col min-h-0 overflow-hidden bg-black">
-        <ParticleField active={showThinking} />
-
-        {/* Top bar — mobile only: menu + current thread + new chat */}
-        <div className="relative z-10 flex items-center gap-2 px-3 py-2 border-b border-white/[0.06] md:hidden">
-          <button
-            type="button"
-            onClick={() => setSidebarOpen(true)}
-            title="Чаты"
-            className="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-text-secondary hover:text-text-primary hover:bg-white/[0.05] bg-transparent border-none cursor-pointer"
-          >
-            <MenuIcon />
-          </button>
-          <div className="flex-1 min-w-0 truncate text-[12px] font-medium text-text-secondary">{activeThreadTitle}</div>
-          <button
-            type="button"
-            onClick={startNewChat}
-            title="Новый чат"
-            className="shrink-0 w-9 h-9 flex items-center justify-center rounded-lg text-text-secondary hover:text-text-primary hover:bg-white/[0.05] bg-transparent border-none cursor-pointer"
-          >
-            <PlusIcon />
-          </button>
-        </div>
-
-        <div ref={logRef} onScroll={onLogScroll} className="relative z-10 flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden px-5 md:px-8 py-6 space-y-6">
-          {messages.length === 0 && !historyLoading && !showThinking ? (
-            <div className="h-full flex items-center justify-center text-center text-[#444] text-[12px] px-6">
-              {activeSpace
-                ? 'Напишите сообщение, чтобы начать диалог с агентом.'
-                : 'Выберите пространство с платным планом или включённой автооплатой.'}
-            </div>
-          ) : null}
-
-          {hiddenCount > 0 ? (
-            <div className="text-center text-[11px] text-text-muted py-1">
-              Прокрутите вверх, чтобы загрузить ещё · {hiddenCount}
-            </div>
-          ) : null}
-
-          {historyLoading ? (
-            <div className="flex items-center gap-2 text-text-muted text-[12px]">
-              <span className="inline-block w-3 h-3 rounded-full border-2 border-text-muted border-t-transparent animate-spin" />
-              Загружаю историю…
-            </div>
-          ) : null}
-
-          {visibleMessages.map((msg, idx) => (
-            <MessageRow key={hiddenCount + idx} role={msg.role} text={msg.text} steps={msg.steps} />
-          ))}
-
-          {showThinking ? <StreamingRow status={status} steps={liveSteps} liveText={liveText} /> : null}
-        </div>
-
-        {error ? (
-          <div className="relative z-10 px-4 py-2 text-[12px] text-red-400 border-t border-white/[0.06] bg-black/50">{error}</div>
-        ) : null}
-
-        <Composer
-          hasSpace={!!activeSpace}
-          sending={sending}
-          showModelPicker={showModelPicker}
-          models={models}
-          selectedModel={selectedModel}
-          onModelChange={setSelectedModel}
-          onSend={handleSend}
-          onStop={handleStop}
-        />
-      </section>
-    </div>
-  )
-}
+              ariaLabel="Аген
