@@ -41,6 +41,23 @@ function loadThreadAgents(): Record<string, string> {
   }
 }
 
+// Desktop-only: the chat sidebar width is user-resizable via the splitter and
+// remembered across sessions. Clamped so neither column can collapse.
+const SIDEBAR_WIDTH_KEY = 'nmp_chat_sidebar_w'
+const SIDEBAR_MIN = 180
+const SIDEBAR_MAX = 560
+const SIDEBAR_DEFAULT = 224
+
+function loadSidebarWidth(): number {
+  try {
+    const n = parseInt(localStorage.getItem(SIDEBAR_WIDTH_KEY) || '', 10)
+    if (Number.isFinite(n)) return Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, n))
+  } catch {
+    // ignore privacy-mode / parse failures
+  }
+  return SIDEBAR_DEFAULT
+}
+
 interface SpaceOption {
   key: string
   account: DiscoveredAccount
@@ -765,6 +782,11 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const [error, setError] = useState('')
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  // Desktop splitter: track viewport class + the resizable sidebar width.
+  const [isDesktop, setIsDesktop] = useState(
+    () => typeof window !== 'undefined' && window.matchMedia('(min-width: 768px)').matches,
+  )
+  const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth)
   const logRef = useRef<HTMLDivElement>(null)
   const instantScrollRef = useRef(false)
   const viewKeyRef = useRef(NEW_KEY)
@@ -795,6 +817,25 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   useEffect(() => {
     fetchAutoPayConfig().then(setAutoCfg).catch(() => {})
   }, [])
+
+  // Keep isDesktop in sync so the sidebar width is only applied on PC (on
+  // mobile the sidebar is a full-height drawer with a fixed width).
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 768px)')
+    const onChange = () => setIsDesktop(mq.matches)
+    onChange()
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+
+  // Persist the chosen sidebar width across sessions.
+  useEffect(() => {
+    try {
+      localStorage.setItem(SIDEBAR_WIDTH_KEY, String(sidebarWidth))
+    } catch {
+      // ignore quota / privacy-mode failures
+    }
+  }, [sidebarWidth])
 
   const spaceOptions = useMemo<SpaceOption[]>(() => {
     const out: SpaceOption[] = []
@@ -933,6 +974,32 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     pollTokenRef.current += 1
   }, [])
 
+  // Desktop splitter drag: widen/narrow the chat sidebar by dragging the
+  // divider between it and the conversation. Listeners live on document so the
+  // drag keeps tracking even if the cursor outruns the 4px handle.
+  const startSidebarResize = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault()
+      const startX = e.clientX
+      const startW = sidebarWidth
+      const onMove = (ev: MouseEvent) => {
+        const next = Math.min(SIDEBAR_MAX, Math.max(SIDEBAR_MIN, startW + (ev.clientX - startX)))
+        setSidebarWidth(next)
+      }
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove)
+        document.removeEventListener('mouseup', onUp)
+        document.body.style.userSelect = ''
+        document.body.style.cursor = ''
+      }
+      document.addEventListener('mousemove', onMove)
+      document.addEventListener('mouseup', onUp)
+      document.body.style.userSelect = 'none'
+      document.body.style.cursor = 'col-resize'
+    },
+    [sidebarWidth],
+  )
+
   // startPolling is the faithful port of the Notion web client's continuous
   // syncRecordValuesSpaceInitial polling. While a turn is in-flight -- whether
   // started here or on another device, and even if the stream connection has
@@ -993,8 +1060,11 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       instantScrollRef.current = true
       setActiveThreadId(t.id)
       setSidebarOpen(false)
+      // Old chats lock to the agent they were created with: restore the
+      // remembered one (falling back to the default agent if unknown) instead
+      // of carrying over whatever was selected for a new chat.
       const remembered = threadAgentsRef.current[t.id]
-      if (remembered && agents.some((a) => a.id === remembered)) setAgentId(remembered)
+      setAgentId(remembered && agents.some((a) => a.id === remembered) ? remembered : 'default')
       setError('')
       setMessages([])
       setVisibleCount(PAGE_SIZE)
@@ -1252,7 +1322,8 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       ) : null}
 
       <aside
-        className={`fixed inset-y-0 left-0 z-40 w-[280px] max-w-[82vw] flex flex-col p-3 bg-[#030303] border-r border-white/[0.08] overflow-hidden transform transition-transform duration-200 md:static md:z-auto md:w-56 md:max-w-none md:translate-x-0 ${
+        style={isDesktop ? { width: sidebarWidth } : undefined}
+        className={`fixed inset-y-0 left-0 z-40 w-[280px] max-w-[82vw] flex flex-col p-3 bg-[#030303] border-r border-white/[0.08] overflow-hidden transform transition-transform duration-200 md:static md:z-auto md:max-w-none md:translate-x-0 ${
           sidebarOpen ? 'translate-x-0' : '-translate-x-full'
         }`}
       >
@@ -1287,11 +1358,17 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
             <Dropdown
               value={agentId}
               onChange={setAgentId}
+              disabled={!!activeThreadId}
               ariaLabel="Агент"
               buttonClassName="rounded-md px-2.5 py-1.5 text-[12px]"
               menuClassName="w-full"
               options={agents.map((a) => ({ value: a.id, label: `${a.name}${a.kind === 'custom' ? ' · кастом' : ''}` }))}
             />
+            {activeThreadId ? (
+              <div className="mt-1 px-0.5 text-[9px] text-text-muted leading-snug">
+                Агент зафиксирован для этого чата. Создайте новый чат, чтобы выбрать другого.
+              </div>
+            ) : null}
           </div>
         </div>
 
@@ -1332,6 +1409,13 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           )}
         </div>
       </aside>
+
+      {/* Desktop-only splitter: drag to resize the sidebar / chat columns. */}
+      <div
+        onMouseDown={startSidebarResize}
+        title="Потяните, чтобы изменить ширину"
+        className="hidden md:block shrink-0 w-1 cursor-col-resize bg-white/[0.04] hover:bg-white/[0.14] active:bg-notion-blue/50 transition-colors"
+      />
 
       <section className="relative flex-1 min-w-0 flex flex-col min-h-0 overflow-hidden bg-black">
         <ParticleField active={showThinking} />
