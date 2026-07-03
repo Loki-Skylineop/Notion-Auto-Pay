@@ -42,6 +42,11 @@ type AutoPayConfig struct {
 	Card            *AutoPaySavedCard `json:"card,omitempty"`
 	// Spaces maps a workspace space_id -> whether auto-pay is armed for it.
 	Spaces map[string]bool `json:"spaces"`
+	// SpacePlans maps a workspace space_id -> the plan auto-pay should buy for
+	// THAT space. When a space has no entry (or an empty value) auto-pay falls
+	// back to the global Plan. This lets every workspace be paid on its own
+	// tariff instead of forcing a single plan for all of them.
+	SpacePlans map[string]string `json:"space_plans"`
 	// Paid records the last time a space was paid (space_id -> unix-ms). It is
 	// kept only for display/log purposes — it does NOT gate re-payment, because
 	// the user wants auto-pay to keep paying a space as long as Notion still
@@ -64,8 +69,20 @@ func defaultAutoPayConfig() *AutoPayConfig {
 		Country:         "DE",
 		IntervalSeconds: 60,
 		Spaces:          map[string]bool{},
+		SpacePlans:      map[string]string{},
 		Paid:            map[string]int64{},
 	}
+}
+
+// planForSpace resolves the plan auto-pay should buy for a given space: the
+// per-space override when set, otherwise the global default plan.
+func (c *AutoPayConfig) planForSpace(spaceID string) string {
+	if c.SpacePlans != nil {
+		if p := strings.TrimSpace(c.SpacePlans[spaceID]); p != "" {
+			return p
+		}
+	}
+	return c.Plan
 }
 
 // AutoPayManager owns the persisted config and the background scheduler.
@@ -102,6 +119,9 @@ func NewAutoPayManager(pool *AccountPool, accountsDir, stripeKey string) *AutoPa
 			cfg.Card = loaded.Card
 			if loaded.Spaces != nil {
 				cfg.Spaces = loaded.Spaces
+			}
+			if loaded.SpacePlans != nil {
+				cfg.SpacePlans = loaded.SpacePlans
 			}
 			if loaded.Paid != nil {
 				cfg.Paid = loaded.Paid
@@ -150,6 +170,10 @@ func (m *AutoPayManager) snapshot() AutoPayConfig {
 	c.Spaces = map[string]bool{}
 	for k, v := range m.cfg.Spaces {
 		c.Spaces[k] = v
+	}
+	c.SpacePlans = map[string]string{}
+	for k, v := range m.cfg.SpacePlans {
+		c.SpacePlans[k] = v
 	}
 	c.Paid = map[string]int64{}
 	for k, v := range m.cfg.Paid {
@@ -214,6 +238,10 @@ func (m *AutoPayManager) PublicJSON() map[string]interface{} {
 	for k, v := range m.cfg.Spaces {
 		spaces[k] = v
 	}
+	spacePlans := map[string]string{}
+	for k, v := range m.cfg.SpacePlans {
+		spacePlans[k] = v
+	}
 	logCopy := make([]string, len(m.log))
 	copy(logCopy, m.log)
 	lastRun := ""
@@ -229,6 +257,7 @@ func (m *AutoPayManager) PublicJSON() map[string]interface{} {
 		"card_brand":       map[bool]string{true: "card", false: ""}[hasCard],
 		"card_last4":       last4,
 		"spaces":           spaces,
+		"space_plans":      spacePlans,
 		"last_run":         lastRun,
 		"log":              logCopy,
 	}
@@ -236,14 +265,16 @@ func (m *AutoPayManager) PublicJSON() map[string]interface{} {
 
 // AutoPayPatch is the editable subset accepted by PUT /admin/autopay.
 type AutoPayPatch struct {
-	Enabled         *bool           `json:"enabled"`
-	Plan            *string         `json:"plan"`
-	Country         *string         `json:"country"`
-	IntervalSeconds *int            `json:"interval_seconds"`
-	Spaces          map[string]bool `json:"spaces"`
+	Enabled         *bool             `json:"enabled"`
+	Plan            *string           `json:"plan"`
+	Country         *string           `json:"country"`
+	IntervalSeconds *int              `json:"interval_seconds"`
+	Spaces          map[string]bool   `json:"spaces"`
+	SpacePlans      map[string]string `json:"space_plans"`
 	Space           *struct {
-		ID string `json:"id"`
-		On bool   `json:"on"`
+		ID   string `json:"id"`
+		On   bool   `json:"on"`
+		Plan string `json:"plan"`
 	} `json:"space"`
 	Card      *AutoPaySavedCard `json:"card"`
 	ClearCard bool              `json:"clear_card"`
@@ -278,29 +309,31 @@ func (m *AutoPayManager) applyPatch(p AutoPayPatch) {
 	if m.cfg.Spaces == nil {
 		m.cfg.Spaces = map[string]bool{}
 	}
+	if m.cfg.SpacePlans == nil {
+		m.cfg.SpacePlans = map[string]string{}
+	}
 	if p.Spaces != nil {
 		m.cfg.Spaces = p.Spaces
 	}
+	if p.SpacePlans != nil {
+		// Replace wholesale, but drop empty values so a cleared per-space plan
+		// falls back to the global default instead of persisting a blank.
+		next := map[string]string{}
+		for k, v := range p.SpacePlans {
+			if strings.TrimSpace(v) != "" {
+				next[k] = strings.TrimSpace(v)
+			}
+		}
+		m.cfg.SpacePlans = next
+	}
 	if p.Space != nil && p.Space.ID != "" {
 		m.cfg.Spaces[p.Space.ID] = p.Space.On
-		log.Printf("[autopay] config: space %s armed=%v", truncate(p.Space.ID, 8), p.Space.On)
-	}
-	if p.ClearCard {
-		m.cfg.Card = nil
-		log.Printf("[autopay] config: card cleared")
-	} else if p.Card != nil && strings.TrimSpace(p.Card.Number) != "" {
-		m.cfg.Card = &AutoPaySavedCard{
-			Number:   strings.TrimSpace(p.Card.Number),
-			ExpMonth: strings.TrimSpace(p.Card.ExpMonth),
-			ExpYear:  strings.TrimSpace(p.Card.ExpYear),
-			CVC:      strings.TrimSpace(p.Card.CVC),
+		if strings.TrimSpace(p.Space.Plan) != "" {
+			m.cfg.SpacePlans[p.Space.ID] = strings.TrimSpace(p.Space.Plan)
+			log.Printf("[autopay] config: space %s armed=%v plan=%s", truncate(p.Space.ID, 8), p.Space.On, m.cfg.SpacePlans[p.Space.ID])
+		} else {
+			log.Printf("[autopay] config: space %s armed=%v", truncate(p.Space.ID, 8), p.Space.On)
 		}
-		digits := digitsOnly(m.cfg.Card.Number)
-		last4 := digits
-		if len(digits) >= 4 {
-			last4 = digits[len(digits)-4:]
-		}
-		log.Printf("[autopay] config: card saved ···· %s", last4)
 	}
 	m.saveLocked()
 }
@@ -387,7 +420,7 @@ func (m *AutoPayManager) runOnce() {
 			armed++
 		}
 	}
-	log.Printf("[autopay] === скан старт === план=%s страна=%s интервал=%ds отмечено «Авто»=%d", cfg.Plan, cfg.Country, cfg.IntervalSeconds, armed)
+	log.Printf("[autopay] === скан старт === глобальный план=%s страна=%s интервал=%ds отмечено «Авто»=%d", cfg.Plan, cfg.Country, cfg.IntervalSeconds, armed)
 
 	if armed == 0 {
 		log.Printf("[autopay] ⚠ ни одно пространство не отмечено «Авто» — оплачивать нечего. Отметьте нужные пространства галочкой «Авто».")
@@ -478,7 +511,8 @@ func (m *AutoPayManager) runOnce() {
 				log.Printf("[autopay]   ↺ %s (%s): платили ранее (%s), но всё ещё free — плачу снова", name, shortID, time.UnixMilli(ts).Format("15:04:05"))
 			}
 
-			log.Printf("[autopay]   → плачу %s (%s): план %s, создаю токен карты...", name, shortID, cfg.Plan)
+			plan := cfg.planForSpace(sp.SpaceID)
+			log.Printf("[autopay]   → плачу %s (%s): план %s, создаю токен карты...", name, shortID, plan)
 			pmID, err := createStripePaymentMethod(m.stripeKey, cfg.Country, *cfg.Card)
 			if err != nil {
 				log.Printf("[autopay]   ✗ %s (%s): Stripe отклонил карту: %v", name, shortID, err)
@@ -486,14 +520,14 @@ func (m *AutoPayManager) runOnce() {
 				continue
 			}
 			log.Printf("[autopay]   • %s (%s): карта токенизирована (%s), отправляю в Notion...", name, shortID, pmID)
-			err = callNotionUpdateSubscription(token, ws.UserID, sp.SpaceID, pmID, cfg.Plan, ws.UserEmail, ws.UserName, cfg.Country, DefaultClientVersion)
+			err = callNotionUpdateSubscription(token, ws.UserID, sp.SpaceID, pmID, plan, ws.UserEmail, ws.UserName, cfg.Country, DefaultClientVersion)
 			if err != nil {
 				log.Printf("[autopay]   ✗ %s (%s): Notion отклонил оплату: %v", name, shortID, err)
 				msgs = append(msgs, "✗ "+name+": "+err.Error())
 				continue
 			}
-			log.Printf("[autopay]   ✓ %s (%s): ОПЛАЧЕНО — план %s", name, shortID, cfg.Plan)
-			msgs = append(msgs, "✓ "+name+": "+cfg.Plan)
+			log.Printf("[autopay]   ✓ %s (%s): ОПЛАЧЕНО — план %s", name, shortID, plan)
+			msgs = append(msgs, "✓ "+name+": "+plan)
 			m.markPaid(sp.SpaceID)
 			totPaid++
 		}
@@ -557,7 +591,9 @@ func (m *AutoPayManager) PaySpace(token, spaceID, plan, country string) (string,
 		return "", "", fmt.Errorf("token_v2 и space_id обязательны")
 	}
 	if strings.TrimSpace(plan) == "" {
-		plan = cfg.Plan
+		// No explicit plan from the caller: use the per-space plan (falling
+		// back to the global default) so the manual button matches auto-pay.
+		plan = cfg.planForSpace(spaceID)
 	}
 	if strings.TrimSpace(country) == "" {
 		country = cfg.Country

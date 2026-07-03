@@ -244,6 +244,36 @@ type chatThread struct {
 	CreatedAt int64  `json:"created_at"`
 	UpdatedAt int64  `json:"updated_at"`
 	Type      string `json:"type"`
+	// AgentID is the workflowId of the custom agent this thread belongs to
+	// (from the thread record's parent pointer), or "default" for the built-in
+	// assistant. The dashboard uses it to preselect the right agent when a
+	// thread is opened — the server is the source of truth, so the agent is
+	// detected correctly even in a fresh browser without localStorage history.
+	AgentID string `json:"agent_id,omitempty"`
+}
+
+// threadRecordShape is the subset of a thread record we read from record maps:
+// the ordered messages[] plus the parent pointer that identifies which custom
+// agent (workflow) the thread belongs to.
+type threadRecordShape struct {
+	Value struct {
+		Value struct {
+			ID          string   `json:"id"`
+			Messages    []string `json:"messages"`
+			ParentTable string   `json:"parent_table"`
+			ParentID    string   `json:"parent_id"`
+		} `json:"value"`
+	} `json:"value"`
+}
+
+// agentIDFromThreadParent maps a thread record's parent pointer to an agent id:
+// threads created under a custom agent are parented by its workflow record;
+// everything else belongs to the built-in assistant.
+func agentIDFromThreadParent(parentTable, parentID string) string {
+	if strings.EqualFold(strings.TrimSpace(parentTable), "workflow") && strings.TrimSpace(parentID) != "" {
+		return strings.TrimSpace(parentID)
+	}
+	return "default"
 }
 
 // HandleChatThreads lists the account's recent chat threads in a space.
@@ -285,6 +315,31 @@ func HandleChatThreads(auth *DashboardAuth) http.HandlerFunc {
 			Transcripts []chatThread `json:"transcripts"`
 		}
 		json.Unmarshal(data, &parsed)
+		// Best-effort agent detection: the same response's record map carries
+		// the thread records, whose parent pointer names the custom agent
+		// (workflow) a thread was created under. Annotate each transcript so
+		// the dashboard preselects the right agent without relying on
+		// browser-local state.
+		var rm struct {
+			RecordMap struct {
+				Thread map[string]threadRecordShape `json:"thread"`
+			} `json:"recordMap"`
+		}
+		if json.Unmarshal(data, &rm) == nil && len(rm.RecordMap.Thread) > 0 {
+			agentByThread := make(map[string]string, len(rm.RecordMap.Thread))
+			for key, rec := range rm.RecordMap.Thread {
+				id := rec.Value.Value.ID
+				if id == "" {
+					id = key
+				}
+				agentByThread[id] = agentIDFromThreadParent(rec.Value.Value.ParentTable, rec.Value.Value.ParentID)
+			}
+			for i := range parsed.Transcripts {
+				if a, ok := agentByThread[parsed.Transcripts[i].ID]; ok {
+					parsed.Transcripts[i].AgentID = a
+				}
+			}
+		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"threads": parsed.Transcripts})
 	}
 }
@@ -399,7 +454,10 @@ func syncRecordValues(tokenV2, userID, spaceID string, pointers []map[string]str
 	return data, nil
 }
 
-// HandleChatHistory rebuilds the full message history of a single thread.
+// HandleChatHistory rebuilds the full message history of a single thread. The
+// response also carries agent_id — the custom agent (workflow) the thread
+// belongs to per its parent pointer, or "default" — so the dashboard can show
+// the correct agent instead of guessing from browser-local state.
 func HandleChatHistory(auth *DashboardAuth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -434,22 +492,18 @@ func HandleChatHistory(auth *DashboardAuth) http.HandlerFunc {
 		}
 		var tr struct {
 			RecordMap struct {
-				Thread map[string]struct {
-					Value struct {
-						Value struct {
-							Messages []string `json:"messages"`
-						} `json:"value"`
-					} `json:"value"`
-				} `json:"thread"`
+				Thread map[string]threadRecordShape `json:"thread"`
 			} `json:"recordMap"`
 		}
 		json.Unmarshal(threadData, &tr)
 		var order []string
+		agentID := ""
 		if t, ok := tr.RecordMap.Thread[body.ThreadID]; ok {
 			order = t.Value.Value.Messages
+			agentID = agentIDFromThreadParent(t.Value.Value.ParentTable, t.Value.Value.ParentID)
 		}
 		if len(order) == 0 {
-			json.NewEncoder(w).Encode(map[string]interface{}{"messages": []chatHistMsg{}})
+			json.NewEncoder(w).Encode(map[string]interface{}{"messages": []chatHistMsg{}, "agent_id": agentID})
 			return
 		}
 
@@ -469,7 +523,7 @@ func HandleChatHistory(auth *DashboardAuth) http.HandlerFunc {
 		json.Unmarshal(msgData, &wrap)
 
 		messages := buildHistory(wrap.RecordMap, order)
-		json.NewEncoder(w).Encode(map[string]interface{}{"messages": messages})
+		json.NewEncoder(w).Encode(map[string]interface{}{"messages": messages, "agent_id": agentID})
 	}
 }
 

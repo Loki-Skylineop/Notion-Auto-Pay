@@ -74,11 +74,18 @@ func TestNewMux_RegistersModelsRoutes(t *testing.T) {
 		proxy.ReplaceModelMap(original)
 	})
 
+	originalConfig := proxy.AppConfig
+	proxy.AppConfig = proxy.DefaultConfig()
+	t.Cleanup(func() {
+		proxy.AppConfig = originalConfig
+	})
+
 	pool := proxy.NewAccountPool()
 	dashAuth := proxy.NewDashboardAuth("", "sk-test")
 	usageStats := proxy.InitUsageStats("")
 	regDeps := &proxy.RegisterJobsDeps{Pool: pool, AccountsDir: "", Auth: dashAuth}
-	mux := newMux(pool, "", "sk-test", dashAuth, usageStats, regDeps)
+	autoPay := proxy.NewAutoPayManager(pool, "", "")
+	mux := newMux(pool, "", "sk-test", dashAuth, usageStats, regDeps, autoPay)
 	handler := apiKeyAuthMiddleware("sk-test", mux)
 
 	for _, path := range []string{"/v1/models", "/models"} {
@@ -104,7 +111,8 @@ func TestNewMux_RegistersOpenAIRoutes(t *testing.T) {
 	dashAuth := proxy.NewDashboardAuth("", "sk-test")
 	usageStats := proxy.InitUsageStats("")
 	regDeps := &proxy.RegisterJobsDeps{Pool: pool, AccountsDir: "", Auth: dashAuth}
-	mux := newMux(pool, "", "sk-test", dashAuth, usageStats, regDeps)
+	autoPay := proxy.NewAutoPayManager(pool, "", "")
+	mux := newMux(pool, "", "sk-test", dashAuth, usageStats, regDeps, autoPay)
 	handler := apiKeyAuthMiddleware("sk-test", mux)
 
 	tests := []struct {

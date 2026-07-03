@@ -1,10 +1,11 @@
 // Server-driven auto-pay.
 //
-// Everything (enabled, target plan, country, scan interval, per-space flags
-// and the saved card) now lives on the BACKEND in accounts/.autopay.json and
-// is paid by a background scheduler in Go. That means auto-pay keeps working
-// even when the dashboard tab / browser is closed. The browser only reads and
-// edits the config via /admin/autopay; it no longer charges anything itself.
+// Everything (enabled, target plan, country, scan interval, per-space flags,
+// per-space plans and the saved card) now lives on the BACKEND in
+// accounts/.autopay.json and is paid by a background scheduler in Go. That
+// means auto-pay keeps working even when the dashboard tab / browser is closed.
+// The browser only reads and edits the config via /admin/autopay; it no longer
+// charges anything itself.
 //
 // The scan interval is configured in SECONDS (minimum 5s).
 
@@ -17,6 +18,9 @@ export interface ServerAutoPayConfig {
   card_brand: string
   card_last4: string
   spaces: Record<string, boolean>
+  // Per-space plan overrides: space_id -> plan id. A space without an entry
+  // (or an empty value) is paid on the global `plan`.
+  space_plans: Record<string, string>
   last_run: string
   log: string[]
 }
@@ -34,7 +38,9 @@ export interface AutoPayPatch {
   country?: string
   interval_seconds?: number
   spaces?: Record<string, boolean>
-  space?: { id: string; on: boolean }
+  space_plans?: Record<string, string>
+  // `plan` sets the per-space plan override alongside its armed state.
+  space?: { id: string; on: boolean; plan?: string }
   card?: AutoPayCardInput
   clear_card?: boolean
 }
@@ -46,6 +52,15 @@ export function clampIntervalSeconds(v: unknown): number {
   const n = typeof v === 'number' ? v : parseInt(String(v ?? ''), 10)
   if (!Number.isFinite(n) || n <= 0) return 60
   return Math.min(Math.max(Math.round(n), MIN_INTERVAL_SECONDS), 86400)
+}
+
+// planForSpace resolves the plan auto-pay will buy for a space: the per-space
+// override when set, otherwise the global default.
+export function planForSpace(cfg: ServerAutoPayConfig | null, spaceId: string): string {
+  if (!cfg) return ''
+  const override = cfg.space_plans?.[spaceId]
+  if (override && override.trim()) return override
+  return cfg.plan
 }
 
 export async function fetchAutoPayConfig(): Promise<ServerAutoPayConfig> {

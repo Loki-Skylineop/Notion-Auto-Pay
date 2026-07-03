@@ -463,11 +463,21 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       instantScrollRef.current = true
       setActiveThreadId(t.id)
       setSidebarOpen(false)
-      // Old chats lock to the agent they were created with: restore the
-      // remembered one (falling back to the default agent if unknown) instead
-      // of carrying over whatever was selected for a new chat.
-      const remembered = threadAgentsRef.current[t.id]
-      setAgentId(remembered && agents.some((a) => a.id === remembered) ? remembered : 'default')
+      // Pick this thread's agent from the server's detection first (its
+      // workflow parent, carried on the thread record), then a remembered
+      // local choice, then the built-in assistant. Fixes the bug where a
+      // custom-agent chat opened showing the default agent because only
+      // browser-local state was trusted.
+      const detectedAgent = t.agent_id
+      const rememberedAgent = threadAgentsRef.current[t.id]
+      const initialAgent =
+        detectedAgent && agents.some((a) => a.id === detectedAgent)
+          ? detectedAgent
+          : rememberedAgent && agents.some((a) => a.id === rememberedAgent)
+            ? rememberedAgent
+            : 'default'
+      setAgentId(initialAgent)
+      if (detectedAgent) rememberThreadAgent(t.id, detectedAgent)
       setError('')
       // Cache-first: paint the last-seen history immediately so switching
       // chats is instant, then revalidate against the server in parallel and
@@ -488,11 +498,18 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           space_id: activeSpace.spaceId,
           thread_id: t.id,
         })
-        const mapped: ChatMessage[] = hist.map((m) => ({ role: m.role, text: m.text, steps: m.steps, survey: m.survey, pages: m.pages }))
+        const mapped: ChatMessage[] = hist.messages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, survey: m.survey, pages: m.pages }))
         if (viewKeyRef.current === t.id && (!cached || cached.hash !== hashMessages(mapped))) {
           setMessages(mapped)
         }
         writeCachedHistory(t.id, mapped)
+        // The server is the source of truth for which agent this thread
+        // belongs to. Apply its detection unless the user already changed the
+        // agent manually while history was loading.
+        if (viewKeyRef.current === t.id && hist.agent_id && agents.some((a) => a.id === hist.agent_id)) {
+          setAgentId((prev) => (prev === initialAgent ? hist.agent_id! : prev))
+          rememberThreadAgent(t.id, hist.agent_id)
+        }
         // Keep mirroring the server while the thread is open so a turn that is
         // still running (or was started elsewhere) streams in, and the final
         // state lands without a manual reopen. The loop stops itself once the
@@ -505,7 +522,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         setHistoryLoading(false)
       }
     },
-    [activeSpace, agents, startPolling, stopPolling],
+    [activeSpace, agents, startPolling, stopPolling, rememberThreadAgent],
   )
 
   // On first load, reopen the chat the user was last viewing -- restoring its
@@ -559,8 +576,9 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         thread_id: threadId,
       })
       if (viewKeyRef.current !== threadId) return
-      if (hist.length > 0 && hist[hist.length - 1].role === 'assistant') {
-        setMessages(hist.map((m) => ({ role: m.role, text: m.text, steps: m.steps, survey: m.survey, pages: m.pages })))
+      const histMessages = hist.messages
+      if (histMessages.length > 0 && histMessages[histMessages.length - 1].role === 'assistant') {
+        setMessages(histMessages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, survey: m.survey, pages: m.pages })))
       }
     } catch {
       // ignore — reconciliation is best-effort
@@ -879,8 +897,12 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
             <div className="text-[9px] text-text-muted uppercase tracking-widest mb-1 px-0.5">Агент</div>
             <Dropdown
               value={agentId}
-              onChange={setAgentId}
-              disabled={!!activeThreadId}
+              onChange={(v) => {
+                setAgentId(v)
+                // Let the user fix a wrongly detected agent on an existing chat
+                // and remember the choice for next time it is opened.
+                if (activeThreadId) rememberThreadAgent(activeThreadId, v)
+              }}
               ariaLabel="Агент"
               buttonClassName="rounded-md px-2.5 py-1.5 text-[12px]"
               menuClassName="w-full"
@@ -888,7 +910,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
             />
             {activeThreadId ? (
               <div className="mt-1 px-0.5 text-[9px] text-text-muted leading-snug">
-                Агент зафиксирован для этого чата. Создайте новый чат, чтобы выбрать другого.
+                Агент определён автоматически. Если выбран неверно — выберите нужного вручную.
               </div>
             ) : null}
           </div>

@@ -467,6 +467,10 @@ export interface ChatThread {
   created_at?: number
   updated_at?: number
   type?: string
+  // The agent this thread belongs to, detected server-side from the thread's
+  // workflow parent ("default" for the built-in assistant). Lets the UI
+  // preselect the correct agent when an existing chat is opened.
+  agent_id?: string
 }
 
 // A single visible reasoning/tool step of an assistant turn (mirrors the
@@ -584,7 +588,13 @@ export async function chatDelete(ref: { token_v2: string; user_id?: string; spac
 // chatHistory loads a single thread's full message history (user turns +
 // assistant turns with their visible steps) so the UI can show it when the
 // user clicks a chat instead of starting from a blank view.
-export async function chatHistory(ref: { token_v2: string; user_id?: string; space_id: string; thread_id: string }): Promise<ChatHistoryMessage[]> {
+export interface ChatHistoryResult {
+  messages: ChatHistoryMessage[]
+  // Agent detected server-side for this thread ("default" or a custom agent id).
+  agent_id?: string
+}
+
+export async function chatHistory(ref: { token_v2: string; user_id?: string; space_id: string; thread_id: string }): Promise<ChatHistoryResult> {
   const resp = await fetch('/admin/chat/history', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -592,7 +602,10 @@ export async function chatHistory(ref: { token_v2: string; user_id?: string; spa
     body: JSON.stringify(ref),
   })
   const data = await jsonOrError(resp)
-  return Array.isArray(data?.messages) ? data.messages : []
+  return {
+    messages: Array.isArray(data?.messages) ? data.messages : [],
+    agent_id: typeof data?.agent_id === 'string' ? data.agent_id : undefined,
+  }
 }
 
 export interface ChatSendResult {

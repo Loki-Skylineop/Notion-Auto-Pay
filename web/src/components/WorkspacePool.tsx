@@ -346,12 +346,22 @@ export function WorkspacePool({
   const toggleAutoPay = () => { if (cfg) patchCfg({ enabled: !cfg.enabled }) }
   const setInterval2 = (v: string) => patchCfg({ interval_seconds: clampIntervalSeconds(v) })
   const toggleSpace = (id: string, on: boolean) => patchCfg({ space: { id, on } })
+  // Per-space plan override: rebuild the whole space_plans map (empty value =
+  // clear, so that space falls back to the global plan). Lets each workspace be
+  // auto-paid on its own tariff instead of one shared plan for every space.
+  const setSpacePlan = (id: string, plan: string) => {
+    const next: Record<string, string> = { ...(cfg?.space_plans || {}) }
+    if (plan) next[id] = plan
+    else delete next[id]
+    patchCfg({ space_plans: next })
+  }
   const payNow = async () => { try { await runAutoPayNow(); setTimeout(reloadCfg, 1500) } catch { /* ignore */ } }
 
   if (!pool.length) return null
 
   const totalSpaces = pool.reduce((sum, acc) => sum + (acc.spaces?.length || 0), 0)
   const targetPlan = PLANS.find(p => p.id === (cfg?.plan || ''))
+  const globalPlanName = targetPlan ? targetPlan.name : (cfg?.plan || '')
   const targetPlanLabel = targetPlan ? `${targetPlan.name} ${targetPlan.price}${targetPlan.interval}` : (cfg?.plan || '—')
   const intervalSec = cfg?.interval_seconds ?? 60
   const canPayNow = !!cfg?.enabled && !!cfg?.has_card
@@ -522,6 +532,20 @@ export function WorkspacePool({
                         >
                           Оплатить
                         </button>
+                      </div>
+                      <div className="flex items-center gap-2 mt-2">
+                        <span className="text-[10px] text-text-muted uppercase tracking-wider shrink-0">План авто</span>
+                        <select
+                          value={cfg?.space_plans?.[space.space_id] || ''}
+                          onChange={(e) => setSpacePlan(space.space_id, e.target.value)}
+                          title="План автооплаты для этого пространства"
+                          className="flex-1 min-w-0 bg-[#0a0a0a] border border-white/[0.08] rounded px-2 py-1 text-[10px] text-text-secondary focus:outline-none focus:border-white/[0.20] transition-colors cursor-pointer"
+                        >
+                          <option value="">По умолчанию · {globalPlanName}</option>
+                          {PLANS.map((pl) => (
+                            <option key={pl.id} value={pl.id}>{pl.name}</option>
+                          ))}
+                        </select>
                       </div>
                       <AICreditsBar used={space.ai_credits_used} limit={space.ai_credits_limit} />
                     </div>
