@@ -2,6 +2,8 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { addAccount, discoverWorkspaces, checkAuth, login as apiLogin, logout as apiLogout } from './api'
 import { WorkspacePool, type DiscoveredAccount } from './components/WorkspacePool'
 import { ChatTab } from './components/ChatTab'
+import { RegisterModal } from './components/RegisterModal'
+import { HistoryDrawer } from './components/HistoryDrawer'
 
 // Pull the persisted accounts + their workspaces straight from the server so
 // the pool shows up even in a fresh browser / incognito window where the
@@ -40,6 +42,18 @@ const IconPlus = ({ size = 14 }: { size?: number }) => (
 const IconLogOut = ({ size = 12 }: { size?: number }) => (
   <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
     <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" />
+  </svg>
+)
+
+const IconUsers = ({ size = 12 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M23 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" />
+  </svg>
+)
+
+const IconHistory = ({ size = 12 }: { size?: number }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M3 3v5h5" /><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8" /><path d="M12 7v5l4 2" />
   </svg>
 )
 
@@ -96,6 +110,8 @@ function TabBar({ tab, onChange }: { tab: 'pay' | 'chat'; onChange: (t: 'pay' | 
 // when collapsed only the chevron + tab pill remain.
 function Hero({
   onAdd,
+  onRegister,
+  onHistory,
   accountCount,
   spaceCount,
   onLogout,
@@ -105,6 +121,8 @@ function Hero({
   onToggleCollapse,
 }: {
   onAdd: () => void
+  onRegister: () => void
+  onHistory: () => void
   accountCount: number
   spaceCount: number
   onLogout?: () => void
@@ -133,6 +151,22 @@ function Hero({
               <span className="text-[11px] text-text-muted tracking-wide font-mono">Notion Auto Pay</span>
             </div>
             <div className="flex items-center gap-2">
+              <button
+                onClick={onRegister}
+                title="Массовая регистрация аккаунтов"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-white/[0.08] text-[11px] text-text-muted hover:text-text-secondary hover:border-white/[0.15] transition-colors bg-transparent cursor-pointer"
+              >
+                <IconUsers size={12} />
+                <span className="hidden sm:inline">Регистрация</span>
+              </button>
+              <button
+                onClick={onHistory}
+                title="История задач регистрации"
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-white/[0.08] text-[11px] text-text-muted hover:text-text-secondary hover:border-white/[0.15] transition-colors bg-transparent cursor-pointer"
+              >
+                <IconHistory size={12} />
+                <span className="hidden sm:inline">История</span>
+              </button>
               <button
                 onClick={onAdd}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-white text-black text-[11px] font-medium hover:bg-[#f2f2f2] active:scale-[0.98] transition-all border-none cursor-pointer"
@@ -382,6 +416,8 @@ function AddAccountModal({ onClose, onDiscovered }: { onClose: () => void; onDis
 
 function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const [showAddModal, setShowAddModal] = useState(false)
+  const [showRegisterModal, setShowRegisterModal] = useState(false)
+  const [showHistory, setShowHistory] = useState(false)
   const [tab, setTab] = useState<'pay' | 'chat'>(() => {
     try {
       return localStorage.getItem('nmp_active_tab') === 'chat' ? 'chat' : 'pay'
@@ -412,6 +448,25 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   }, [tab])
 
   const [hydrating, setHydrating] = useState(true)
+
+  // Pull the persisted accounts + workspaces from the server and merge them
+  // into the local pool. Reused on first mount and after a bulk-registration
+  // job finishes so freshly created accounts show up without a manual reload.
+  const hydrateFromServer = useCallback(async () => {
+    try {
+      const serverAccounts = await fetchServerWorkspaces()
+      if (serverAccounts.length === 0) return
+      setDiscovered(prev => {
+        const byKey = new Map<string, DiscoveredAccount>()
+        for (const a of prev) byKey.set(a.user_email || a.token_v2, a)
+        for (const a of serverAccounts) byKey.set(a.user_email || a.token_v2, a)
+        return Array.from(byKey.values())
+      })
+    } catch {
+      /* server hydration is best-effort */
+    }
+  }, [])
+
   useEffect(() => {
     let cancelled = false
     fetchServerWorkspaces()
@@ -447,6 +502,8 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
     <div className="min-h-screen">
       <Hero
         onAdd={() => setShowAddModal(true)}
+        onRegister={() => setShowRegisterModal(true)}
+        onHistory={() => setShowHistory(true)}
         accountCount={accountCount}
         spaceCount={spaceCount}
         onLogout={onLogout}
@@ -482,6 +539,17 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
       </main>
 
       {showAddModal && <AddAccountModal onClose={() => setShowAddModal(false)} onDiscovered={upsertDiscovered} />}
+
+      <RegisterModal
+        open={showRegisterModal}
+        onClose={() => setShowRegisterModal(false)}
+        onJobFinished={hydrateFromServer}
+      />
+
+      <HistoryDrawer
+        open={showHistory}
+        onClose={() => setShowHistory(false)}
+      />
     </div>
   )
 }
