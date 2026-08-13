@@ -1425,7 +1425,7 @@ export const Composer = memo(function Composer({
 
   const submit = useCallback(() => {
     const t = text.trim()
-    if (!t || !hasSpace || sending || busyUploading || busyElsewhere) return
+    if (!t || !hasSpace || sending || busyUploading) return
     onSend(t)
     setText('')
     saveDraft(draftKey, '')
@@ -1433,7 +1433,7 @@ export const Composer = memo(function Composer({
       const el = taRef.current
       if (el) el.style.height = 'auto'
     })
-  }, [text, hasSpace, sending, busyUploading, busyElsewhere, onSend, draftKey])
+  }, [text, hasSpace, sending, busyUploading, onSend, draftKey])
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1566,8 +1566,8 @@ export const Composer = memo(function Composer({
           <button
             type="button"
             onClick={submit}
-            disabled={!hasSpace || busyUploading || busyElsewhere || text.trim() === ''}
-            title={busyElsewhere ? 'Агент сейчас занят ходом в другом чате' : 'Отправить'}
+            disabled={!hasSpace || busyUploading || text.trim() === ''}
+            title="Отправить"
             className="shrink-0 w-7 h-7 flex items-center justify-center rounded-full bg-white text-black hover:bg-[#f0f0f0] transition-colors disabled:opacity-25 disabled:cursor-not-allowed border-none cursor-pointer"
           >
             <SendIcon />
@@ -1577,7 +1577,7 @@ export const Composer = memo(function Composer({
         </div>
       </div>
       <p className="text-center text-[10px] text-[#3a3a3a] mt-1.5">
-        {busyElsewhere ? 'Агент отвечает в другом чате — дождитесь конца хода' : 'Enter — отправить · Shift+Enter — новая строка'}
+        {busyElsewhere ? 'Агент отвечает в другом чате — здесь можно писать параллельно' : 'Enter — отправить · Shift+Enter — новая строка'}
       </p>
     </div>
   )

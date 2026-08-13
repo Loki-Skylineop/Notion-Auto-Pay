@@ -89,11 +89,21 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
   const [threads, setThreads] = useState<ChatThread[]>([])
   const [activeThreadId, setActiveThreadId] = useState('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
-  const [sending, setSending] = useState(false)
+  // Каждый чат ведёт свой ход независимо: ключ чата (id треда либо
+  // уникальный ключ пустого «Нового чата») -> идёт ли в нём сейчас ход.
+  // Раньше на весь компонент был один флаг sending, и пока агент работал
+  // в одном чате, отправка во всех остальных была заблокирована.
+  const [runningKeys, setRunningKeys] = useState<Record<string, boolean>>({})
   const [status, setStatus] = useState<ChatStatus | null>(null)
   const [liveSteps, setLiveSteps] = useState<ChatStep[]>([])
   const [liveText, setLiveText] = useState('')
-  const [streamKey, setStreamKey] = useState<string | null>(null)
+  // Живой буфер (status/liveSteps/liveText) один, поэтому им владеет
+  // последний запущенный ход. Остальные ходы продолжают идти: их прогресс
+  // подтягивает опрос сервера, а индикатор берётся из runningKeys/busyThreads.
+  const [liveOwner, setLiveOwner] = useState<string | null>(null)
+  // Уникальный ключ текущего пустого «Нового чата»: два новых чата не
+  // должны делить состояние хода.
+  const [newKey, setNewKey] = useState(NEW_KEY)
   const [historyLoading, setHistoryLoading] = useState(false)
   const [threadsLoading, setThreadsLoading] = useState(false)
   const [error, setError] = useState('')
@@ -134,9 +144,12 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
   const suppressAutoScrollRef = useRef(false)
   const viewKeyRef = useRef(NEW_KEY)
   const threadAgentsRef = useRef<Record<string, string>>(loadThreadAgents())
-  const stopRef = useRef(false)
-  const streamThreadIdRef = useRef('')
-  const turnSeqRef = useRef(0)
+  // Всё, что раньше было одиночным состоянием хода, разложено по ключам
+  // чатов — иначе параллельные ходы затирали бы друг другу флаги.
+  const stopKeysRef = useRef<Record<string, boolean>>({})
+  const threadIdsRef = useRef<Record<string, string>>({})
+  const turnSeqRef = useRef<Record<string, number>>({})
+  const liveOwnerRef = useRef<string | null>(null)
   // Poll-loop bookkeeping for the version-gated chatSync mirror of Notion's
   // ~1s record polling. pollsRef cancels a stale loop for ONE thread only;
   // pollVersionsRef holds each thread's last applied version.
@@ -156,8 +169,34 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
   const restoredThreadRef = useRef(false)
 
   useEffect(() => {
-    viewKeyRef.current = activeThreadId || NEW_KEY
-  }, [activeThreadId])
+    viewKeyRef.current = activeThreadId || newKey
+  }, [activeThreadId, newKey])
+
+  // Ключ открытого чата и «идёт ли ход именно здесь» нужны и в эффектах
+  // ниже, поэтому считаются до первого использования.
+  const viewKey = activeThreadId || newKey
+  const runningHere = !!runningKeys[viewKey]
+  const isNewChatKey = (key: string) => key === NEW_KEY || key.startsWith(`${NEW_KEY}:`)
+  const setRunning = useCallback((key: string, on: boolean) => {
+    setRunningKeys((prev) => (!!prev[key] === on ? prev : { ...prev, [key]: on }))
+  }, [])
+  // Забрать живой буфер под новый ход. Прошлый владелец теряет
+  // «печатающийся» текст, но сам ход не прерывается — его доведёт опрос.
+  const claimLive = useCallback((key: string) => {
+    liveOwnerRef.current = key
+    setLiveOwner(key)
+    setStatus(null)
+    setLiveSteps([])
+    setLiveText('')
+  }, [])
+  const releaseLive = useCallback((key: string) => {
+    if (liveOwnerRef.current !== key) return
+    liveOwnerRef.current = null
+    setLiveOwner(null)
+    setStatus(null)
+    setLiveSteps([])
+    setLiveText('')
+  }, [])
 
   const rememberThreadAgent = useCallback((threadId: string, agent: string) => {
     if (!threadId) return
@@ -223,10 +262,10 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
   // Persist the active thread's settled messages so re-opening it is instant.
   // Skipped while a turn is in flight so we never cache a half-streamed state.
   useEffect(() => {
-    if (!activeThreadId || sending || remoteBusy) return
+    if (!activeThreadId || runningHere || remoteBusy) return
     if (messages.length === 0) return
     writeCachedHistory(activeThreadId, messages)
-  }, [activeThreadId, messages, sending, remoteBusy])
+  }, [activeThreadId, messages, runningHere, remoteBusy])
 
   const spaceOptions = useMemo<SpaceOption[]>(() => {
     const out: SpaceOption[] = []
@@ -380,7 +419,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
     }
     const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160
     if (nearBottom) el.scrollTop = el.scrollHeight
-  }, [messages, sending, historyLoading, liveSteps, liveText, status])
+  }, [messages, runningHere, historyLoading, liveSteps, liveText, status])
 
   // Вкладка «Чат» снова на экране. Пока она была спрятана, у лога была нулевая
   // высота, поэтому автоскролл выше ничего не прокручивал, а браузер сбросил
@@ -613,6 +652,9 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
   }, [activeSpace, threadsLoading])
 
   const startNewChat = useCallback(() => {
+    // Свежий ключ для пустого чата: если в предыдущем «Новом чате» ход
+    // ещё идёт, он остаётся при своём ключе, а этот готов к отправке.
+    setNewKey(`${NEW_KEY}:${Date.now()}`)
     // Чужие циклы опроса не глушим: агент, запущенный в другом чате, должен
     // продолжать крутить свой кружок в списке «История».
     setRemoteBusy(false)
@@ -702,7 +744,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
     if (restoredThreadRef.current) return
     if (!activeSpace || agents.length === 0 || threads.length === 0) return
     restoredThreadRef.current = true
-    if (viewKeyRef.current !== NEW_KEY) return
+    if (!isNewChatKey(viewKeyRef.current)) return
     let saved = ''
     try {
       saved = localStorage.getItem(ACTIVE_THREAD_KEY) || ''
@@ -764,26 +806,26 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
   }, [])
 
   const handleStop = useCallback(() => {
-    // A turn can be driven two ways: by our own stream (sending), or by the
-    // polling loop that picked it up after a reload, a dropped stream or a
-    // chat switch. The stop button used to disappear in the second case even
-    // though the agent kept working, so both cases are stoppable now.
-    const viewKeyNow = activeThreadId || NEW_KEY
-    const ownStream = sending && streamKey === viewKeyNow
-    const tid = ownStream ? streamThreadIdRef.current || activeThreadId || '' : activeThreadId || ''
+    // A turn can be driven two ways: by our own stream, or by the polling loop
+    // that picked it up after a reload, a dropped stream or a chat switch. Both
+    // are stoppable, and only the turn of the chat on screen is touched.
+    const key = viewKey
+    const ownStream = !!runningKeys[key]
+    const tid = ownStream ? threadIdsRef.current[key] || activeThreadId || '' : activeThreadId || ''
     if (!ownStream && !tid) return
     // Гасим цикл только того чата, чей ход останавливаем: фоновые диалоги
     // продолжают опрашиваться и не теряют свой индикатор.
     stopPolling(tid || undefined)
     setRemoteBusy(false)
-    stopRef.current = true
-    const partial = liveText.trim()
-    const carriedSteps = liveSteps
-    setSending(false)
-    setStatus(null)
-    setStreamKey(null)
-    setLiveSteps([])
-    setLiveText('')
+    // «Живой» текст забираем только если буфер принадлежит этому чату.
+    const ownsLive = liveOwnerRef.current === key
+    const partial = ownsLive ? liveText.trim() : ''
+    const carriedSteps = ownsLive ? liveSteps : []
+    if (ownStream) {
+      stopKeysRef.current[key] = true
+      setRunning(key, false)
+    }
+    releaseLive(key)
     setMessages((prev) => [
       ...prev,
       {
@@ -803,7 +845,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         thread_id: tid,
       }).then(() => reconcileFromServer(activeSpace, tid))
     }
-  }, [sending, streamKey, activeThreadId, liveText, liveSteps, activeSpace, reconcileFromServer, stopPolling])
+  }, [viewKey, runningKeys, activeThreadId, liveText, liveSteps, activeSpace, reconcileFromServer, stopPolling, setRunning, releaseLive])
 
   // Shared live-status reducer for both chatStream (handleSend) and chatSurvey
   // (handleSurveySubmit). The backend tags every event with a kind: "tool" (a
@@ -812,7 +854,10 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
   // is written). We fold tool + thought events into liveSteps so the live tree
   // mirrors the finished message, and mirror text into liveText so the reply
   // types out in place.
-  const onStatus = useCallback((s: ChatStatus) => {
+  const makeOnStatus = useCallback((key: string) => (s: ChatStatus) => {
+    // События хода, который больше не владеет живым буфером, игнорируем:
+    // его прогресс всё равно приедет из опроса сервера.
+    if (liveOwnerRef.current !== key) return
     setStatus(s)
     if (s.kind === 'text') {
       if (s.detail) setLiveText(s.detail)
@@ -860,12 +905,13 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
   const handleSend = useCallback(
     async (msg: string) => {
       const text = msg.trim()
-      if (!text || !activeSpace || sending) return
-      const originKey = activeThreadId || NEW_KEY
+      const originKey = activeThreadId || newKey
+      // Блокируем только второй ход в ЭТОМ же чате: остальные свободны.
+      if (!text || !activeSpace || runningKeys[originKey]) return
       const agentUsed = agentId
-      const myTurn = ++turnSeqRef.current
-      stopRef.current = false
-      streamThreadIdRef.current = activeThreadId || ''
+      const myTurn = (turnSeqRef.current[originKey] = (turnSeqRef.current[originKey] || 0) + 1)
+      stopKeysRef.current[originKey] = false
+      threadIdsRef.current[originKey] = activeThreadId || ''
       instantScrollRef.current = true
       setError('')
       // Take the attachments this turn carries and clear the tray right away:
@@ -879,15 +925,12 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         ...prev,
         { role: 'user', text, attachments: sentAttachments.length > 0 ? sentAttachments : undefined },
       ])
-      setSending(true)
+      setRunning(originKey, true)
       // Mirror Notion's live record polling for the duration of the turn so the
       // open chat keeps updating even if the stream stalls. A brand-new thread
       // has no id yet, so polling is (re)started below with res.thread_id.
       if (activeThreadId) startPolling(activeSpace, activeThreadId)
-      setStreamKey(originKey)
-      setStatus(null)
-      setLiveSteps([])
-      setLiveText('')
+      claimLive(originKey)
 
       try {
         const res = await chatStream(
@@ -908,10 +951,10 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
             attachments: sentAttachments.length > 0 ? sentAttachments : undefined,
             message: text,
           },
-          onStatus,
+          makeOnStatus(originKey),
         )
         if (res.thread_id) {
-          streamThreadIdRef.current = res.thread_id
+          threadIdsRef.current[originKey] = res.thread_id
           rememberThreadAgent(res.thread_id, agentUsed)
           setThreads((prev) =>
             prev.some((t) => t.id === res.thread_id)
@@ -922,7 +965,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         // Only mutate the visible conversation if the user is still viewing the
         // chat this stream was started from, and the turn wasn't stopped.
         // Otherwise the reply is persisted server-side and shows up on reopen.
-        if (viewKeyRef.current === originKey && !stopRef.current) {
+        if (viewKeyRef.current === originKey && !stopKeysRef.current[originKey]) {
           if (res.thread_id && res.thread_id !== activeThreadId) setActiveThreadId(res.thread_id)
           setMessages((prev) => [
             ...prev,
@@ -934,11 +977,11 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         // final history and then stops once the turn is no longer in-flight.
         if (res.thread_id) startPolling(activeSpace, res.thread_id)
       } catch (e) {
-        if (viewKeyRef.current === originKey && !stopRef.current) {
+        if (viewKeyRef.current === originKey && !stopKeysRef.current[originKey]) {
           // Once the thread exists the turn is already persisted server-side, so
           // a dropped stream is not a failure: let polling catch up instead of
           // flashing a bubble that the next poll immediately overwrites.
-          const tid = streamThreadIdRef.current
+          const tid = threadIdsRef.current[originKey]
           if (tid) {
             startPolling(activeSpace, tid)
           } else {
@@ -949,16 +992,13 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
       } finally {
         // A stop (or a newer turn) may have already reset the live state; only
         // the turn that still owns the stream should clear it.
-        if (turnSeqRef.current === myTurn) {
-          setSending(false)
-          setStatus(null)
-          setLiveSteps([])
-          setLiveText('')
-          setStreamKey(null)
+        if (turnSeqRef.current[originKey] === myTurn) {
+          setRunning(originKey, false)
+          releaseLive(originKey)
         }
       }
     },
-    [activeSpace, sending, activeThreadId, agentId, selectedModel, selectedEffort, attachments, pendingThreadId, onStatus, rememberThreadAgent, startPolling],
+    [activeSpace, runningKeys, newKey, activeThreadId, agentId, selectedModel, selectedEffort, attachments, pendingThreadId, makeOnStatus, rememberThreadAgent, startPolling, setRunning, claimLive, releaseLive],
   )
 
   // Push picked files straight into Notion's bucket (the proxy signs the S3
@@ -1013,7 +1053,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
   const handleEditLast = useCallback(
     async (index: number, next: string) => {
       const text = next.trim()
-      if (!text || !activeSpace || sending || editBusy) return
+      if (!text || !activeSpace || runningKeys[activeThreadId] || editBusy) return
       if (!activeThreadId) {
         setError('Правка доступна только в сохранённом чате')
         setEditingIdx(-1)
@@ -1021,14 +1061,14 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
       }
       const originKey = activeThreadId
       const agentUsed = agentId
-      const myTurn = ++turnSeqRef.current
-      stopRef.current = false
-      streamThreadIdRef.current = activeThreadId
+      const myTurn = (turnSeqRef.current[originKey] = (turnSeqRef.current[originKey] || 0) + 1)
+      stopKeysRef.current[originKey] = false
+      threadIdsRef.current[originKey] = activeThreadId
       instantScrollRef.current = true
       setError('')
       setEditingIdx(-1)
       setEditBusy(true)
-      setSending(true)
+      setRunning(originKey, true)
       // The old answer is gone the moment the message changes - drop everything
       // after the edited turn locally too, so the UI matches the thread.
       // Щит от «воскрешения» старого ответа: пока правка едет на сервер, любой
@@ -1042,10 +1082,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         return truncated
       })
       startPolling(activeSpace, activeThreadId)
-      setStreamKey(originKey)
-      setStatus(null)
-      setLiveSteps([])
-      setLiveText('')
+      claimLive(originKey)
 
       try {
         const res = await chatEdit(
@@ -1064,9 +1101,9 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
             thread_id: activeThreadId,
             message: text,
           },
-          onStatus,
+          makeOnStatus(originKey),
         )
-        if (viewKeyRef.current === originKey && !stopRef.current) {
+        if (viewKeyRef.current === originKey && !stopKeysRef.current[originKey]) {
           setMessages((prev) => [
             ...prev,
             { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, blocks: res.blocks, survey: res.survey, pages: res.pages },
@@ -1074,10 +1111,10 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         }
         if (res.thread_id) startPolling(activeSpace, res.thread_id)
       } catch (e) {
-        if (viewKeyRef.current === originKey && !stopRef.current) {
+        if (viewKeyRef.current === originKey && !stopKeysRef.current[originKey]) {
           // The edited message is already saved server-side, so reconcile through
           // polling rather than pushing a phantom failure bubble.
-          const tid = streamThreadIdRef.current
+          const tid = threadIdsRef.current[originKey]
           if (tid) {
             startPolling(activeSpace, tid)
           } else {
@@ -1086,33 +1123,31 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
           }
         }
       } finally {
-        if (turnSeqRef.current === myTurn) {
-          setSending(false)
-          setStatus(null)
-          setLiveSteps([])
-          setLiveText('')
-          setStreamKey(null)
+        if (turnSeqRef.current[originKey] === myTurn) {
+          setRunning(originKey, false)
+          releaseLive(originKey)
         }
         setEditBusy(false)
         // Щит снимаем только когда правка полностью отработала.
         editGuardRef.current = null
       }
     },
-    [activeSpace, sending, editBusy, activeThreadId, agentId, selectedModel, selectedEffort, onStatus, startPolling],
+    [activeSpace, runningKeys, editBusy, activeThreadId, agentId, selectedModel, selectedEffort, makeOnStatus, startPolling, setRunning, claimLive, releaseLive],
   )
 
   // Continue a turn by answering the agent's survey. Mirrors handleSend, but
   // posts the collected answers to chatSurvey instead of a free-text message.
   const handleSurveySubmit = useCallback(
     async (survey: ChatSurvey, answers: ChatSurveyAnswer[]) => {
-      if (!activeSpace || sending) return
+      if (!activeSpace) return
       const tid = activeThreadId
       if (!tid || !survey || survey.submitted) return
       const originKey = tid
+      if (runningKeys[originKey]) return
       const agentUsed = agentId
-      const myTurn = ++turnSeqRef.current
-      stopRef.current = false
-      streamThreadIdRef.current = tid
+      const myTurn = (turnSeqRef.current[originKey] = (turnSeqRef.current[originKey] || 0) + 1)
+      stopKeysRef.current[originKey] = false
+      threadIdsRef.current[originKey] = tid
       instantScrollRef.current = true
       setError('')
       // Mark the survey answered and echo the chosen answers as a user turn.
@@ -1125,11 +1160,8 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         ...prev,
         { role: 'user', text: answers.map((a) => `${a.prompt}\n— ${a.label}`).join('\n\n') },
       ])
-      setSending(true)
-      setStreamKey(originKey)
-      setStatus(null)
-      setLiveSteps([])
-      setLiveText('')
+      setRunning(originKey, true)
+      claimLive(originKey)
       startPolling(activeSpace, tid)
       try {
         const res = await chatSurvey(
@@ -1151,13 +1183,13 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
             created_at: survey.createdAt,
             answers,
           },
-          onStatus,
+          makeOnStatus(originKey),
         )
         if (res.thread_id) {
-          streamThreadIdRef.current = res.thread_id
+          threadIdsRef.current[originKey] = res.thread_id
           rememberThreadAgent(res.thread_id, agentUsed)
         }
-        if (viewKeyRef.current === originKey && !stopRef.current) {
+        if (viewKeyRef.current === originKey && !stopKeysRef.current[originKey]) {
           setMessages((prev) => [
             ...prev,
             { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, blocks: res.blocks, survey: res.survey, pages: res.pages },
@@ -1165,21 +1197,18 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         }
         if (res.thread_id) startPolling(activeSpace, res.thread_id)
       } catch (e) {
-        if (viewKeyRef.current === originKey && !stopRef.current) {
+        if (viewKeyRef.current === originKey && !stopKeysRef.current[originKey]) {
           setError(e instanceof Error ? e.message : 'Ошибка отправки')
           setMessages((prev) => [...prev, { role: 'assistant', text: '⚠️ Не удалось отправить ответы. Попробуйте ещё раз.' }])
         }
       } finally {
-        if (turnSeqRef.current === myTurn) {
-          setSending(false)
-          setStatus(null)
-          setLiveSteps([])
-          setLiveText('')
-          setStreamKey(null)
+        if (turnSeqRef.current[originKey] === myTurn) {
+          setRunning(originKey, false)
+          releaseLive(originKey)
         }
       }
     },
-    [activeSpace, sending, activeThreadId, agentId, selectedModel, selectedEffort, onStatus, rememberThreadAgent, startPolling],
+    [activeSpace, runningKeys, activeThreadId, agentId, selectedModel, selectedEffort, makeOnStatus, rememberThreadAgent, startPolling, setRunning, claimLive, releaseLive],
   )
 
   if (accounts.length === 0) {
@@ -1190,7 +1219,6 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
     )
   }
 
-  const viewKey = activeThreadId || NEW_KEY
   // Only the newest user message gets the edit affordance, exactly like Notion.
   const lastUserIdx = useMemo(() => {
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -1201,14 +1229,16 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
   // Работает ли агент именно в ОТКРЫТОМ чате. Ход, запущенный в другом
   // диалоге, сюда больше не протекает — это и был баг с «ИИ работает» и
   // моделью внизу в чужом чате.
-  const sendingHere = sending && streamKey === viewKey
-  const busyElsewhere = sending && streamKey !== viewKey
+  const sendingHere = runningHere
+  // Ход в другом чате больше ничего здесь не блокирует — это только
+  // подсказка под полем ввода, что агент параллельно занят рядом.
+  const busyElsewhere = Object.keys(runningKeys).some((k) => k !== viewKey && runningKeys[k])
   const busyHere = !!activeThreadId && !!busyThreads[activeThreadId]
-  const showThinking = sendingHere || busyHere || (remoteBusy && !sending)
+  const showThinking = sendingHere || busyHere || remoteBusy
   // The stop button has to live exactly as long as a turn runs in THIS chat:
   // our own stream, or one the polling loop is still driving (reload, dropped
   // stream, reopened chat). Before, it vanished mid-run in those cases.
-  const stoppableHere = sendingHere || (!busyElsewhere && (busyHere || remoteBusy))
+  const stoppableHere = sendingHere || busyHere || remoteBusy
   const showModelPicker = agentId === 'default' && models.filter((m) => !m.disabled).length > 0
   const activeThreadTitle = threads.find((t) => t.id === activeThreadId)?.title || 'Новый чат'
   const lastMessage = messages[messages.length - 1]
@@ -1411,7 +1441,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
                 blocks={msg.blocks}
                 pages={msg.pages}
                 attachments={msg.attachments}
-                canEdit={msg.role === 'user' && absIdx === lastUserIdx && !!activeThreadId && !sending}
+                canEdit={msg.role === 'user' && absIdx === lastUserIdx && !!activeThreadId && !runningHere}
                 editing={editingIdx === absIdx}
                 editBusy={editBusy}
                 onEditStart={() => setEditingIdx(absIdx)}
@@ -1421,7 +1451,13 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
             )
           })}
 
-          {showThinking ? <StreamingRow status={status} steps={liveSteps} liveText={liveText} /> : null}
+          {showThinking ? (
+            <StreamingRow
+              status={liveOwner === viewKey ? status : null}
+              steps={liveOwner === viewKey ? liveSteps : []}
+              liveText={liveOwner === viewKey ? liveText : ''}
+            />
+          ) : null}
         </div>
 
         {error ? (
