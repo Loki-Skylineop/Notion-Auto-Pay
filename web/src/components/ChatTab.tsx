@@ -764,10 +764,17 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
   }, [])
 
   const handleStop = useCallback(() => {
-    if (!sending) return
+    // A turn can be driven two ways: by our own stream (sending), or by the
+    // polling loop that picked it up after a reload, a dropped stream or a
+    // chat switch. The stop button used to disappear in the second case even
+    // though the agent kept working, so both cases are stoppable now.
+    const viewKeyNow = activeThreadId || NEW_KEY
+    const ownStream = sending && streamKey === viewKeyNow
+    const tid = ownStream ? streamThreadIdRef.current || activeThreadId || '' : activeThreadId || ''
+    if (!ownStream && !tid) return
     // Гасим цикл только того чата, чей ход останавливаем: фоновые диалоги
     // продолжают опрашиваться и не теряют свой индикатор.
-    stopPolling(streamThreadIdRef.current || undefined)
+    stopPolling(tid || undefined)
     setRemoteBusy(false)
     stopRef.current = true
     const partial = liveText.trim()
@@ -785,7 +792,9 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         steps: carriedSteps,
       },
     ])
-    const tid = streamThreadIdRef.current
+    // Drop the per-thread indicator immediately so the sidebar dot and the
+    // thinking row do not survive the stop.
+    if (tid) setBusyThreads((prev) => (prev[tid] ? { ...prev, [tid]: false } : prev))
     if (tid && activeSpace) {
       requestStopInference({
         token_v2: activeSpace.account.token_v2,
@@ -794,7 +803,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         thread_id: tid,
       }).then(() => reconcileFromServer(activeSpace, tid))
     }
-  }, [sending, liveText, liveSteps, activeSpace, reconcileFromServer, stopPolling])
+  }, [sending, streamKey, activeThreadId, liveText, liveSteps, activeSpace, reconcileFromServer, stopPolling])
 
   // Shared live-status reducer for both chatStream (handleSend) and chatSurvey
   // (handleSurveySubmit). The backend tags every event with a kind: "tool" (a
@@ -1196,6 +1205,10 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
   const busyElsewhere = sending && streamKey !== viewKey
   const busyHere = !!activeThreadId && !!busyThreads[activeThreadId]
   const showThinking = sendingHere || busyHere || (remoteBusy && !sending)
+  // The stop button has to live exactly as long as a turn runs in THIS chat:
+  // our own stream, or one the polling loop is still driving (reload, dropped
+  // stream, reopened chat). Before, it vanished mid-run in those cases.
+  const stoppableHere = sendingHere || (!busyElsewhere && (busyHere || remoteBusy))
   const showModelPicker = agentId === 'default' && models.filter((m) => !m.disabled).length > 0
   const activeThreadTitle = threads.find((t) => t.id === activeThreadId)?.title || 'Новый чат'
   const lastMessage = messages[messages.length - 1]
@@ -1421,7 +1434,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
 
         <Composer
           hasSpace={!!activeSpace}
-          sending={sendingHere}
+          sending={stoppableHere}
           busyElsewhere={busyElsewhere}
           showModelPicker={showModelPicker}
           models={models}

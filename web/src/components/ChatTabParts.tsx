@@ -1490,7 +1490,7 @@ export const Composer = memo(function Composer({
             ))}
           </div>
         ) : null}
-        <div className="flex items-end gap-2.5">
+        <div className="flex flex-col gap-1.5 sm:flex-row sm:items-end sm:gap-2.5">
         <textarea
           ref={taRef}
           value={text}
@@ -1503,8 +1503,13 @@ export const Composer = memo(function Composer({
           rows={1}
           placeholder={hasSpace ? 'Напишите сообщение…' : 'Сначала выберите пространство'}
           disabled={!hasSpace}
-          className="no-scrollbar flex-1 min-w-0 resize-none max-h-[220px] overflow-y-auto bg-transparent border-none outline-none text-[#e8e8e8] text-[13.5px] placeholder-[#333] leading-relaxed py-0.5 disabled:opacity-50"
+          className="no-scrollbar w-full sm:flex-1 min-w-0 resize-none max-h-[220px] overflow-y-auto bg-transparent border-none outline-none text-[#e8e8e8] text-[13.5px] placeholder-[#333] leading-relaxed py-0.5 disabled:opacity-50"
         />
+        {/* РќР° С‚РµР»РµС„РѕРЅРµ РїРѕР»Рµ РІРІРѕРґР° Р·Р°РЅРёРјР°РµС‚ РІСЃСЋ С€РёСЂРёРЅСѓ, Р° РёРєРѕРЅРєРё СѓРµР·Р¶Р°СЋС‚ РЅР° СЃРІРѕСЋ
+            СЃС‚СЂРѕРєСѓ РїРѕРґ РЅРёРј вЂ” РёРЅР°С‡Рµ С‚РµРєСЃС‚ Р¶Р°Р»СЃСЏ РІ СѓР·РєСѓСЋ РєРѕР»РѕРЅРєСѓ, С…РѕС‚СЏ СЃРїСЂР°РІР° РЅР°Рґ
+            РёРєРѕРЅРєР°РјРё РѕСЃС‚Р°РІР°Р»РѕСЃСЊ РїСѓСЃС‚РѕРµ РјРµСЃС‚Рѕ. РќР° sm+ РѕР±С‘СЂС‚РєР° СЃС‚Р°РЅРѕРІРёС‚СЃСЏ
+            display:contents, Рё СЂР°СЃРєР»Р°РґРєР° РІРѕР·РІСЂР°С‰Р°РµС‚СЃСЏ Рє РїСЂРµР¶РЅРµР№ РѕРґРЅРѕСЃС‚СЂРѕС‡РЅРѕР№. */}
+        <div className="flex items-center justify-end gap-1.5 sm:gap-2.5 sm:contents">
         <input
           ref={fileRef}
           type="file"
@@ -1568,6 +1573,7 @@ export const Composer = memo(function Composer({
             <SendIcon />
           </button>
         )}
+        </div>
         </div>
       </div>
       <p className="text-center text-[10px] text-[#3a3a3a] mt-1.5">
