@@ -31,6 +31,47 @@ type WorkspaceInfo struct {
 	// AI budget, so the UI hides the bar.
 	AICreditsUsed  int `json:"ai_credits_used"`
 	AICreditsLimit int `json:"ai_credits_limit"`
+	// BasicCreditsUsed / BasicCreditsLimit describe the SEPARATE basic credit
+	// allowance that the ordinary, non-premium agent spends (e.g. 1708 used out
+	// of 75). It comes from the basicCredits block of the same
+	// getAIUsageEligibilityV2 payload. On paid plans basic AI is not metered, so
+	// usage happily runs past the nominal limit; BasicCreditsUnlimited records
+	// that so the UI can draw a full bar plus the raw counters instead of a
+	// nonsense percentage.
+	BasicCreditsUsed      int  `json:"basic_credits_used"`
+	BasicCreditsLimit     int  `json:"basic_credits_limit"`
+	BasicCreditsUnlimited bool `json:"basic_credits_unlimited"`
+	// The next block mirrors the two gauges Notion draws on its own "Limits"
+	// tab, both from /api/v3/getCreditRateLimitStatus. Rolling* is the short
+	// SLIDING window (RollingWindow is its size, e.g. "6h") that throttles
+	// bursts and frees up again after RollingResetsInSec seconds. Period* is
+	// the allowance for the whole billing period, resetting at PeriodEndMs.
+	// Notion already reports both as a used/limit pair scaled to 100, so the
+	// percentages are its numbers, not ours. RateLimitOK is false when the
+	// call failed, which tells the UI to hide both bars instead of showing a
+	// misleading 0%.
+	RateLimitOK        bool    `json:"rate_limit_ok"`
+	RollingUsed        float64 `json:"rolling_used"`
+	RollingLimit       float64 `json:"rolling_limit"`
+	RollingWindow      string  `json:"rolling_window"`
+	RollingResetsInSec int64   `json:"rolling_resets_in_sec"`
+	PeriodUsed         float64 `json:"period_used"`
+	PeriodLimit        float64 `json:"period_limit"`
+	PeriodEndMs        int64   `json:"period_end_ms"`
+	// McpConnected reports whether this workspace has at least one MCP server
+	// integration in the "connected" state, per /api/v3/listExternalConnections
+	// with integrationType "mcpServer". McpServers carries the resolved details
+	// (name, icon, URL, tool count) so the dashboard can label the indicator it
+	// draws next to the workspace name.
+	McpConnected bool            `json:"mcp_connected"`
+	McpServers   []McpServerInfo `json:"mcp_servers,omitempty"`
+	// OveragePolicy mirrors space.settings.ai_credit_overage_policy, the "use
+	// additional credits" switch on Notion's AI settings page ("disabled" = off,
+	// "all_workspace_members" = on). OverageEnabled is the ready-made boolean the
+	// dashboard indicator reads; it only matters once a workspace has drained its
+	// sliding window, which is the only time the UI shows it.
+	OveragePolicy  string `json:"overage_policy,omitempty"`
+	OverageEnabled bool   `json:"overage_enabled"`
 }
 
 // AccountWorkspaces holds a user's account info plus all their workspaces
@@ -221,10 +262,37 @@ func DiscoverWorkspacesFromToken(tokenV2 string) (*AccountWorkspaces, error) {
 			// not count as subscribed unless getSubscriptionData said otherwise.
 			spaces[idx].IsSubscribed = pt != "" && pt != "free" && pt != "team" && pt != "personal"
 
-			// Per-workspace premium AI credit budget for the progress bar.
-			used, limit := fetchSpaceAIUsage(tokenV2, userID, spaces[idx].SpaceID)
-			spaces[idx].AICreditsUsed = used
-			spaces[idx].AICreditsLimit = limit
+			// Per-workspace credit budgets for the progress bars: the premium
+			// pool first, then the basic allowance the ordinary agent spends.
+			u := fetchSpaceAIUsage(tokenV2, userID, spaces[idx].SpaceID)
+			spaces[idx].AICreditsUsed = u.PremiumUsed
+			spaces[idx].AICreditsLimit = u.PremiumLimit
+			spaces[idx].BasicCreditsUsed = u.BasicUsed
+			spaces[idx].BasicCreditsLimit = u.BasicLimit
+			spaces[idx].BasicCreditsUnlimited = u.BasicUnlimited
+
+			// ...plus the two throttling windows the Limits tab shows.
+			rl := fetchSpaceCreditRateLimit(tokenV2, userID, spaces[idx].SpaceID)
+			spaces[idx].RateLimitOK = rl.OK
+			spaces[idx].RollingUsed = rl.RollingUsed
+			spaces[idx].RollingLimit = rl.RollingLimit
+			spaces[idx].RollingWindow = rl.RollingWindow
+			spaces[idx].RollingResetsInSec = rl.RollingResets
+			spaces[idx].PeriodUsed = rl.PeriodUsed
+			spaces[idx].PeriodLimit = rl.PeriodLimit
+			spaces[idx].PeriodEndMs = rl.PeriodEndMs
+
+			// ...and finally the MCP server integrations that drive the
+			// connection indicator next to the workspace name.
+			servers := fetchSpaceMcpServers(tokenV2, userID, spaces[idx].SpaceID)
+			spaces[idx].McpServers = servers
+			spaces[idx].McpConnected = mcpConnectedCount(servers) > 0
+
+			// ...and the "use additional credits" switch, so the pool can show
+			// whether overage is armed on a workspace that hit its limit.
+			pol := fetchSpaceOveragePolicy(tokenV2, userID, spaces[idx].SpaceID)
+			spaces[idx].OveragePolicy = pol
+			spaces[idx].OverageEnabled = overageEnabled(pol)
 		}(i)
 	}
 	wg.Wait()
@@ -332,19 +400,20 @@ func fetchSpaceSubscription(tokenV2, userID, spaceID string) (planType, planName
 }
 
 // fetchSpaceAIUsage queries /api/v3/getAIUsageEligibilityV2 for a single space
-// and returns how many premium AI credits have been used this service period
-// plus the total monthly limit (e.g. 0 used out of 400). Free spaces with no
-// premium budget report a limit of 0. Returns (0, 0) on any failure so the
-// caller can simply hide the progress bar.
-func fetchSpaceAIUsage(tokenV2, userID, spaceID string) (used, limit int) {
+// and returns both credit budgets the dashboard draws: the premium AI credit
+// pool for the current service period (e.g. 0 used out of 400) and the separate
+// basic allowance that the ordinary, non-premium agent spends (e.g. 1708 used
+// out of 75). A zero limit means the space has no such budget, so the UI hides
+// that particular bar. Returns the zero value on any failure.
+func fetchSpaceAIUsage(tokenV2, userID, spaceID string) (usage spaceAIUsage) {
 	if spaceID == "" {
-		return 0, 0
+		return usage
 	}
 	client := getChromeHTTPClient(AppConfig.APITimeoutDuration())
 	reqBody, _ := json.Marshal(map[string]string{"spaceId": spaceID})
 	req, err := http.NewRequest("POST", NotionAPIBase+"/getAIUsageEligibilityV2", bytes.NewReader(reqBody))
 	if err != nil {
-		return 0, 0
+		return usage
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
@@ -359,23 +428,27 @@ func fetchSpaceAIUsage(tokenV2, userID, spaceID string) (used, limit int) {
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("[workspace] getAIUsageEligibilityV2 %s failed: %v", truncate(spaceID, 8), err)
-		return 0, 0
+		return usage
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
 		log.Printf("[workspace] getAIUsageEligibilityV2 %s -> %d: %s", truncate(spaceID, 8), resp.StatusCode, truncate(string(body), 160))
-		return 0, 0
+		return usage
 	}
 
-	// Top-level usage/limits describe the PREMIUM AI credit budget (the "400").
-	// basicCredits/free in the same payload are the separate 75 basic-credit
-	// allowance and are intentionally ignored here.
+	// The payload carries two independent budgets:
+	//   * top-level usage/limits    -> PREMIUM AI credits (the "400")
+	//   * basicCredits/limits.free  -> the basic allowance the ORDINARY agent
+	//     spends (the "75"). We surface both, the UI draws a bar for each.
 	var data struct {
 		Usage struct {
 			CurrentServicePeriod struct {
 				SpaceUsage float64 `json:"spaceUsage"`
 			} `json:"currentServicePeriod"`
+			Lifetime struct {
+				SpaceUsage float64 `json:"spaceUsage"`
+			} `json:"lifetime"`
 			TotalCreditBalance float64 `json:"totalCreditBalance"`
 		} `json:"usage"`
 		Limits struct {
@@ -385,17 +458,25 @@ func fetchSpaceAIUsage(tokenV2, userID, spaceID string) (used, limit int) {
 					MonthlyAllocated float64 `json:"monthlyAllocated"`
 				} `json:"perSource"`
 			} `json:"purchased"`
+			Free struct {
+				SpaceLimit float64 `json:"spaceLimit"`
+			} `json:"free"`
 		} `json:"limits"`
+		BasicCredits struct {
+			SpaceUsage float64 `json:"spaceUsage"`
+			SpaceLimit float64 `json:"spaceLimit"`
+		} `json:"basicCredits"`
 	}
 	if err := json.Unmarshal(body, &data); err != nil {
-		return 0, 0
+		return usage
 	}
 
-	limit = int(data.Limits.Purchased.TotalLimit)
+	// ---- premium credits ------------------------------------------------
+	limit := int(data.Limits.Purchased.TotalLimit)
 	if limit == 0 {
 		limit = int(data.Limits.Purchased.PerSource.MonthlyAllocated)
 	}
-	used = int(data.Usage.CurrentServicePeriod.SpaceUsage)
+	used := int(data.Usage.CurrentServicePeriod.SpaceUsage)
 	// Fallback: if the period counter was empty but a remaining balance is
 	// reported below the limit, derive used from (limit - balance).
 	if used == 0 && limit > 0 {
@@ -410,9 +491,130 @@ func fetchSpaceAIUsage(tokenV2, userID, spaceID string) (used, limit int) {
 	if limit > 0 && used > limit {
 		used = limit
 	}
+	usage.PremiumUsed = used
+	usage.PremiumLimit = limit
 
-	log.Printf("[workspace] %s ai credits used=%d limit=%d", truncate(spaceID, 8), used, limit)
-	return used, limit
+	// ---- basic credits (the ordinary agent) -------------------------------
+	basicUsed := int(data.BasicCredits.SpaceUsage)
+	if basicUsed == 0 {
+		basicUsed = int(data.Usage.Lifetime.SpaceUsage)
+	}
+	basicLimit := int(data.BasicCredits.SpaceLimit)
+	if basicLimit == 0 {
+		basicLimit = int(data.Limits.Free.SpaceLimit)
+	}
+	if basicUsed < 0 {
+		basicUsed = 0
+	}
+	// Deliberately NOT clamped: paid spaces keep counting basic usage far past
+	// the free allowance (Notion reports type "unlimited" there), and the raw
+	// number is the interesting part. Flag it instead.
+	usage.BasicUsed = basicUsed
+	usage.BasicLimit = basicLimit
+	usage.BasicUnlimited = basicLimit > 0 && basicUsed > basicLimit
+
+	log.Printf("[workspace] %s ai credits used=%d limit=%d | basic used=%d limit=%d unlimited=%v",
+		truncate(spaceID, 8), usage.PremiumUsed, usage.PremiumLimit,
+		usage.BasicUsed, usage.BasicLimit, usage.BasicUnlimited)
+	return usage
+}
+
+// fetchSpaceCreditRateLimit queries /api/v3/getCreditRateLimitStatus, the
+// endpoint behind the two gauges on Notion's own "Limits" tab. "window" is the
+// short SLIDING window (labelled "Rolling", currently 6h) that throttles bursts
+// and frees up again after resetsInSeconds, while "billingPeriodWindow" is the
+// allowance for the whole billing period (labelled "Monthly") that resets at
+// periodEndMs. Both arrive as a used/limit pair already scaled to 100, so the
+// percentages the dashboard shows are Notion's own numbers rather than
+// something we derive. OK stays false on any failure so the UI can hide both
+// bars instead of drawing two empty ones.
+func fetchSpaceCreditRateLimit(tokenV2, userID, spaceID string) (rl spaceRateLimit) {
+	if spaceID == "" {
+		return rl
+	}
+	client := getChromeHTTPClient(AppConfig.APITimeoutDuration())
+	reqBody, _ := json.Marshal(map[string]string{"spaceId": spaceID})
+	req, err := http.NewRequest("POST", NotionAPIBase+"/getCreditRateLimitStatus", bytes.NewReader(reqBody))
+	if err != nil {
+		return rl
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Cookie", "token_v2="+tokenV2)
+	req.Header.Set("User-Agent", AppConfig.Browser.UserAgent)
+	if userID != "" {
+		req.Header.Set("x-notion-active-user-header", userID)
+	}
+	req.Header.Set("x-notion-space-id", spaceID)
+	req.Header.Set("notion-client-version", DefaultClientVersion)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[workspace] getCreditRateLimitStatus %s failed: %v", truncate(spaceID, 8), err)
+		return rl
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 {
+		log.Printf("[workspace] getCreditRateLimitStatus %s -> %d: %s", truncate(spaceID, 8), resp.StatusCode, truncate(string(body), 160))
+		return rl
+	}
+
+	var data struct {
+		Window struct {
+			Window string  `json:"window"`
+			Used   float64 `json:"used"`
+			Limit  float64 `json:"limit"`
+		} `json:"window"`
+		BillingPeriodWindow struct {
+			Used        float64 `json:"used"`
+			Limit       float64 `json:"limit"`
+			PeriodEndMs float64 `json:"periodEndMs"`
+		} `json:"billingPeriodWindow"`
+		ResetsInSeconds float64 `json:"resetsInSeconds"`
+	}
+	if err := json.Unmarshal(body, &data); err != nil {
+		return rl
+	}
+
+	rl.RollingUsed = data.Window.Used
+	rl.RollingLimit = data.Window.Limit
+	rl.RollingWindow = data.Window.Window
+	rl.RollingResets = int64(data.ResetsInSeconds)
+	rl.PeriodUsed = data.BillingPeriodWindow.Used
+	rl.PeriodLimit = data.BillingPeriodWindow.Limit
+	rl.PeriodEndMs = int64(data.BillingPeriodWindow.PeriodEndMs)
+	// Only claim success once at least one window came back with a real cap;
+	// an empty 200 would otherwise render two permanently empty bars.
+	rl.OK = rl.RollingLimit > 0 || rl.PeriodLimit > 0
+
+	log.Printf("[workspace] %s rate limit rolling=%.2f/%.2f (%s, resets in %ds) period=%.2f/%.2f",
+		truncate(spaceID, 8), rl.RollingUsed, rl.RollingLimit, rl.RollingWindow, rl.RollingResets,
+		rl.PeriodUsed, rl.PeriodLimit)
+	return rl
+}
+
+// spaceAIUsage bundles the two credit budgets that
+// /api/v3/getAIUsageEligibilityV2 reports for a single workspace.
+type spaceAIUsage struct {
+	PremiumUsed    int
+	PremiumLimit   int
+	BasicUsed      int
+	BasicLimit     int
+	BasicUnlimited bool
+}
+
+// spaceRateLimit bundles the two throttling windows that
+// /api/v3/getCreditRateLimitStatus reports for a single workspace.
+type spaceRateLimit struct {
+	OK            bool
+	RollingUsed   float64
+	RollingLimit  float64
+	RollingWindow string
+	RollingResets int64
+	PeriodUsed    float64
+	PeriodLimit   float64
+	PeriodEndMs   int64
 }
 
 // HandleDiscoverWorkspaces discovers all workspaces for a token_v2

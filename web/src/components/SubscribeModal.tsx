@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { fetchAutoPayConfig, paySpaceWithSavedCard } from '../autopay'
+import { startTrial } from '../api'
 
 declare global {
   interface Window {
@@ -22,6 +23,18 @@ export const PLANS: PlanOption[] = [
   { id: 'business_monthly_eur_202505', name: 'Business', price: '23.50 EUR', interval: '/мес' },
   { id: 'business_yearly_eur_202505', name: 'Business', price: '234 EUR', interval: '/год' },
 ]
+
+// Способы оплаты в модалке «Оплатить»: обычная карта и бесплатный триал,
+// восстановленный из HAR-записи веб-клиента Notion (updateSubscription с
+// trialData и trialEnd вместо paymentMethodId).
+export type PayMethod = 'card' | 'trial'
+
+// Длительность триала. В захваченной сессии Notion просил ровно 14 дней
+// (custom_agents_business_reverse_14d), остальные значения — на пробу.
+export const TRIAL_DAYS = [7, 14, 30]
+
+// План, который улетал из веб-клиента вместе с триалом.
+export const TRIAL_DEFAULT_PLAN = 'business_monthly_eur_202505'
 
 export function SubscribeModal({
   onClose,
@@ -49,6 +62,11 @@ export function SubscribeModal({
   // re-typing the card.
   const [savedLast4, setSavedLast4] = useState('')
   const [savedLoading, setSavedLoading] = useState(false)
+  // Метод оплаты: карта через Stripe или триал вообще без карты.
+  const [method, setMethod] = useState<PayMethod>('card')
+  const [trialDays, setTrialDays] = useState(14)
+  const [trialCaptcha, setTrialCaptcha] = useState('')
+  const [trialLoading, setTrialLoading] = useState(false)
   const cardRef = useRef<HTMLDivElement>(null)
   // IMPORTANT: a single Stripe instance must be shared between the Card Element
   // and createPaymentMethod. Creating a second window.Stripe(...) for the
@@ -107,8 +125,39 @@ export function SubscribeModal({
     setStripeLoaded(true)
   }
 
+  // Триал без карты. Сервер повторяет запрос из HAR: POST
+  // /api/v3/updateSubscription с trialData + trialEnd и без paymentMethodId.
+  const handleTrial = async () => {
+    const trimmedToken = token.trim()
+    if (!trimmedToken) { setError('token_v2 пуст'); return }
+    setTrialLoading(true)
+    setError('')
+    setResult(null)
+    try {
+      const r = await startTrial({
+        token_v2: trimmedToken,
+        space_id: spaceId || '',
+        plan,
+        days: trialDays,
+        captcha_token: trialCaptcha.trim(),
+      })
+      if (r.error) {
+        setError(r.error)
+      } else {
+        const until = r.trial_end ? new Date(r.trial_end).toLocaleDateString('ru-RU') : ''
+        setResult(`Триал активирован (${r.subscription_status || 'trialing'})${until ? ' до ' + until : ''}`)
+        setTimeout(() => { onSuccess(); onClose() }, 2000)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Ошибка запроса')
+    } finally {
+      setTrialLoading(false)
+    }
+  }
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (method === 'trial') { await handleTrial(); return }
     const trimmedToken = token.trim()
     if (!trimmedToken) return
     const stripe = stripeRef.current
@@ -203,6 +252,23 @@ export function SubscribeModal({
             : <p>Вставьте <code className="font-mono bg-bg-secondary px-1.5 py-0.5 rounded text-[12px] text-text-primary">token_v2</code>, выберите план и введите данные карты.</p>}
         </div>
 
+        <div className="flex gap-2 mb-4">
+          <button
+            type="button"
+            onClick={() => { setMethod('card'); setError('') }}
+            className={`flex-1 px-3 py-2 rounded-lg border text-[12px] font-medium cursor-pointer transition-all ${method === 'card' ? 'border-text-primary bg-white/5 text-text-primary' : 'border-border bg-bg-card text-text-secondary hover:border-hairline-strong'}`}
+          >
+            Картой
+          </button>
+          <button
+            type="button"
+            onClick={() => { setMethod('trial'); setPlan(TRIAL_DEFAULT_PLAN); setError('') }}
+            className={`flex-1 px-3 py-2 rounded-lg border text-[12px] font-medium cursor-pointer transition-all ${method === 'trial' ? 'border-text-primary bg-white/5 text-text-primary' : 'border-border bg-bg-card text-text-secondary hover:border-hairline-strong'}`}
+          >
+            Триал без карты
+          </button>
+        </div>
+
         <form onSubmit={handleSubmit}>
           {!initialToken && (
             <>
@@ -237,10 +303,45 @@ export function SubscribeModal({
             ))}
           </div>
 
-          <label className="text-[11px] text-text-muted mb-1 block">Данные карты</label>
-          <div ref={cardRef} className="py-2.5 px-3 bg-bg-input border border-border rounded-lg min-h-[40px] mb-3" />
+          {/* Карточный блок НЕ размонтируем при переходе на триал: внутри живёт
+              Stripe Element, поэтому просто прячем его через hidden. */}
+          <div className={method === 'card' ? '' : 'hidden'}>
+            <label className="text-[11px] text-text-muted mb-1 block">Данные карты</label>
+            <div ref={cardRef} className="py-2.5 px-3 bg-bg-input border border-border rounded-lg min-h-[40px] mb-3" />
+          </div>
 
-          {spaceId && savedLast4 && (
+          {method === 'trial' && (
+            <div className="mb-3 p-3 bg-bg-secondary border border-border rounded-lg">
+              <div className="text-[11px] text-text-muted mb-1">Триал без карты</div>
+              <p className="text-[12px] text-text-secondary mb-2">
+                Метод из HAR: тот же <code className="font-mono text-[11px] text-text-primary">updateSubscription</code>, но с <code className="font-mono text-[11px] text-text-primary">trialData</code> и <code className="font-mono text-[11px] text-text-primary">trialEnd</code> вместо карты. Notion отвечает <span className="text-text-primary">trialing</span>, деньги не списываются.
+              </p>
+              <label className="text-[11px] text-text-muted mb-1 block">Длительность</label>
+              <div className="flex gap-2 mb-3">
+                {TRIAL_DAYS.map(d => (
+                  <button
+                    key={d}
+                    type="button"
+                    onClick={() => setTrialDays(d)}
+                    className={`flex-1 py-1.5 rounded-lg border text-[12px] cursor-pointer transition-all ${trialDays === d ? 'border-text-primary bg-white/5 text-text-primary' : 'border-border bg-bg-card text-text-secondary hover:border-hairline-strong'}`}
+                  >
+                    {d} дней
+                  </button>
+                ))}
+              </div>
+              <label className="text-[11px] text-text-muted mb-1 block">captchaToken (если Notion попросит)</label>
+              <textarea
+                value={trialCaptcha}
+                onChange={e => setTrialCaptcha(e.target.value)}
+                placeholder="P1_eyJ..."
+                rows={2}
+                className="w-full py-2 px-3 bg-bg-input border border-border rounded-lg text-[12px] text-text-primary outline-none focus:border-notion-blue transition-all placeholder:text-text-muted resize-none font-mono"
+              />
+              <div className="text-[10px] text-text-muted mt-1.5">Сначала пробуем без captcha (3 попытки). Если Notion ответит «Trial activation is not allowed» — вставьте свежий hCaptcha-токен из DevTools и повторите.</div>
+            </div>
+          )}
+
+          {method === 'card' && spaceId && savedLast4 && (
             <div className="mb-3 p-3 bg-bg-secondary border border-border rounded-lg">
               <div className="flex items-center justify-between gap-2">
                 <div className="min-w-0">
@@ -260,19 +361,21 @@ export function SubscribeModal({
             </div>
           )}
 
-          <label className="text-[11px] text-text-muted mb-1 block">Страна</label>
-          <select
-            value={country}
-            onChange={e => setCountry(e.target.value)}
-            className="w-full py-2 px-3 bg-bg-input border border-border rounded-lg text-[13px] text-text-primary outline-none focus:border-notion-blue transition-all mb-3"
-          >
-            <option value="DE">DE (Germany)</option>
-            <option value="US">US (United States)</option>
-            <option value="GB">GB (United Kingdom)</option>
-            <option value="KR">KR (South Korea)</option>
-            <option value="CN">CN (China)</option>
-            <option value="RU">RU (Russia)</option>
-          </select>
+          <div className={method === 'card' ? '' : 'hidden'}>
+            <label className="text-[11px] text-text-muted mb-1 block">Страна</label>
+            <select
+              value={country}
+              onChange={e => setCountry(e.target.value)}
+              className="w-full py-2 px-3 bg-bg-input border border-border rounded-lg text-[13px] text-text-primary outline-none focus:border-notion-blue transition-all mb-3"
+            >
+              <option value="DE">DE (Germany)</option>
+              <option value="US">US (United States)</option>
+              <option value="GB">GB (United Kingdom)</option>
+              <option value="KR">KR (South Korea)</option>
+              <option value="CN">CN (China)</option>
+              <option value="RU">RU (Russia)</option>
+            </select>
+          </div>
 
           {error && <div className="text-err text-[12px] mb-2 px-1">{error}</div>}
           {result && (
@@ -286,9 +389,11 @@ export function SubscribeModal({
               className="flex-1 h-11 bg-bg-card hover:bg-bg-secondary text-text-primary rounded-full text-[14px] font-medium cursor-pointer transition-colors border border-border">
               Отмена
             </button>
-            <button type="submit" disabled={loading || savedLoading || !token.trim() || !stripeLoaded || !!result}
+            <button type="submit" disabled={loading || savedLoading || trialLoading || !token.trim() || !!result || (method === 'card' && !stripeLoaded)}
               className="flex-1 h-11 bg-white hover:bg-white/90 text-black rounded-full text-[14px] font-medium cursor-pointer transition-colors border-none disabled:opacity-40 disabled:cursor-not-allowed">
-              {loading ? 'Обработка...' : 'Оплатить новой картой'}
+              {method === 'trial'
+                ? (trialLoading ? 'Активирую триал...' : `Активировать триал на ${trialDays} дней`)
+                : (loading ? 'Обработка...' : 'Оплатить новой картой')}
             </button>
           </div>
         </form>

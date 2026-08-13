@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react'
+import { DEFAULT_PARTICLES, type ParticleConfig } from '../particleSettings'
 
 // Interactive particle-network background. Particles drift, link to nearby
 // neighbours and to the cursor with hairline strands, and are gently pulled
@@ -8,12 +9,25 @@ import { useEffect, useRef } from 'react'
 // accent blue. Edges fade out via a radial CSS mask so it reads as ambient
 // texture rather than a hard rectangle. Honors prefers-reduced-motion by drawing
 // a single static frame.
-export function ParticleField({ active = false }: { active?: boolean }) {
+//
+// `cfg` — пользовательские настройки из шестерёнки рядом с «Новый чат».
+// Скорость, прозрачность, радиус связей, курсор и осколки читаются на каждом
+// кадре из живого зеркала cfgRef, поэтому применяются мгновенно. Количество
+// частиц и полное выключение требуют пересборки холста и потому стоят в
+// зависимостях эффекта.
+export function ParticleField({ active = false, cfg }: { active?: boolean; cfg?: ParticleConfig }) {
+  const conf = cfg || DEFAULT_PARTICLES
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const activeRef = useRef(active)
   useEffect(() => { activeRef.current = active }, [active])
+  const cfgRef = useRef(conf)
+  useEffect(() => { cfgRef.current = conf }, [conf])
+
+  const enabled = conf.enabled
+  const density = conf.density
 
   useEffect(() => {
+    if (!enabled) return
     const canvas = canvasRef.current
     if (!canvas) return
     const ctx = canvas.getContext('2d')
@@ -33,7 +47,8 @@ export function ParticleField({ active = false }: { active?: boolean }) {
     const mouse = { x: -9999, y: -9999, on: false }
 
     const seed = () => {
-      const target = Math.min(72, Math.max(24, Math.round((width * height) / 17000)))
+      const base = Math.min(72, Math.max(24, Math.round((width * height) / 17000)))
+      const target = Math.max(3, Math.round(base * cfgRef.current.density))
       particles = []
       for (let i = 0; i < target; i++) {
         particles.push({
@@ -48,6 +63,7 @@ export function ParticleField({ active = false }: { active?: boolean }) {
     // Burst a particle into a handful of fragments flying off in random
     // directions when it hits an edge.
     const shatter = (x: number, y: number) => {
+      if (!cfgRef.current.shatter) return
       if (frags.length > FRAG_CAP) return
       const n = 4 + Math.floor(Math.random() * 3)
       for (let k = 0; k < n; k++) {
@@ -78,18 +94,21 @@ export function ParticleField({ active = false }: { active?: boolean }) {
     }
     const onLeave = () => { mouse.on = false; mouse.x = -9999; mouse.y = -9999 }
 
-    const LINK = 118
-    const MOUSE_LINK = 168
     let raf = 0
 
     const frame = () => {
+      const c = cfgRef.current
       const hot = activeRef.current
-      const speed = hot ? 1.8 : 1
+      const op = c.opacity
+      const speed = (hot ? 1.8 : 1) * c.speed
       const rgb = hot ? '60,150,255' : '255,255,255'
-      const lineBase = hot ? 0.42 : 0.16
-      const mouseLineBase = hot ? 0.6 : 0.3
-      const dotAlpha = hot ? 0.85 : 0.4
+      const lineBase = (hot ? 0.42 : 0.16) * op
+      const mouseLineBase = (hot ? 0.6 : 0.3) * op
+      const dotAlpha = (hot ? 0.85 : 0.4) * op
       const dotR = hot ? 1.8 : 1.4
+      const LINK = c.link
+      const MOUSE_LINK = c.link * 1.42
+      const mouseOn = mouse.on && c.mouse
       ctx.clearRect(0, 0, width, height)
 
       for (const p of particles) {
@@ -101,7 +120,7 @@ export function ParticleField({ active = false }: { active?: boolean }) {
         if (p.y <= 0) { p.y = 0; p.vy = Math.abs(p.vy) || 0.2; hit = true }
         else if (p.y >= height) { p.y = height; p.vy = -(Math.abs(p.vy) || 0.2); hit = true }
         if (hit) shatter(p.x, p.y)
-        if (mouse.on) {
+        if (mouseOn) {
           const dx = mouse.x - p.x
           const dy = mouse.y - p.y
           const d2 = dx * dx + dy * dy
@@ -144,7 +163,7 @@ export function ParticleField({ active = false }: { active?: boolean }) {
             ctx.stroke()
           }
         }
-        if (mouse.on) {
+        if (mouseOn) {
           const dx = a.x - mouse.x
           const dy = a.y - mouse.y
           const d = Math.hypot(dx, dy)
@@ -163,13 +182,13 @@ export function ParticleField({ active = false }: { active?: boolean }) {
       // Fragments: tiny shrinking sparks.
       for (const f of frags) {
         const a = f.life < 0 ? 0 : f.life
-        ctx.fillStyle = `rgba(${rgb},${(a * (hot ? 0.9 : 0.6)).toFixed(3)})`
+        ctx.fillStyle = `rgba(${rgb},${(a * (hot ? 0.9 : 0.6) * op).toFixed(3)})`
         ctx.beginPath()
         ctx.arc(f.x, f.y, Math.max(0.4, 1.6 * a), 0, Math.PI * 2)
         ctx.fill()
       }
 
-      ctx.fillStyle = `rgba(${rgb},${dotAlpha})`
+      ctx.fillStyle = `rgba(${rgb},${dotAlpha.toFixed(3)})`
       for (const p of particles) {
         ctx.beginPath()
         ctx.arc(p.x, p.y, dotR, 0, Math.PI * 2)
@@ -198,7 +217,10 @@ export function ParticleField({ active = false }: { active?: boolean }) {
       window.removeEventListener('mousemove', onMove)
       window.removeEventListener('mouseout', onLeave)
     }
-  }, [])
+  }, [enabled, density])
+
+  // Выключено в настройках — не рисуем вообще ничего (нет ни холста, ни rAF).
+  if (!enabled) return null
 
   return (
     <canvas

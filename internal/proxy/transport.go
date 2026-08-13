@@ -51,6 +51,11 @@ func RebuildChromeTransport() {
 	if chromeRoundTripperH2 != nil {
 		chromeRoundTripperH2.CloseIdleConnections()
 	}
+	// The S3 upload transport dials through the same proxy setting, so it has
+	// to forget its pooled connections too.
+	if s3RoundTripper != nil {
+		s3RoundTripper.CloseIdleConnections()
+	}
 }
 
 func dialChromeTLS(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -100,6 +105,61 @@ func dialChromeTLS(ctx context.Context, network, addr string) (net.Conn, error) 
 func getChromeHTTPClient(timeout time.Duration) *http.Client {
 	return &http.Client{
 		Transport: getChromeRoundTripper(),
+		Timeout:   timeout,
+	}
+}
+
+// Presigned S3 uploads must NOT use the Chrome round tripper. That one is a
+// pure http2.Transport: it speaks HTTP/2 on whatever connection DialTLSContext
+// hands it, without ever looking at ALPN. Notion's bucket
+// (prod-files-secure.s3.us-west-2.amazonaws.com) answers presigned POSTs in
+// HTTP/1.1 - the browser capture records httpVersion "HTTP/1.1" for exactly
+// this request - so the HTTP/2 framer reads the plain "HTTP/1.1 204" status
+// line as a frame header and fails with
+//
+//	http2: frame too large, note that the frame header looked like an HTTP/1.1 header
+//
+// Hence a separate transport with HTTP/2 disabled at every level: ALPN offers
+// http/1.1 only, ForceAttemptHTTP2 is off, and TLSNextProto is a non-nil empty
+// map so net/http never installs the h2 upgrade on its own.
+//
+// The dial still goes through netutil.DialThroughProxy with the configured
+// AppConfig.Proxy.NotionProxy, so an upload leaves the machine over the same
+// hop as the rest of the Notion traffic instead of leaking the real address.
+var (
+	s3RoundTripperOnce sync.Once
+	s3RoundTripper     *http.Transport
+)
+
+func getS3RoundTripper() *http.Transport {
+	s3RoundTripperOnce.Do(func() {
+		s3RoundTripper = &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				proxyURL := ""
+				if AppConfig != nil {
+					proxyURL = AppConfig.NotionProxyURL()
+				}
+				return netutil.DialThroughProxy(ctx, network, addr, proxyURL)
+			},
+			TLSClientConfig: &tls.Config{
+				MinVersion: tls.VersionTLS12,
+				NextProtos: []string{"http/1.1"},
+			},
+			ForceAttemptHTTP2:     false,
+			TLSNextProto:          map[string]func(authority string, c *tls.Conn) http.RoundTripper{},
+			MaxIdleConns:          8,
+			IdleConnTimeout:       60 * time.Second,
+			TLSHandshakeTimeout:   30 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+		}
+	})
+	return s3RoundTripper
+}
+
+// getS3HTTPClient returns the HTTP/1.1-only client used for presigned S3 POSTs.
+func getS3HTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Transport: getS3RoundTripper(),
 		Timeout:   timeout,
 	}
 }

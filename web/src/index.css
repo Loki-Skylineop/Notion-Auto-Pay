@@ -66,6 +66,20 @@ body {
   background: rgba(255, 255, 255, 0.26);
 }
 
+/* Surfaces that scroll without showing a bar: the chat log and its thread list,
+   the composer, expanded step payloads, code blocks and every dropdown menu
+   (the model picker included). Wheel, touch, keyboard and drag scrolling keep
+   working -- only the visible bar is gone. */
+.no-scrollbar {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.no-scrollbar::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
@@ -213,4 +227,25 @@ body {
   .stream-caret { animation: none; }
   .dot-flash { animation: none; opacity: 0.6; }
   .hero-glow, .hero-float-a, .hero-float-b, .brand-star, .hero-sweep, .dropdown-pop { animation: none; }
+}
+
+/* --- chat attachments: chip pop-in + upload shimmer --------------------- */
+@keyframes chip-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes upload-shimmer {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
 }

@@ -93,7 +93,7 @@ export function Dropdown({
       {open ? (
         <div
           role="listbox"
-          className={`dropdown-pop absolute z-50 ${menuPos} ${menuAlign} max-h-64 overflow-y-auto rounded-md border border-white/[0.1] bg-[#0c0c0c] py-1 shadow-float ${menuClassName}`}
+          className={`dropdown-pop no-scrollbar absolute z-50 ${menuPos} ${menuAlign} max-h-64 overflow-y-auto rounded-md border border-white/[0.1] bg-[#0c0c0c] py-1 shadow-float ${menuClassName}`}
         >
           {options.length === 0 ? (
             <div className="px-2.5 py-1.5 text-[12px] text-text-muted">Нет вариантов</div>

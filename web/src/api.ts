@@ -405,7 +405,60 @@ export async function subscribe(tokenV2: string, paymentMethodId: string, plan: 
   return data
 }
 
+// --- Trial API ---
+
+export interface TrialResult {
+  status?: string
+  error?: string
+  email?: string
+  space_id?: string
+  plan?: string
+  days?: number
+  trial_end?: string
+  subscription_status?: string
+  invoice_url?: string
+  attempts?: number
+}
+
+export interface TrialInput {
+  token_v2: string
+  space_id?: string
+  plan?: string
+  days?: number
+  captcha_token?: string
+}
+
+// Активация бесплатного триала для одного пространства — карта не нужна.
+// Сервер повторяет запрос, снятый с веб-клиента Notion (HAR): тот же
+// /api/v3/updateSubscription, но с trialData + trialEnd и без paymentMethodId.
+// Успех выглядит как {"subscriptionStatus":"trialing", "invoiceUrl": "..."}.
+export async function startTrial(input: TrialInput): Promise<TrialResult> {
+  const resp = await fetch('/admin/subscribe/trial', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify(input),
+  })
+  const text = await resp.text()
+  let data: TrialResult = {}
+  try { data = text ? JSON.parse(text) : {} } catch { data = {} }
+  if (!resp.ok || data.error) return { error: data.error || `HTTP ${resp.status}` }
+  return data
+}
+
 // --- Workspace Discovery API ---
+
+// One MCP server integration attached to a workspace. The backend merges the
+// /api/v3/listExternalConnections entry (status + URL) with its backing
+// workflow_module record (name, icon, tool list).
+export interface McpServerInfo {
+  id: string
+  name?: string
+  icon?: string
+  url?: string
+  status?: string
+  tools_count?: number
+}
 
 export interface WorkspaceInfo {
   space_id: string
@@ -417,6 +470,15 @@ export interface WorkspaceInfo {
   region: string
   cell: string
   is_subscribed: boolean
+  // True when at least one MCP server is in the "connected" state. Drives the
+  // indicator the pool draws next to the workspace name.
+  mcp_connected?: boolean
+  mcp_servers?: McpServerInfo[]
+  // Notion's "use additional credits" switch, read from
+  // space.settings.ai_credit_overage_policy: "disabled" when off,
+  // "all_workspace_members" when on. overage_enabled is the ready-made boolean.
+  overage_policy?: string
+  overage_enabled?: boolean
 }
 
 export interface DiscoverResult {
@@ -426,6 +488,42 @@ export interface DiscoverResult {
   token_v2?: string
   spaces?: WorkspaceInfo[]
   error?: string
+}
+
+export interface SetOverageParams {
+  tokenV2: string
+  userId?: string
+  spaceId: string
+  enabled: boolean
+}
+
+export interface SetOverageResult {
+  ok?: boolean
+  policy?: string
+  enabled?: boolean
+  error?: string
+}
+
+// setOverage flips a workspace's "use additional credits" switch. The server
+// replays the same saveTransactionsFanout transaction the Notion web client
+// sends from its AI settings page (AiSettings.toggleCreditOverage).
+export async function setOverage(p: SetOverageParams): Promise<SetOverageResult> {
+  const resp = await fetch('/admin/overage/toggle', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({
+      token_v2: p.tokenV2,
+      user_id: p.userId || '',
+      space_id: p.spaceId,
+      enabled: p.enabled,
+    }),
+  })
+  const data = await resp.json().catch(() => null)
+  if (!data || typeof data !== 'object') {
+    return { error: 'Сервер вернул некорректный ответ' }
+  }
+  return data as SetOverageResult
 }
 
 export async function discoverWorkspaces(tokenV2: string): Promise<DiscoverResult> {
@@ -438,6 +536,183 @@ export async function discoverWorkspaces(tokenV2: string): Promise<DiscoverResul
   const data = await readJson<DiscoverResult>(resp, 'Discovery endpoint returned invalid response')
   if (!resp.ok) return { error: data.error || `HTTP ${resp.status}` }
   return data
+}
+
+// --- Workspace Creation API ---
+// Создание новых пространств для одного аккаунта. Имена генерирует сервер
+// (см. internal/proxy/workspace_create.go): каждый вызов /createSpace он
+// дополняет транзакцией space_view, иначе пространство не попадает в сайдбар.
+
+export interface CreatedWorkspace {
+  space_id: string
+  space_view_id?: string
+  name: string
+}
+
+export interface CreateWorkspacesResult {
+  user_id?: string
+  requested?: number
+  created: CreatedWorkspace[]
+  errors?: string[]
+  error?: string
+}
+
+// createWorkspaces создаёт count пространств со случайными именами. Сервер
+// работает последовательно и возвращает частичный результат, поэтому created
+// может быть короче запрошенного, а errors — содержать причины отказов.
+// --- MCP connect API ---
+
+export interface ConnectMcpParams {
+  tokenV2: string
+  userId: string
+  spaceId: string
+  spaceViewId: string
+  serverUrl: string
+  headerName?: string
+  headerValue?: string
+  name?: string
+  icon?: string
+}
+
+export interface ConnectMcpResult {
+  ok?: boolean
+  module_id?: string
+  name?: string
+  icon?: string
+  server_url?: string
+  tools_count?: number
+  error?: string
+}
+
+// connectMcp attaches an MCP server to one workspace. The server replays the
+// same four calls the Notion web client makes when you add a server by hand.
+export async function connectMcp(p: ConnectMcpParams): Promise<ConnectMcpResult> {
+  const resp = await fetch('/admin/mcp/connect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({
+      token_v2: p.tokenV2,
+      user_id: p.userId,
+      space_id: p.spaceId,
+      space_view_id: p.spaceViewId,
+      server_url: p.serverUrl,
+      header_name: p.headerName || '',
+      header_value: p.headerValue || '',
+      name: p.name || '',
+      icon: p.icon || '',
+    }),
+  })
+  const data = await readJson<ConnectMcpResult>(resp, 'Сервер подключения MCP вернул некорректный ответ')
+  if (!resp.ok) {
+    return { ...data, ok: false, error: data.error || `HTTP ${resp.status}` }
+  }
+  return { ...data, ok: data.ok !== false }
+}
+
+// disconnectMcp отключает MCP-сервер от пространства. Сервер повторяет ровно
+// одну транзакцию веб-клиента (ConnectionSurfaceTabs.disconnectPersonalMcpServer):
+// убирает модуль из space_view.settings.agent_chat_modules и гасит сам
+// workflow_module флагом alive:false. Отдельного delete-эндпоинта у Notion нет.
+export interface DisconnectMcpParams {
+  tokenV2: string
+  userId: string
+  spaceId: string
+  spaceViewId?: string
+  // Достаточно любого из двух: id модуля или URL сервера.
+  moduleId?: string
+  serverUrl?: string
+}
+
+export interface DisconnectMcpResult {
+  ok?: boolean
+  module_id?: string
+  error?: string
+}
+
+export async function disconnectMcp(p: DisconnectMcpParams): Promise<DisconnectMcpResult> {
+  const resp = await fetch('/admin/mcp/disconnect', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({
+      token_v2: p.tokenV2,
+      user_id: p.userId,
+      space_id: p.spaceId,
+      space_view_id: p.spaceViewId || '',
+      module_id: p.moduleId || '',
+      server_url: p.serverUrl || '',
+    }),
+  })
+  const data = await readJson<DisconnectMcpResult>(resp, 'Сервер отключения MCP вернул некорректный ответ')
+  if (!resp.ok) {
+    return { ...data, ok: false, error: data.error || `HTTP ${resp.status}` }
+  }
+  return { ...data, ok: data.ok !== false }
+}
+
+export async function createWorkspaces(tokenV2: string, count: number): Promise<CreateWorkspacesResult> {
+  const resp = await fetch('/admin/workspaces/create', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ token_v2: tokenV2, count }),
+  })
+  const data = await readJson<CreateWorkspacesResult>(resp, 'Сервер создания пространств вернул некорректный ответ')
+  if (!resp.ok) {
+    return {
+      created: data.created || [],
+      errors: data.errors,
+      error: data.error || `HTTP ${resp.status}`,
+    }
+  }
+  return { ...data, created: data.created || [] }
+}
+
+// --- Workspace deletion API ---
+// Удаление пространства. Сервер повторяет то же, что делает веб-клиент Notion:
+// один enqueueTask с eventName "deleteSpace", а затем опрос getTasks до
+// состояния success (см. internal/proxy/workspace_delete.go). Операция
+// необратима, подтверждение целиком на стороне интерфейса.
+
+export interface DeletedWorkspace {
+  space_id: string
+  task_id?: string
+  // Состояние задачи на стороне Notion: "success", "in_progress" или "failure".
+  state?: string
+}
+
+export interface DeleteWorkspacesResult {
+  user_id?: string
+  requested?: number
+  deleted: DeletedWorkspace[]
+  errors?: string[]
+  error?: string
+}
+
+// deleteWorkspaces удаляет перечисленные пространства одного аккаунта. Сервер
+// работает последовательно и возвращает частичный результат, поэтому deleted
+// может быть короче запроса, а errors — содержать причины отказов.
+export async function deleteWorkspaces(
+  tokenV2: string,
+  spaceIds: string[],
+  userId?: string,
+): Promise<DeleteWorkspacesResult> {
+  const resp = await fetch('/admin/workspaces/delete', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ token_v2: tokenV2, user_id: userId || '', space_ids: spaceIds }),
+  })
+  const data = await readJson<DeleteWorkspacesResult>(resp, 'Сервер удаления пространств вернул некорректный ответ')
+  if (!resp.ok) {
+    return {
+      deleted: data.deleted || [],
+      errors: data.errors,
+      error: data.error || `HTTP ${resp.status}`,
+    }
+  }
+  return { ...data, deleted: data.deleted || [] }
 }
 
 // --- Chat API ---
@@ -459,6 +734,14 @@ export interface ChatModel {
   family: string
   group: string // "fast" | "intelligent"
   disabled: boolean
+  // Reasoning efforts this specific model accepts, mirrored from Notion's
+  // modelConfiguration.supportedReasoningEfforts. The sets really do differ:
+  // GPT-5.6 Sol -> none/low/medium/high/xhigh/max, Opus 5 -> low/medium/high/max,
+  // Opus 4.7 -> high only, Haiku 4.5 -> [] (the effort picker hides itself).
+  efforts?: string[]
+  // Notion's own default effort for this model, used as a fallback when the
+  // "strongest supported" rule cannot be applied.
+  default_effort?: string
 }
 
 export interface ChatThread {
@@ -484,6 +767,16 @@ export interface ChatStep {
   server?: string
   input?: string
   result?: string
+}
+
+// One segment of an assistant turn: either a run of consecutive actions or a
+// paragraph of answer text. A turn is the ordered ribbon of these blocks, so a
+// log alternates action groups and paragraphs the way Notion does instead of
+// showing one huge action list followed by every paragraph glued together.
+export interface ChatBlock {
+  kind: 'steps' | 'text'
+  steps?: ChatStep[]
+  text?: string
 }
 
 // One option the user can pick in an agent survey.
@@ -525,6 +818,7 @@ export interface ChatHistoryMessage {
   role: 'user' | 'assistant'
   text: string
   steps?: ChatStep[]
+  blocks?: ChatBlock[]
   survey?: ChatSurvey
   pages?: ChatPageRef[]
 }
@@ -613,6 +907,7 @@ export interface ChatSendResult {
   title?: string
   text: string
   steps?: ChatStep[]
+  blocks?: ChatBlock[]
   survey?: ChatSurvey
   pages?: ChatPageRef[]
 }
@@ -635,9 +930,17 @@ export type ChatSendParams = ChatAccountRef & {
   timezone?: string
   agent: string // "default" or a workflowId
   model?: string // codename, only honoured for the built-in assistant
+  reasoning_effort?: string // thinking budget, validated against the model's own set
   context_page_id?: string
   thread_id?: string
   message: string
+  // Thread id minted by an earlier attachment upload. A brand-new chat has no
+  // thread yet, so the file is bound to a client-side id that the very first
+  // message has to reuse - otherwise the file and the text end up apart.
+  pending_thread_id?: string
+  // Files already uploaded with chatUpload. The server replays them as
+  // "computer-file" transcript steps right in front of the text.
+  attachments?: ChatAttachment[]
 }
 
 export async function chatSend(params: ChatSendParams): Promise<ChatSendResult> {
@@ -673,6 +976,82 @@ export async function chatStream(params: ChatSendParams, onStatus: (s: ChatStatu
 // shared by chatStream + chatSurvey: {event:"status"} rows drive the live
 // agent step tree, the final {event:"done"} carries the answer plus any
 // follow-up survey and the pages the agent created/shared this turn.
+// One file already stored in Notion's bucket, ready to ride along with the
+// next message. Mirrors the Go chatAttachment struct.
+export interface ChatAttachment {
+  file_url: string
+  file_name: string
+  content_type: string
+  file_size: number
+}
+
+export interface ChatUploadResult {
+  thread_id: string
+  attachment: ChatAttachment
+}
+
+// chatUpload pushes one file through the proxy into Notion's S3 bucket
+// (getUploadFileUrlForAssistantChatTranscriptUpload + presigned POST) and
+// returns the attachment descriptor plus the thread the file was bound to.
+// XMLHttpRequest is used instead of fetch purely for upload.onprogress, which
+// drives the composer's progress animation.
+export function chatUpload(
+  file: File,
+  ref: ChatAccountRef & { thread_id?: string },
+  onProgress?: (ratio: number) => void,
+): Promise<ChatUploadResult> {
+  return new Promise<ChatUploadResult>((resolve, reject) => {
+    const form = new FormData()
+    form.append('token_v2', ref.token_v2)
+    form.append('user_id', ref.user_id || '')
+    form.append('space_id', ref.space_id)
+    form.append('thread_id', ref.thread_id || '')
+    form.append('file', file, file.name)
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', '/admin/chat/upload')
+    xhr.withCredentials = true
+    xhr.upload.onprogress = (e: ProgressEvent) => {
+      if (onProgress && e.lengthComputable && e.total > 0) onProgress(e.loaded / e.total)
+    }
+    xhr.onload = () => {
+      let data: { error?: string; thread_id?: string; attachment?: ChatAttachment } | null = null
+      try {
+        data = JSON.parse(xhr.responseText)
+      } catch {
+        /* server returned a non-JSON error page */
+      }
+      if (xhr.status >= 200 && xhr.status < 300 && data && data.attachment) {
+        if (onProgress) onProgress(1)
+        resolve({ thread_id: data.thread_id || '', attachment: data.attachment })
+        return
+      }
+      reject(new Error((data && data.error) || `HTTP ${xhr.status}`))
+    }
+    xhr.onerror = () => reject(new Error('Не удалось загрузить файл'))
+    xhr.onabort = () => reject(new Error('Не удалось загрузить файл'))
+    xhr.send(form)
+  })
+}
+
+export type ChatEditParams = ChatSendParams & { thread_id: string; message_id?: string }
+
+// chatEdit rewrites the last user message of a thread and re-runs the agent on
+// it. The server drops the old answer first (listRemove) and streams the new
+// one back as the very same ndjson protocol chatStream uses.
+export async function chatEdit(params: ChatEditParams, onStatus: (s: ChatStatus) => void): Promise<ChatSendResult> {
+  const resp = await fetch('/admin/chat/edit', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
+    credentials: 'same-origin',
+    body: JSON.stringify(params),
+  })
+  if (!resp.ok || !resp.body) {
+    const data = await resp.json().catch(() => null)
+    throw new Error((data && data.error) || `HTTP ${resp.status}`)
+  }
+  return readChatNdjson(resp, onStatus)
+}
+
 async function readChatNdjson(resp: Response, onStatus: (s: ChatStatus) => void): Promise<ChatSendResult> {
   if (!resp.body) throw new Error('Пустой ответ от сервера')
   const reader = resp.body.getReader()
@@ -729,6 +1108,7 @@ export type ChatSurveyParams = ChatAccountRef & {
   timezone?: string
   agent: string
   model?: string
+  reasoning_effort?: string
   thread_id: string
   survey_step_id: string
   questions?: ChatSurveyQuestion[]

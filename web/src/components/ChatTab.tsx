@@ -2,11 +2,13 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import {
   chatAgents,
   chatDelete,
+  chatEdit,
   chatHistory,
   chatModels,
   chatStream,
   chatSurvey,
   chatThreads,
+  chatUpload,
   type ChatAgent,
   type ChatModel,
   type ChatStatus,
@@ -18,6 +20,8 @@ import {
 import { fetchAutoPayConfig, type ServerAutoPayConfig } from '../autopay'
 import type { DiscoveredAccount } from './WorkspacePool'
 import { ParticleField } from './ParticleField'
+import { ParticleSettings } from './ParticleSettings'
+import { loadParticleConfig, type ParticleConfig } from '../particleSettings'
 import { Dropdown } from './Dropdown'
 import { chatSync, type ChatSyncResult } from '../chatSync'
 import {
@@ -36,6 +40,11 @@ import {
   loadOuterWidth,
   ACTIVE_SPACE_KEY,
   ACTIVE_THREAD_KEY,
+  loadEfforts,
+  saveEffort,
+  resolveEffort,
+  loadRememberedModels,
+  saveRememberedModel,
   hashMessages,
   readCachedHistory,
   writeCachedHistory,
@@ -55,7 +64,11 @@ import {
   type ChatMessage,
 } from './ChatTabParts'
 
-export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
+// active — видна ли вкладка «Чат» прямо сейчас. Компонент смонтирован всегда
+// (иначе уход на «Оплату» рвал бы идущий ход), но пока он спрятан, у панели
+// нулевая высота: холст частиц крутить незачем, а автоскролл всё равно ничего
+// не прокрутит — и лог открылся бы в самом начале переписки.
+export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccount[]; active?: boolean }) {
   const [autoCfg, setAutoCfg] = useState<ServerAutoPayConfig | null>(null)
   const [spaceKey, setSpaceKey] = useState(() => {
     try {
@@ -68,6 +81,11 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const [agentId, setAgentId] = useState('default')
   const [models, setModels] = useState<ChatModel[]>([])
   const [selectedModel, setSelectedModel] = useState('')
+  // Reasoning effort is remembered per model codename and hydrated from
+  // localStorage on mount, so reloading the page restores the user pick
+  // instead of snapping back to the default.
+  const [rememberedEfforts, setRememberedEfforts] = useState<Record<string, string>>(loadEfforts)
+  const [selectedEffort, setSelectedEffort] = useState('')
   const [threads, setThreads] = useState<ChatThread[]>([])
   const [activeThreadId, setActiveThreadId] = useState('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
@@ -79,6 +97,16 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const [historyLoading, setHistoryLoading] = useState(false)
   const [threadsLoading, setThreadsLoading] = useState(false)
   const [error, setError] = useState('')
+  // Files already uploaded to Notion and waiting to travel with the next
+  // message, plus the uploads still in flight (they drive the progress chips).
+  const [attachments, setAttachments] = useState<{ file_url: string; file_name: string; content_type: string; file_size: number }[]>([])
+  const [uploads, setUploads] = useState<{ id: string; name: string; progress: number }[]>([])
+  // A brand-new chat has no thread yet: the upload endpoint mints an id and the
+  // first message has to reuse it, otherwise file and text land in two threads.
+  const [pendingThreadId, setPendingThreadId] = useState('')
+  // Index (inside `messages`) of the user message currently being edited.
+  const [editingIdx, setEditingIdx] = useState(-1)
+  const [editBusy, setEditBusy] = useState(false)
   const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
   const [sidebarOpen, setSidebarOpen] = useState(false)
   // Desktop splitter: track viewport class + the resizable sidebar width.
@@ -91,6 +119,13 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   // this client didn't start (e.g. after a reload, or a turn running on another
   // device) -- drives the "agent is working" indicator on reopen.
   const [remoteBusy, setRemoteBusy] = useState(false)
+  // threadId -> идёт ли в нём прямо сейчас ход агента. Заполняется опросом всех
+  // известных чатов, а не только открытого: отсюда берётся крутящийся кружок
+  // слева в списке «История».
+  const [busyThreads, setBusyThreads] = useState<Record<string, boolean>>({})
+  // Настройки летающих частиц (шестерёнка рядом с «Новый чат»). Держим их в
+  // состоянии, чтобы поле перерисовалось сразу после движения ползунка.
+  const [particleCfg, setParticleCfg] = useState<ParticleConfig>(loadParticleConfig)
   const logRef = useRef<HTMLDivElement>(null)
   const instantScrollRef = useRef(false)
   // While the user is lazily loading older messages (scrolling up) or a
@@ -103,10 +138,20 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   const streamThreadIdRef = useRef('')
   const turnSeqRef = useRef(0)
   // Poll-loop bookkeeping for the version-gated chatSync mirror of Notion's
-  // ~1s record polling. pollTokenRef cancels a stale loop when the user
-  // switches threads; pollVersionRef holds the last applied thread version.
-  const pollTokenRef = useRef(0)
-  const pollVersionRef = useRef(-1)
+  // ~1s record polling. pollsRef cancels a stale loop for ONE thread only;
+  // pollVersionsRef holds each thread's last applied version.
+  // Всё разложено по threadId: у каждого чата свой токен цикла и своя
+  // последняя применённая версия, поэтому опрос фонового чата больше не
+  // убивается открытием соседнего.
+  const pollsRef = useRef<Record<string, number>>({})
+  const pollVersionsRef = useRef<Record<string, number>>({})
+  // Какие циклы опроса живы прямо сейчас — чтобы фоновый обход не дублировал
+  // запросы по чатам, за которыми уже следят.
+  const pollLiveRef = useRef<Record<string, boolean>>({})
+  // Пока правка последнего сообщения не доехала до сервера, он ещё какое-то
+  // время отдаёт снапшот со старым ответом ИИ. editGuardRef режет такие ответы:
+  // без него ответ «воскресает» сразу после нажатия «Отправить».
+  const editGuardRef = useRef<{ threadId: string; maxLen: number } | null>(null)
   // Guards the one-time "restore last open thread on reload" effect.
   const restoredThreadRef = useRef(false)
 
@@ -258,10 +303,11 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       return
     }
     let cancelled = false
+    const spaceId = activeSpace.spaceId
     chatModels({
       token_v2: activeSpace.account.token_v2,
       user_id: activeSpace.account.user_id,
-      space_id: activeSpace.spaceId,
+      space_id: spaceId,
     })
       .then((m) => {
         if (cancelled) return
@@ -269,6 +315,10 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         const enabled = m.filter((x) => !x.disabled)
         setSelectedModel((prev) => {
           if (prev && enabled.some((x) => x.id === prev)) return prev
+          // Restore the model this workspace was last used with, so reloading
+          // the page no longer snaps everyone back to the hardcoded default.
+          const remembered = loadRememberedModels()[spaceId]
+          if (remembered && enabled.some((x) => x.id === remembered)) return remembered
           const opus = enabled.find((x) => x.id === 'ambrosia-tart-high')
           return opus ? opus.id : enabled[0]?.id || ''
         })
@@ -280,6 +330,35 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       cancelled = true
     }
   }, [activeSpace])
+
+  // Re-resolve the effort whenever the model list or the selected model
+  // changes: keep the remembered pick if this model still supports it,
+  // otherwise fall back to the strongest effort the model offers.
+  useEffect(() => {
+    const model = models.find((m) => m.id === selectedModel)
+    setSelectedEffort(resolveEffort(model, rememberedEfforts))
+  }, [models, selectedModel, rememberedEfforts])
+
+  // Persist only explicit user picks. An automatic fallback (the remembered
+  // model is not offered in this workspace) must not overwrite the memory.
+  const handleModelChange = useCallback(
+    (id: string) => {
+      setSelectedModel(id)
+      if (activeSpace) saveRememberedModel(activeSpace.spaceId, id)
+    },
+    [activeSpace],
+  )
+
+  // Persist the choice against the current model so it survives reloads.
+  const handleEffortChange = useCallback(
+    (effort: string) => {
+      if (!selectedModel) return
+      setSelectedEffort(effort)
+      saveEffort(selectedModel, effort)
+      setRememberedEfforts((prev) => ({ ...prev, [selectedModel]: effort }))
+    },
+    [selectedModel],
+  )
 
   // Keep the log pinned to the bottom. On thread open / new chat we jump
   // instantly to the end; during live updates we only follow if the user is
@@ -303,6 +382,18 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     if (nearBottom) el.scrollTop = el.scrollHeight
   }, [messages, sending, historyLoading, liveSteps, liveText, status])
 
+  // Вкладка «Чат» снова на экране. Пока она была спрятана, у лога была нулевая
+  // высота, поэтому автоскролл выше ничего не прокручивал, а браузер сбросил
+  // позицию в ноль. Возвращаем чат вниз, к последнему сообщению.
+  useEffect(() => {
+    if (!active) return
+    const raf = requestAnimationFrame(() => {
+      const el = logRef.current
+      if (el) el.scrollTop = el.scrollHeight
+    })
+    return () => cancelAnimationFrame(raf)
+  }, [active])
+
   const visibleMessages = useMemo(
     () => messages.slice(Math.max(0, messages.length - visibleCount)),
     [messages, visibleCount],
@@ -323,9 +414,20 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     })
   }, [messages.length])
 
-  // stopPolling cancels any live poll loop by advancing the token it checks.
-  const stopPolling = useCallback(() => {
-    pollTokenRef.current += 1
+  // stopPolling cancels live poll loops by advancing the token each one checks.
+  const stopPolling = useCallback((threadId?: string) => {
+    // Без аргумента гасим все циклы (размонтирование), с threadId — только
+    // один. Переключение чатов больше НЕ трогает чужие циклы, иначе кружок в
+    // фоновом диалоге погас бы, хотя агент там ещё работает.
+    if (threadId) {
+      pollsRef.current[threadId] = (pollsRef.current[threadId] || 0) + 1
+      pollLiveRef.current[threadId] = false
+      return
+    }
+    for (const key of Object.keys(pollsRef.current)) {
+      pollsRef.current[key] = (pollsRef.current[key] || 0) + 1
+      pollLiveRef.current[key] = false
+    }
   }, [])
 
   // Desktop splitter drag: widen/narrow the chat sidebar by dragging the
@@ -387,42 +489,108 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   // advances, and stops once the server reports the turn is no longer running.
   const startPolling = useCallback((space: SpaceOption, threadId: string) => {
     if (!space || !threadId) return
-    const myToken = ++pollTokenRef.current
-    pollVersionRef.current = -1
+    const myToken = (pollsRef.current[threadId] = (pollsRef.current[threadId] || 0) + 1)
+    pollVersionsRef.current[threadId] = -1
     const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+    // 1 с — тот же такт, с которым веб-клиент Notion опрашивает свои записи.
+    const TICK = 1000
     const loop = async () => {
-      // Let the server persist the just-started turn before the first poll.
-      await sleep(1500)
-      while (pollTokenRef.current === myToken) {
-        let res: ChatSyncResult | null = null
-        try {
-          res = await chatSync({
-            token_v2: space.account.token_v2,
-            user_id: space.account.user_id,
-            space_id: space.spaceId,
-            thread_id: threadId,
-            since_version: pollVersionRef.current,
-          })
-        } catch {
-          await sleep(1500)
-          continue
+      pollLiveRef.current[threadId] = true
+      try {
+        // Let the server persist the just-started turn before the first poll.
+        await sleep(900)
+        while (pollsRef.current[threadId] === myToken) {
+          let res: ChatSyncResult | null = null
+          try {
+            res = await chatSync({
+              token_v2: space.account.token_v2,
+              user_id: space.account.user_id,
+              space_id: space.spaceId,
+              thread_id: threadId,
+              since_version: pollVersionsRef.current[threadId] ?? -1,
+            })
+          } catch {
+            await sleep(TICK)
+            continue
+          }
+          if (pollsRef.current[threadId] !== myToken) return
+          if (!res) {
+            await sleep(TICK)
+            continue
+          }
+          // Снапшот «из прошлого»: правка уже обрезала хвост треда, а сервер
+          // ещё отдаёт прежнюю длину — применять такой ответ нельзя.
+          const guard = editGuardRef.current
+          const stale = !!guard && guard.threadId === threadId && !!res.messages && res.messages.length > guard.maxLen
+          if (res.changed && res.messages && !stale) {
+            const mapped = res.messages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, blocks: m.blocks, survey: m.survey, pages: m.pages }))
+            // Кэш пишем всегда, даже когда чат не на экране: иначе при возврате
+            // в него на миг покажется устаревшая история.
+            writeCachedHistory(threadId, mapped)
+            if (viewKeyRef.current === threadId) {
+              setMessages(mapped)
+              // Server state just landed: clear a transient stream error the poll
+              // has now superseded, so no stale banner is left on screen.
+              setError('')
+            }
+          }
+          if (res.version >= 0 && !stale) pollVersionsRef.current[threadId] = res.version
+          const running = !!res.running
+          setBusyThreads((prev) => (prev[threadId] === running ? prev : { ...prev, [threadId]: running }))
+          if (viewKeyRef.current === threadId) setRemoteBusy(running)
+          if (!running) return
+          await sleep(TICK)
         }
-        if (pollTokenRef.current !== myToken) return
-        if (!res) {
-          await sleep(1500)
-          continue
-        }
-        if (res.changed && res.messages && viewKeyRef.current === threadId) {
-          setMessages(res.messages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, survey: m.survey, pages: m.pages })))
-        }
-        if (res.version >= 0) pollVersionRef.current = res.version
-        if (viewKeyRef.current === threadId) setRemoteBusy(!!res.running)
-        if (!res.running) return
-        await sleep(1500)
+      } finally {
+        if (pollsRef.current[threadId] === myToken) pollLiveRef.current[threadId] = false
       }
     }
     void loop()
   }, [])
+
+  // Фоновый обход чатов. Notion в вебе понимает, что «в этом диалоге сейчас
+  // работает нейронка», не по своему локальному состоянию, а по записи треда:
+  // непустой current_inference_id плюс живая аренда. Наш /admin/chat/sync
+  // отдаёт ровно этот признак в поле running, поэтому достаточно спросить про
+  // каждый чат. Обход ограничен десятком самых свежих тредов и не трогает те,
+  // за которыми уже следит собственный цикл, — иначе вышел бы шторм запросов.
+  useEffect(() => {
+    if (!activeSpace || threads.length === 0) return
+    let cancelled = false
+    const scan = async () => {
+      if (document.visibilityState === 'hidden') return
+      for (const t of threads.slice(0, 10)) {
+        if (cancelled) return
+        if (pollLiveRef.current[t.id]) continue
+        try {
+          const res = await chatSync({
+            token_v2: activeSpace.account.token_v2,
+            user_id: activeSpace.account.user_id,
+            space_id: activeSpace.spaceId,
+            thread_id: t.id,
+            since_version: -1,
+          })
+          if (cancelled) return
+          const running = !!res?.running
+          setBusyThreads((prev) => (prev[t.id] === running ? prev : { ...prev, [t.id]: running }))
+          // Нашли живой ход — дальше за ним следит полноценный цикл опроса,
+          // который дотянет сообщения и до экрана, и до кэша.
+          if (running && !pollLiveRef.current[t.id]) startPolling(activeSpace, t.id)
+        } catch {
+          // сеть моргнула — попробуем на следующем обходе
+        }
+      }
+    }
+    void scan()
+    const timer = window.setInterval(() => { void scan() }, 15000)
+    const onVisible = () => { if (document.visibilityState === 'visible') void scan() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [activeSpace, threads, startPolling])
 
   // Reload the thread list for the active space on demand (the small refresh
   // icon next to the «История» header). Best-effort: leaves the current list
@@ -445,7 +613,8 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   }, [activeSpace, threadsLoading])
 
   const startNewChat = useCallback(() => {
-    stopPolling()
+    // Чужие циклы опроса не глушим: агент, запущенный в другом чате, должен
+    // продолжать крутить свой кружок в списке «История».
     setRemoteBusy(false)
     instantScrollRef.current = true
     setActiveThreadId('')
@@ -453,12 +622,14 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
     setVisibleCount(PAGE_SIZE)
     setError('')
     setSidebarOpen(false)
-  }, [stopPolling])
+  }, [])
 
   const openThread = useCallback(
     async (t: ChatThread) => {
       if (!activeSpace) return
-      stopPolling()
+      // Гасим только цикл ЭТОГО чата (сейчас запустим его заново). Остальные
+      // продолжают работать, поэтому индикатор в соседнем диалоге не гаснет.
+      stopPolling(t.id)
       setRemoteBusy(false)
       instantScrollRef.current = true
       setActiveThreadId(t.id)
@@ -498,7 +669,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           space_id: activeSpace.spaceId,
           thread_id: t.id,
         })
-        const mapped: ChatMessage[] = hist.messages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, survey: m.survey, pages: m.pages }))
+        const mapped: ChatMessage[] = hist.messages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, blocks: m.blocks, survey: m.survey, pages: m.pages }))
         if (viewKeyRef.current === t.id && (!cached || cached.hash !== hashMessages(mapped))) {
           setMessages(mapped)
         }
@@ -575,10 +746,17 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         space_id: space.spaceId,
         thread_id: threadId,
       })
-      if (viewKeyRef.current !== threadId) return
+      // Тот же щит, что и в опросе: сразу после правки сервер ещё отдаёт
+      // историю со старым ответом ИИ, и без проверки он вернулся бы на экран.
+      const guard = editGuardRef.current
+      if (guard && guard.threadId === threadId && hist.messages.length > guard.maxLen) return
       const histMessages = hist.messages
       if (histMessages.length > 0 && histMessages[histMessages.length - 1].role === 'assistant') {
-        setMessages(histMessages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, survey: m.survey, pages: m.pages })))
+        const mapped = histMessages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, blocks: m.blocks, survey: m.survey, pages: m.pages }))
+        // Кэш обновляем и для фонового чата, чтобы открытие было мгновенным и
+        // сразу правильным.
+        writeCachedHistory(threadId, mapped)
+        if (viewKeyRef.current === threadId) setMessages(mapped)
       }
     } catch {
       // ignore — reconciliation is best-effort
@@ -587,7 +765,9 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
 
   const handleStop = useCallback(() => {
     if (!sending) return
-    stopPolling()
+    // Гасим цикл только того чата, чей ход останавливаем: фоновые диалоги
+    // продолжают опрашиваться и не теряют свой индикатор.
+    stopPolling(streamThreadIdRef.current || undefined)
     setRemoteBusy(false)
     stopRef.current = true
     const partial = liveText.trim()
@@ -679,7 +859,17 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       streamThreadIdRef.current = activeThreadId || ''
       instantScrollRef.current = true
       setError('')
-      setMessages((prev) => [...prev, { role: 'user', text }])
+      // Take the attachments this turn carries and clear the tray right away:
+      // the files already live on Notion's side, the next message starts empty.
+      const sentAttachments = attachments
+      const sentPendingThread = pendingThreadId
+      setAttachments([])
+      setPendingThreadId('')
+      setEditingIdx(-1)
+      setMessages((prev) => [
+        ...prev,
+        { role: 'user', text, attachments: sentAttachments.length > 0 ? sentAttachments : undefined },
+      ])
       setSending(true)
       // Mirror Notion's live record polling for the duration of the turn so the
       // open chat keeps updating even if the stream stalls. A brand-new thread
@@ -703,7 +893,10 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
             timezone: browserTimezone(),
             agent: agentUsed,
             model: agentUsed === 'default' ? selectedModel || undefined : undefined,
+            reasoning_effort: agentUsed === 'default' ? selectedEffort || undefined : undefined,
             thread_id: activeThreadId || undefined,
+            pending_thread_id: sentPendingThread || undefined,
+            attachments: sentAttachments.length > 0 ? sentAttachments : undefined,
             message: text,
           },
           onStatus,
@@ -724,7 +917,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           if (res.thread_id && res.thread_id !== activeThreadId) setActiveThreadId(res.thread_id)
           setMessages((prev) => [
             ...prev,
-            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, survey: res.survey, pages: res.pages },
+            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, blocks: res.blocks, survey: res.survey, pages: res.pages },
           ])
         }
         // Keep polling the freshly persisted thread state so the message list
@@ -733,8 +926,16 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         if (res.thread_id) startPolling(activeSpace, res.thread_id)
       } catch (e) {
         if (viewKeyRef.current === originKey && !stopRef.current) {
-          setError(e instanceof Error ? e.message : 'Ошибка отправки')
-          setMessages((prev) => [...prev, { role: 'assistant', text: '⚠️ Не удалось получить ответ. Попробуйте ещё раз.' }])
+          // Once the thread exists the turn is already persisted server-side, so
+          // a dropped stream is not a failure: let polling catch up instead of
+          // flashing a bubble that the next poll immediately overwrites.
+          const tid = streamThreadIdRef.current
+          if (tid) {
+            startPolling(activeSpace, tid)
+          } else {
+            setError(e instanceof Error ? e.message : 'Ошибка отправки')
+            setMessages((prev) => [...prev, { role: 'assistant', text: '⚠️ Не удалось получить ответ. Попробуйте ещё раз.' }])
+          }
         }
       } finally {
         // A stop (or a newer turn) may have already reset the live state; only
@@ -748,7 +949,147 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         }
       }
     },
-    [activeSpace, sending, activeThreadId, agentId, selectedModel, onStatus, rememberThreadAgent, startPolling],
+    [activeSpace, sending, activeThreadId, agentId, selectedModel, selectedEffort, attachments, pendingThreadId, onStatus, rememberThreadAgent, startPolling],
+  )
+
+  // Push picked files straight into Notion's bucket (the proxy signs the S3
+  // POST for us). Every file gets its own progress chip in the composer and,
+  // once it lands, becomes an attachment the next message will carry as a
+  // "computer-file" transcript step.
+  const handlePickFiles = useCallback(
+    async (files: File[]) => {
+      if (!activeSpace) {
+        setError('Сначала выберите аккаунт и пространство')
+        return
+      }
+      setError('')
+      for (const file of files) {
+        const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        setUploads((prev) => [...prev, { id, name: file.name, progress: 0 }])
+        try {
+          const res = await chatUpload(
+            file,
+            {
+              token_v2: activeSpace.account.token_v2,
+              user_id: activeSpace.account.user_id,
+              user_name: activeSpace.account.user_name,
+              user_email: activeSpace.account.user_email,
+              space_id: activeSpace.spaceId,
+              space_view_id: activeSpace.spaceViewId,
+              space_name: activeSpace.spaceName,
+              thread_id: activeThreadId || pendingThreadId || undefined,
+            },
+            (ratio) => setUploads((prev) => prev.map((u) => (u.id === id ? { ...u, progress: ratio } : u))),
+          )
+          if (res.thread_id && !activeThreadId) setPendingThreadId(res.thread_id)
+          setAttachments((prev) => [...prev, res.attachment])
+        } catch (e) {
+          setError(e instanceof Error ? e.message : 'Не удалось загрузить файл')
+        } finally {
+          setUploads((prev) => prev.filter((u) => u.id !== id))
+        }
+      }
+    },
+    [activeSpace, activeThreadId, pendingThreadId],
+  )
+
+  const handleRemoveAttachment = useCallback((index: number) => {
+    setAttachments((prev) => prev.filter((_, i) => i !== index))
+  }, [])
+
+  // Edit the last user message and re-run the agent on it. Server side this is
+  // exactly what Notion does: rewrite the stored step
+  // (AgentUserStep.saveUserStepChanges), listRemove everything that followed it
+  // and replay the transcript with the same message id.
+  const handleEditLast = useCallback(
+    async (index: number, next: string) => {
+      const text = next.trim()
+      if (!text || !activeSpace || sending || editBusy) return
+      if (!activeThreadId) {
+        setError('Правка доступна только в сохранённом чате')
+        setEditingIdx(-1)
+        return
+      }
+      const originKey = activeThreadId
+      const agentUsed = agentId
+      const myTurn = ++turnSeqRef.current
+      stopRef.current = false
+      streamThreadIdRef.current = activeThreadId
+      instantScrollRef.current = true
+      setError('')
+      setEditingIdx(-1)
+      setEditBusy(true)
+      setSending(true)
+      // The old answer is gone the moment the message changes - drop everything
+      // after the edited turn locally too, so the UI matches the thread.
+      // Щит от «воскрешения» старого ответа: пока правка едет на сервер, любой
+      // снапшот длиннее обрезанного считается протухшим и не применяется.
+      editGuardRef.current = { threadId: activeThreadId, maxLen: index + 1 }
+      setMessages((prev) => {
+        const truncated = [...prev.slice(0, index), { ...prev[index], text }]
+        // Кэш истории обрезаем тем же движением: иначе при повторном открытии
+        // чата localStorage вернул бы уже удалённый ответ ИИ.
+        writeCachedHistory(activeThreadId, truncated)
+        return truncated
+      })
+      startPolling(activeSpace, activeThreadId)
+      setStreamKey(originKey)
+      setStatus(null)
+      setLiveSteps([])
+      setLiveText('')
+
+      try {
+        const res = await chatEdit(
+          {
+            token_v2: activeSpace.account.token_v2,
+            user_id: activeSpace.account.user_id,
+            user_name: activeSpace.account.user_name,
+            user_email: activeSpace.account.user_email,
+            space_id: activeSpace.spaceId,
+            space_view_id: activeSpace.spaceViewId,
+            space_name: activeSpace.spaceName,
+            timezone: browserTimezone(),
+            agent: agentUsed,
+            model: agentUsed === 'default' ? selectedModel || undefined : undefined,
+            reasoning_effort: agentUsed === 'default' ? selectedEffort || undefined : undefined,
+            thread_id: activeThreadId,
+            message: text,
+          },
+          onStatus,
+        )
+        if (viewKeyRef.current === originKey && !stopRef.current) {
+          setMessages((prev) => [
+            ...prev,
+            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, blocks: res.blocks, survey: res.survey, pages: res.pages },
+          ])
+        }
+        if (res.thread_id) startPolling(activeSpace, res.thread_id)
+      } catch (e) {
+        if (viewKeyRef.current === originKey && !stopRef.current) {
+          // The edited message is already saved server-side, so reconcile through
+          // polling rather than pushing a phantom failure bubble.
+          const tid = streamThreadIdRef.current
+          if (tid) {
+            startPolling(activeSpace, tid)
+          } else {
+            setError(e instanceof Error ? e.message : 'Не удалось изменить сообщение')
+            setMessages((prev) => [...prev, { role: 'assistant', text: '⚠️ Не удалось получить ответ. Попробуйте ещё раз.' }])
+          }
+        }
+      } finally {
+        if (turnSeqRef.current === myTurn) {
+          setSending(false)
+          setStatus(null)
+          setLiveSteps([])
+          setLiveText('')
+          setStreamKey(null)
+        }
+        setEditBusy(false)
+        // Щит снимаем только когда правка полностью отработала.
+        editGuardRef.current = null
+      }
+    },
+    [activeSpace, sending, editBusy, activeThreadId, agentId, selectedModel, selectedEffort, onStatus, startPolling],
   )
 
   // Continue a turn by answering the agent's survey. Mirrors handleSend, but
@@ -794,6 +1135,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
             timezone: browserTimezone(),
             agent: agentUsed,
             model: agentUsed === 'default' ? selectedModel || undefined : undefined,
+            reasoning_effort: agentUsed === 'default' ? selectedEffort || undefined : undefined,
             thread_id: tid,
             survey_step_id: survey.id,
             questions: survey.questions,
@@ -809,7 +1151,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         if (viewKeyRef.current === originKey && !stopRef.current) {
           setMessages((prev) => [
             ...prev,
-            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, survey: res.survey, pages: res.pages },
+            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, blocks: res.blocks, survey: res.survey, pages: res.pages },
           ])
         }
         if (res.thread_id) startPolling(activeSpace, res.thread_id)
@@ -828,7 +1170,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         }
       }
     },
-    [activeSpace, sending, activeThreadId, agentId, selectedModel, onStatus, rememberThreadAgent, startPolling],
+    [activeSpace, sending, activeThreadId, agentId, selectedModel, selectedEffort, onStatus, rememberThreadAgent, startPolling],
   )
 
   if (accounts.length === 0) {
@@ -840,7 +1182,20 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
   }
 
   const viewKey = activeThreadId || NEW_KEY
-  const showThinking = (sending && streamKey === viewKey) || (remoteBusy && !sending)
+  // Only the newest user message gets the edit affordance, exactly like Notion.
+  const lastUserIdx = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') return i
+    }
+    return -1
+  }, [messages])
+  // Работает ли агент именно в ОТКРЫТОМ чате. Ход, запущенный в другом
+  // диалоге, сюда больше не протекает — это и был баг с «ИИ работает» и
+  // моделью внизу в чужом чате.
+  const sendingHere = sending && streamKey === viewKey
+  const busyElsewhere = sending && streamKey !== viewKey
+  const busyHere = !!activeThreadId && !!busyThreads[activeThreadId]
+  const showThinking = sendingHere || busyHere || (remoteBusy && !sending)
   const showModelPicker = agentId === 'default' && models.filter((m) => !m.disabled).length > 0
   const activeThreadTitle = threads.find((t) => t.id === activeThreadId)?.title || 'Новый чат'
   const lastMessage = messages[messages.length - 1]
@@ -916,13 +1271,17 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           </div>
         </div>
 
-        <button
-          type="button"
-          onClick={startNewChat}
-          className="w-full flex items-center justify-center gap-1.5 py-2 mb-4 rounded-lg border border-white/[0.07] text-[11px] text-[#888] hover:bg-white/[0.04] hover:text-text-secondary hover:border-white/[0.12] transition-colors bg-transparent cursor-pointer"
-        >
-          <PlusIcon /> Новый чат
-        </button>
+        <div className="flex items-stretch gap-1.5 mb-4">
+          <button
+            type="button"
+            onClick={startNewChat}
+            className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg border border-white/[0.07] text-[11px] text-[#888] hover:bg-white/[0.04] hover:text-text-secondary hover:border-white/[0.12] transition-colors bg-transparent cursor-pointer"
+          >
+            <PlusIcon /> Новый чат
+          </button>
+          {/* Настройки летающих частиц — ровно там, где просили: рядом с «Новый чат». */}
+          <ParticleSettings cfg={particleCfg} onChange={setParticleCfg} />
+        </div>
 
         <div className="flex items-center justify-between mb-2 px-0.5">
           <span className="text-[9px] text-text-muted uppercase tracking-widest">История</span>
@@ -936,7 +1295,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
             <RefreshIcon />
           </button>
         </div>
-        <div className="flex-1 min-h-0 overflow-y-auto space-y-px pr-1">
+        <div className="no-scrollbar flex-1 min-h-0 overflow-y-auto space-y-px pr-1">
           {threads.length === 0 ? (
             <div className="text-[11px] text-text-muted py-2 px-0.5">Пока нет чатов</div>
           ) : (
@@ -948,8 +1307,17 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
                   t.id === activeThreadId ? 'bg-white/[0.07] text-[#e8e8e8]' : 'text-[#666] hover:bg-white/[0.03] hover:text-[#999]'
                 }`}
               >
-                <span className="text-[11px] truncate" title={t.title || 'Без названия'}>
-                  {t.title || 'Без названия'}
+                <span className="flex items-center gap-1.5 min-w-0">
+                  {/* Кружок загрузки: в этом чате прямо сейчас работает агент. */}
+                  {busyThreads[t.id] ? (
+                    <span
+                      title="Агент сейчас работает в этом чате"
+                      className="shrink-0 w-3 h-3 rounded-full border-2 border-notion-blue border-t-transparent animate-spin"
+                    />
+                  ) : null}
+                  <span className="text-[11px] truncate" title={t.title || 'Без названия'}>
+                    {t.title || 'Без названия'}
+                  </span>
                 </span>
                 <button
                   type="button"
@@ -973,7 +1341,8 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
       />
 
       <section className="relative flex-1 min-w-0 flex flex-col min-h-0 overflow-hidden bg-black">
-        <ParticleField active={showThinking} />
+        {/* Спрятанная вкладка не должна жечь кадры: холст размонтируем целиком. */}
+        {active ? <ParticleField active={showThinking} cfg={particleCfg} /> : null}
 
         {/* Top bar — mobile only: menu + current thread + new chat */}
         <div className="relative z-10 flex items-center gap-2 px-3 py-2 border-b border-white/[0.06] md:hidden">
@@ -996,7 +1365,7 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
           </button>
         </div>
 
-        <div ref={logRef} onScroll={onLogScroll} className="relative z-10 flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden px-5 md:px-8 py-6 space-y-6">
+        <div ref={logRef} onScroll={onLogScroll} className="no-scrollbar relative z-10 flex-1 min-h-0 min-w-0 overflow-y-auto overflow-x-hidden px-5 md:px-8 py-6 space-y-6">
           {messages.length === 0 && !historyLoading && !showThinking ? (
             <div className="h-full flex items-center justify-center text-center text-[#444] text-[12px] px-6">
               {activeSpace
@@ -1018,9 +1387,26 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
             </div>
           ) : null}
 
-          {visibleMessages.map((msg, idx) => (
-            <MessageRow key={hiddenCount + idx} role={msg.role} text={msg.text} steps={msg.steps} pages={msg.pages} />
-          ))}
+          {visibleMessages.map((msg, idx) => {
+            const absIdx = hiddenCount + idx
+            return (
+              <MessageRow
+                key={absIdx}
+                role={msg.role}
+                text={msg.text}
+                steps={msg.steps}
+                blocks={msg.blocks}
+                pages={msg.pages}
+                attachments={msg.attachments}
+                canEdit={msg.role === 'user' && absIdx === lastUserIdx && !!activeThreadId && !sending}
+                editing={editingIdx === absIdx}
+                editBusy={editBusy}
+                onEditStart={() => setEditingIdx(absIdx)}
+                onEditCancel={() => setEditingIdx(-1)}
+                onEditSubmit={(next) => handleEditLast(absIdx, next)}
+              />
+            )
+          })}
 
           {showThinking ? <StreamingRow status={status} steps={liveSteps} liveText={liveText} /> : null}
         </div>
@@ -1030,19 +1416,26 @@ export function ChatTab({ accounts }: { accounts: DiscoveredAccount[] }) {
         ) : null}
 
         {pendingSurvey ? (
-          <SurveyCard survey={pendingSurvey} busy={sending} onSubmit={(answers) => handleSurveySubmit(pendingSurvey, answers)} />
+          <SurveyCard survey={pendingSurvey} busy={sendingHere} onSubmit={(answers) => handleSurveySubmit(pendingSurvey, answers)} />
         ) : null}
 
         <Composer
           hasSpace={!!activeSpace}
-          sending={sending}
+          sending={sendingHere}
+          busyElsewhere={busyElsewhere}
           showModelPicker={showModelPicker}
           models={models}
           selectedModel={selectedModel}
-          onModelChange={setSelectedModel}
+          onModelChange={handleModelChange}
+          selectedEffort={selectedEffort}
+          onEffortChange={handleEffortChange}
           onSend={handleSend}
           onStop={handleStop}
           draftKey={viewKey}
+          attachments={attachments}
+          uploads={uploads}
+          onPickFiles={handlePickFiles}
+          onRemoveAttachment={handleRemoveAttachment}
         />
       </section>
     </div>

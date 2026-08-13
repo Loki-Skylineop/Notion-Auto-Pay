@@ -25,16 +25,21 @@ REM ============================================================
 cd /d "%~dp0"
 set "BINARY=notion-auto-pay.exe"
 set "CMD_PATH=./cmd/notion-manager"
+REM Сохраняем аргументы до разбора: shift их затирает, а для перезапуска
+REM с правами администратора нужен исходный набор.
+set "ORIGINAL_ARGS=%*"
 
 REM --- Разбор аргументов: режим clean/exe/run и --password ---
 set "MODE="
 set "DASH_PASSWORD="
+set "ELEVATED="
 :parse_args
 if "%~1"=="" goto after_args
 set "ARG=%~1"
 if /i "!ARG!"=="clean" ( set "MODE=clean" & shift & goto parse_args )
 if /i "!ARG!"=="exe" ( set "MODE=exe" & shift & goto parse_args )
 if /i "!ARG!"=="run" ( set "MODE=run" & shift & goto parse_args )
+if /i "!ARG!"=="--elevated" ( set "ELEVATED=1" & shift & goto parse_args )
 if /i "!ARG!"=="--password" ( set "DASH_PASSWORD=%~2" & shift & shift & goto parse_args )
 if /i "!ARG:~0,11!"=="--password=" ( set "DASH_PASSWORD=!ARG:~11!" & shift & goto parse_args )
 echo [warn] неизвестный аргумент пропущен: !ARG!
@@ -68,6 +73,30 @@ if /i "%MODE%"=="clean" (
   echo Готово.
   exit /b 0
 )
+
+REM --- Доступ с телефона ---
+REM Сервер сам создаёт временное правило брандмауэра для порта 8081, но для
+REM этого нужны права администратора. Если их нет, один раз перезапускаем это
+REM же окно с повышением; флаг --elevated не даёт зациклиться. Отказ от UAC не
+REM фатален: сервер поднимется как обычно, просто без доступа из локальной
+REM сети. Правило живёт ровно столько, сколько открыто это окно.
+set "LAN_NOTE=noadmin"
+if /i "%MODE%"=="exe" ( set "LAN_NOTE=skip" & goto lan_done )
+net session >nul 2>nul
+if not errorlevel 1 goto lan_admin
+if defined ELEVATED goto lan_declined
+echo.
+echo Запрашиваю права администратора: они нужны только для временного правила
+echo брандмауэра, которое откроет панель для телефона в вашей Wi-Fi сети.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Start-Process -FilePath '%~f0' -ArgumentList '--elevated !ORIGINAL_ARGS!' -Verb RunAs -ErrorAction Stop } catch { exit 1 }"
+if errorlevel 1 goto lan_declined
+exit /b 0
+:lan_declined
+echo [warn] Права не получены. Панель будет работать только на этом ПК.
+goto lan_done
+:lan_admin
+set "LAN_NOTE=admin"
+:lan_done
 
 REM --- Проверка инструментов ---
 where npm >nul 2>nul
@@ -132,6 +161,14 @@ if defined DASH_PASSWORD (
   echo Веб-панель открыта без пароля [--no-password]. Чтобы включить: build.bat --password=ВашПароль
 )
 echo Дашборд будет доступен на http://localhost:8081/dashboard/
+if /i "!LAN_NOTE!"=="admin" (
+  echo Доступ с телефона включён. Ссылку вида http://192.168.x.x:8081/dashboard/
+  echo сервер напечатает ниже. Правило брандмауэра удалится, как только вы
+  echo закроете это окно или нажмёте Ctrl+C.
+) else (
+  echo Доступ с телефона выключен: нет прав администратора. Перезапустите
+  echo build.bat от имени администратора, чтобы открыть панель для телефона.
+)
 echo Для остановки нажмите Ctrl+C
 echo.
 go run %CMD_PATH% !RUN_ARGS!

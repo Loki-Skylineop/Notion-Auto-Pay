@@ -457,8 +457,11 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
       />
 
       <main className={`px-5 sm:px-8 py-7 ${tab === 'chat' ? 'w-full' : 'max-w-4xl mx-auto'}`}>
-        {tab === 'pay' ? (
-          discovered.length === 0 ? (
+        {/* Обе вкладки смонтированы всегда и просто прячутся через hidden. Так
+            чат помнит, какой диалог был открыт, а идущий ход агента не рвётся,
+            когда пользователь уходит на «Оплату» и возвращается обратно. */}
+        <div hidden={tab !== 'pay'}>
+          {discovered.length === 0 ? (
             hydrating ? (
               <div className="text-center py-24 text-text-muted text-[13px]">Загрузка рабочих пространств…</div>
             ) : (
@@ -475,10 +478,11 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
             )
           ) : (
             <WorkspacePool accounts={discovered} onRemoveAccount={removeDiscovered} onPaid={() => {}} />
-          )
-        ) : (
-          <ChatTab accounts={discovered} />
-        )}
+          )}
+        </div>
+        <div hidden={tab !== 'chat'}>
+          <ChatTab accounts={discovered} active={tab === 'chat'} />
+        </div>
       </main>
 
       {showAddModal && <AddAccountModal onClose={() => setShowAddModal(false)} onDiscovered={upsertDiscovered} />}

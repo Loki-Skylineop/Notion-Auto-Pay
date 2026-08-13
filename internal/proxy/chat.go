@@ -102,7 +102,7 @@ func HandleChatAgents(auth *DashboardAuth) http.HandlerFunc {
 			http.Error(w, `{"error":"token_v2 and space_id are required"}`, http.StatusBadRequest)
 			return
 		}
-		agents := []chatAgent{ {ID: "default", Name: "Обычный агент", Kind: "default"} }
+		agents := []chatAgent{{ID: "default", Name: "Обычный агент", Kind: "default"}}
 		if custom, err := fetchCustomAgents(body.TokenV2, body.UserID, body.SpaceID); err != nil {
 			log.Printf("[chat] fetch custom agents failed: %v", err)
 		} else {
@@ -114,7 +114,7 @@ func HandleChatAgents(auth *DashboardAuth) http.HandlerFunc {
 
 func transcriptsRequestBody(spaceID string) []byte {
 	b, _ := json.Marshal(map[string]interface{}{
-		"threadParentPointer":   map[string]string{"table": "space", "id": spaceID, "spaceId": spaceID},
+		"threadParentPointer":    map[string]string{"table": "space", "id": spaceID, "spaceId": spaceID},
 		"includeWorkflowThreads": true,
 		"includeWriterChats":     false,
 	})
@@ -211,15 +211,27 @@ func HandleChatModels(auth *DashboardAuth) http.HandlerFunc {
 				ModelFamily  string `json:"modelFamily"`
 				DisplayGroup string `json:"displayGroup"`
 				IsDisabled   bool   `json:"isDisabled"`
+				// Notion nests each model's reasoning-effort capabilities under
+				// modelConfiguration, and the sets genuinely differ per model:
+				// GPT-5.6 offers none/low/medium/high/xhigh/max, Opus 5 offers
+				// low/medium/high/max, Opus 4.7 only high, Haiku 4.5 none at all.
+				ModelConfiguration struct {
+					SupportedReasoningEfforts []string `json:"supportedReasoningEfforts"`
+					DefaultReasoningEffort    string   `json:"defaultReasoningEffort"`
+				} `json:"modelConfiguration"`
 			} `json:"models"`
 		}
 		json.Unmarshal(data, &parsed)
 		type outModel struct {
-			ID       string `json:"id"`
-			Label    string `json:"label"`
-			Family   string `json:"family"`
-			Group    string `json:"group"`
-			Disabled bool   `json:"disabled"`
+			ID       string   `json:"id"`
+			Label    string   `json:"label"`
+			Family   string   `json:"family"`
+			Group    string   `json:"group"`
+			Disabled bool     `json:"disabled"`
+			Efforts  []string `json:"efforts"`
+			// DefaultEffort is Notion's own default for this model; the picker
+			// prefers the strongest supported effort and uses this as a fallback.
+			DefaultEffort string `json:"default_effort"`
 		}
 		out := make([]outModel, 0, len(parsed.Models))
 		for _, m := range parsed.Models {
@@ -230,7 +242,19 @@ func HandleChatModels(auth *DashboardAuth) http.HandlerFunc {
 			if label == "" {
 				label = m.Model
 			}
-			out = append(out, outModel{ID: m.Model, Label: label, Family: m.ModelFamily, Group: m.DisplayGroup, Disabled: m.IsDisabled})
+			efforts := m.ModelConfiguration.SupportedReasoningEfforts
+			if efforts == nil {
+				efforts = []string{}
+			}
+			out = append(out, outModel{
+				ID:            m.Model,
+				Label:         label,
+				Family:        m.ModelFamily,
+				Group:         m.DisplayGroup,
+				Disabled:      m.IsDisabled,
+				Efforts:       efforts,
+				DefaultEffort: m.ModelConfiguration.DefaultReasoningEffort,
+			})
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"models": out})
 	}
@@ -419,6 +443,17 @@ type chatStep struct {
 	Result string `json:"result,omitempty"` // pretty-printed tool result
 }
 
+// chatBlock is one segment of an assistant turn: either a run of consecutive
+// actions or a paragraph of the answer. A turn is the chronological ribbon of
+// these blocks (2 actions -> text -> 11 actions -> text -> ...), which is how
+// Notion itself lays out a turn instead of one huge action list glued to one
+// huge text.
+type chatBlock struct {
+	Kind  string     `json:"kind"`            // "steps" | "text"
+	Steps []chatStep `json:"steps,omitempty"` // actions, when kind == "steps"
+	Text  string     `json:"text,omitempty"`  // answer text, when kind == "text"
+}
+
 // chatHistMsg is one rendered message of a past conversation. Survey is set on
 // an assistant message when the agent is asking the user to pick options
 // ("Уточню пару деталей…"); Pages lists any pages the agent created/edited
@@ -429,6 +464,11 @@ type chatHistMsg struct {
 	Steps  []chatStep    `json:"steps,omitempty"`
 	Survey *chatSurvey   `json:"survey,omitempty"`
 	Pages  []chatPageRef `json:"pages,omitempty"`
+
+	// Blocks is the same turn as an ordered ribbon of action groups and text
+	// paragraphs. Text and Steps stay filled so the copy button, the history
+	// hash and any older client keep working unchanged.
+	Blocks []chatBlock `json:"blocks,omitempty"`
 }
 
 // syncRecordValues fetches one or more records by pointer through the private
@@ -530,18 +570,24 @@ func HandleChatHistory(auth *DashboardAuth) http.HandlerFunc {
 // buildHistory walks the thread's messages[] in canonical order. user-injected
 // steps (survey answers) render as user messages; survey steps attach to the
 // current assistant message; editReferenceMap pages attach as open-page cards.
+// Every assistant turn is rebuilt through turnBuilder, so a reloaded thread
+// shows the same action/text ribbon the live stream did.
 func buildHistory(rm recordMapShape, order []string) []chatHistMsg {
 	out := []chatHistMsg{}
 	var cur *chatHistMsg
+	var tb *turnBuilder
 	flush := func() {
 		if cur != nil {
+			cur.Text, cur.Steps, cur.Blocks = tb.done()
 			out = append(out, *cur)
 			cur = nil
+			tb = nil
 		}
 	}
 	ensure := func() {
 		if cur == nil {
 			cur = &chatHistMsg{Role: "assistant"}
+			tb = &turnBuilder{}
 		}
 	}
 	for _, id := range order {
@@ -558,16 +604,14 @@ func buildHistory(rm recordMapShape, order []string) []chatHistMsg {
 			flush()
 			out = append(out, chatHistMsg{Role: "user", Text: parseInjectedUserText(step)})
 		case "agent-inference":
-			st, t := parseInferenceParts(step.Value)
 			ensure()
-			cur.Steps = append(cur.Steps, st...)
-			cur.Text += t
+			foldInferenceParts(step.Value, tb)
 			if pr := parseEditReferenceMap(step.EditReferenceMap); len(pr) > 0 {
 				cur.Pages = append(cur.Pages, pr...)
 			}
 		case "agent-tool-result":
 			ensure()
-			cur.Steps = append(cur.Steps, parseToolResultStep(step))
+			tb.addStep(parseToolResultStep(step))
 		case "survey":
 			ensure()
 			if sv := parseSurveyStep(step); sv != nil {
@@ -584,83 +628,104 @@ func buildHistory(rm recordMapShape, order []string) []chatHistMsg {
 // chatSendBody is the shared request shape for both the synchronous send and
 // the streaming send. Model is only honoured for the built-in assistant.
 type chatSendBody struct {
-	TokenV2       string `json:"token_v2"`
-	UserID        string `json:"user_id"`
-	UserName      string `json:"user_name"`
-	UserEmail     string `json:"user_email"`
-	SpaceID       string `json:"space_id"`
-	SpaceViewID   string `json:"space_view_id"`
-	SpaceName     string `json:"space_name"`
-	Timezone      string `json:"timezone"`
-	Agent         string `json:"agent"`
-	Model         string `json:"model"`
-	ContextPageID string `json:"context_page_id"`
-	ThreadID      string `json:"thread_id"`
-	Message       string `json:"message"`
+	TokenV2     string `json:"token_v2"`
+	UserID      string `json:"user_id"`
+	UserName    string `json:"user_name"`
+	UserEmail   string `json:"user_email"`
+	SpaceID     string `json:"space_id"`
+	SpaceViewID string `json:"space_view_id"`
+	SpaceName   string `json:"space_name"`
+	Timezone    string `json:"timezone"`
+	Agent       string `json:"agent"`
+	Model       string `json:"model"`
+	// ReasoningEffort is the thinking budget chosen in the composer
+	// (none/minimal/low/medium/high/xhigh/max). Which values are legal depends
+	// on the model, so the UI resolves it against the model's own supported
+	// set. Empty means "let Notion apply the model default".
+	ReasoningEffort string `json:"reasoning_effort"`
+	ContextPageID   string `json:"context_page_id"`
+	ThreadID        string `json:"thread_id"`
+	Message         string `json:"message"`
+	// PendingThreadID is set when a file was attached before the thread
+	// existed: the upload already bound that attachment to a client-minted
+	// thread id, so the first turn has to reuse it instead of minting a
+	// second one (the web client mints the id itself for the same reason).
+	PendingThreadID string `json:"pending_thread_id"`
+	// Attachments are files already uploaded through /admin/chat/upload. They
+	// are replayed as "computer-file" transcript steps right before the user
+	// text, exactly like the web client does. See chat_edit.go.
+	Attachments []chatAttachment `json:"attachments"`
 }
 
-// buildChatConfig returns the transcript config block. model is set only for the
-// built-in assistant (modelFromUser=true); custom agents carry their own model.
-func buildChatConfig(isCustom bool, workflowID string, model string) map[string]interface{} {
+// buildChatConfig returns the transcript config block. model and reasoningEffort
+// are set only for the built-in assistant (modelFromUser=true); custom agents
+// carry their own model and effort.
+func buildChatConfig(isCustom bool, workflowID string, model string, effort string) map[string]interface{} {
 	cfg := map[string]interface{}{
-		"type":                                 "workflow",
-		"enableAgentAutomations":               true,
-		"enableAgentIntegrations":              true,
-		"enableCustomAgents":                   true,
-		"enableExperimentalIntegrations":       false,
-		"enableAgentDiffs":                     true,
-		"enableCsvAttachmentSupport":           true,
-		"showDatabaseAgentsDiscoverability":    true,
-		"enableAgentThreadTools":               false,
-		"enableCrdtOperations":                 false,
-		"enableAgentCardCustomization":         true,
-		"enableSystemPromptAsPage":             false,
-		"enableUserSessionContext":             false,
-		"enableLargeToolResultComputerOffload": false,
-		"enableScriptAgentAdvanced":            false,
-		"enableScriptAgent":                    true,
+		"type":                                           "workflow",
+		"enableAgentAutomations":                         true,
+		"enableAgentIntegrations":                        true,
+		"enableCustomAgents":                             true,
+		"enableExperimentalIntegrations":                 false,
+		"enableAgentDiffs":                               true,
+		"enableCsvAttachmentSupport":                     true,
+		"showDatabaseAgentsDiscoverability":              true,
+		"enableAgentThreadTools":                         false,
+		"enableCrdtOperations":                           false,
+		"enableAgentCardCustomization":                   true,
+		"enableSystemPromptAsPage":                       false,
+		"enableUserSessionContext":                       false,
+		"enableLargeToolResultComputerOffload":           false,
+		"enableScriptAgentAdvanced":                      false,
+		"enableScriptAgent":                              true,
 		"enableScriptAgentSearchConnectorsInCustomAgent": false,
 		"enableScriptAgentGoogleDriveInCustomAgent":      false,
 		"enableScriptAgentGoogleDriveOAuthInCustomAgent": false,
-		"enableScriptAgentSlack":              true,
-		"enableScriptAgentMcpServers":         false,
-		"enableScriptAgentGtm":                false,
-		"enableComputer":                      true,
-		"enableCreateAndRunThread":            true,
-		"enableSoftwareFactoryPage":           false,
-		"enableAgentGenerateImage":            true,
-		"enableQueryCalendar":                 false,
-		"enableQueryMail":                     false,
-		"enableMailExplicitToolCalls":         true,
-		"enableMailNotificationPreferences":   false,
-		"enableMailAgentMultiProviderSupport": false,
-		"useRulePrioritization":               true,
-		"availableConnectors":                 []interface{}{},
-		"searchScopes":                        []map[string]string{ {"type": "everything"} },
-		"useWebSearch":                        true,
-		"isHipaa":                             false,
-		"internetAccess":                      false,
-		"useReadOnlyMode":                     false,
-		"writerMode":                          false,
-		"modelFromUser":                       !isCustom,
-		"isCustomAgent":                       isCustom,
-		"isCustomAgentBuilder":                false,
-		"isAgentResearchRequest":              false,
-		"useCustomAgentDraft":                 isCustom,
-		"use_draft_actor_pointer":             false,
-		"enableUpdatePageAutofixer":           true,
-		"enableMarkdownVNext":                 false,
-		"enableEmbedBlocks":                   true,
-		"updatePageStaleViewGuardEnabled":     false,
-		"enableUpdatePageOrderUpdates":        true,
-		"enableAgentSupportPropertyReorder":   true,
-		"enableAgentAskSurvey":                true,
-		"databaseAgentConfigMode":             false,
-		"isOnboardingAgent":                   false,
-		"isMobile":                            false,
+		"enableScriptAgentSlack":                         true,
+		"enableScriptAgentMcpServers":                    true,
+		"enableScriptAgentGtm":                           false,
+		"enableComputer":                                 true,
+		"enableCreateAndRunThread":                       true,
+		"enableSoftwareFactoryPage":                      false,
+		"enableAgentGenerateImage":                       true,
+		"enableQueryCalendar":                            false,
+		"enableQueryMail":                                false,
+		"enableMailExplicitToolCalls":                    true,
+		"enableMailNotificationPreferences":              false,
+		"enableMailAgentMultiProviderSupport":            false,
+		"useRulePrioritization":                          true,
+		"availableConnectors":                            []interface{}{},
+		"searchScopes":                                   []map[string]string{{"type": "everything"}},
+		"useWebSearch":                                   true,
+		"isHipaa":                                        false,
+		"internetAccess":                                 false,
+		"useReadOnlyMode":                                false,
+		"writerMode":                                     false,
+		"modelFromUser":                                  !isCustom,
+		"isCustomAgent":                                  isCustom,
+		"isCustomAgentBuilder":                           false,
+		"isAgentResearchRequest":                         false,
+		"useCustomAgentDraft":                            isCustom,
+		"use_draft_actor_pointer":                        false,
+		"enableUpdatePageAutofixer":                      true,
+		"enableMarkdownVNext":                            false,
+		"enableEmbedBlocks":                              true,
+		"updatePageStaleViewGuardEnabled":                false,
+		"enableUpdatePageOrderUpdates":                   true,
+		"enableAgentSupportPropertyReorder":              true,
+		"enableAgentAskSurvey":                           true,
+		"databaseAgentConfigMode":                        false,
+		"isOnboardingAgent":                              false,
+		"isMobile":                                       false,
 	}
 	if !isCustom && strings.TrimSpace(model) != "" {
 		cfg["model"] = model
+	}
+	// Notion reads reasoningEffort from the same config block as the model.
+	// Leaving it out makes the server fall back to that model's default, so we
+	// only send a value the UI already validated against the model.
+	if !isCustom && strings.TrimSpace(effort) != "" {
+		cfg["reasoningEffort"] = strings.TrimSpace(effort)
 	}
 	if isCustom && workflowID != "" {
 		cfg["workflowId"] = workflowID
@@ -683,7 +748,7 @@ func buildSendPayload(body chatSendBody) (map[string]interface{}, string) {
 	configMsg := map[string]interface{}{
 		"id":    generateUUIDv4(),
 		"type":  "config",
-		"value": buildChatConfig(isCustom, workflowID, body.Model),
+		"value": buildChatConfig(isCustom, workflowID, body.Model, body.ReasoningEffort),
 	}
 	ctxVal := map[string]interface{}{
 		"timezone":        tz,
@@ -712,23 +777,49 @@ func buildSendPayload(body chatSendBody) (map[string]interface{}, string) {
 	userMsg := map[string]interface{}{
 		"id":        generateUUIDv4(),
 		"type":      "user",
-		"value":     [][]string{ {body.Message} },
+		"value":     [][]string{{body.Message}},
 		"userId":    body.UserID,
 		"createdAt": time.Now().UnixMilli(),
 	}
 	newThread := strings.TrimSpace(body.ThreadID) == ""
 	threadID := strings.TrimSpace(body.ThreadID)
 	if newThread {
-		threadID = generateUUIDv4()
+		// An attachment uploaded before the first message already bound itself
+		// to this id, so the file and the message land in the same thread.
+		threadID = strings.TrimSpace(body.PendingThreadID)
+		if threadID == "" {
+			threadID = generateUUIDv4()
+		}
 	}
 	createdSource := "ai_module"
 	if isCustom {
 		createdSource = "custom_agent"
 	}
+	// The web client never sends the config block on its own: it always follows
+	// the context element with an "updated-config" one, and that is where
+	// enableScriptAgentMcpServers flips to true. The base config Notion ships
+	// has the flag off, so without this element the script agent is assembled
+	// without MCP tools and even a perfectly connected server stays invisible.
+	//
+	// Only the MCP flag is overridden on purpose: the same element in the
+	// capture also switches on enableMarkdownVNext and enableSuggestedEditsTools,
+	// which change the shape of the response this proxy parses.
+	updatedConfigMsg := map[string]interface{}{
+		"id":   generateUUIDv4(),
+		"type": "updated-config",
+		"value": map[string]interface{}{
+			"enableScriptAgentMcpServers": true,
+		},
+	}
+	// Attachments ride in front of the user text as "computer-file" steps,
+	// which is how Notion hands an uploaded file to the agent.
+	transcript := []interface{}{configMsg, contextMsg, updatedConfigMsg}
+	transcript = append(transcript, attachmentSteps(body.Attachments)...)
+	transcript = append(transcript, userMsg)
 	payload := map[string]interface{}{
 		"traceId":                       generateUUIDv4(),
 		"spaceId":                       body.SpaceID,
-		"transcript":                    []interface{}{configMsg, contextMsg, userMsg},
+		"transcript":                    transcript,
 		"threadId":                      threadID,
 		"createThread":                  newThread,
 		"debugOverrides":                map[string]interface{}{},
@@ -776,6 +867,10 @@ func HandleChatSend(auth *DashboardAuth) http.HandlerFunc {
 			http.Error(w, `{"error":"token_v2, space_id and message are required"}`, http.StatusBadRequest)
 			return
 		}
+		// A fully drained sliding window rejects the turn outright, so arm
+		// Notion's "use additional credits" switch for exactly this message and
+		// disarm it again the moment the turn is done.
+		defer armOverageForTurn(body.TokenV2, body.UserID, body.SpaceID)()
 		payload, threadID := buildSendPayload(body)
 		reqBody, _ := json.Marshal(payload)
 		resp, err := notionChatRequest(body.TokenV2, body.UserID, body.SpaceID, "runInferenceTranscript", reqBody, "application/x-ndjson", 180*time.Second)
@@ -792,7 +887,7 @@ func HandleChatSend(auth *DashboardAuth) http.HandlerFunc {
 			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("notion error %d: %s", resp.StatusCode, truncate(string(raw), 200))})
 			return
 		}
-		text, title, steps, survey, pages := parseInferenceStream(raw)
+		text, title, steps, blocks, survey, pages := parseInferenceStream(raw)
 		if strings.TrimSpace(text) == "" {
 			text = "(агент не вернул текстового ответа)"
 		}
@@ -801,6 +896,7 @@ func HandleChatSend(auth *DashboardAuth) http.HandlerFunc {
 			"title":     title,
 			"text":      text,
 			"steps":     steps,
+			"blocks":    blocks,
 			"survey":    survey,
 			"pages":     pages,
 		})
@@ -1006,7 +1102,7 @@ func streamInference(w http.ResponseWriter, tokenV2, userID, spaceID, threadID s
 		copy(lineCopy, line)
 		processStreamLine(lineCopy, &sItems, &answer, emit)
 	}
-	text, title, steps, survey, pages := parseInferenceStream(acc.Bytes())
+	text, title, steps, blocks, survey, pages := parseInferenceStream(acc.Bytes())
 	if strings.TrimSpace(text) == "" {
 		text = "(агент не вернул текстового ответа)"
 	}
@@ -1016,6 +1112,7 @@ func streamInference(w http.ResponseWriter, tokenV2, userID, spaceID, threadID s
 		"title":     title,
 		"text":      text,
 		"steps":     steps,
+		"blocks":    blocks,
 		"survey":    survey,
 		"pages":     pages,
 	})
@@ -1041,6 +1138,8 @@ func HandleChatStream(auth *DashboardAuth) http.HandlerFunc {
 			http.Error(w, `{"error":"token_v2, space_id and message are required"}`, http.StatusBadRequest)
 			return
 		}
+		// Same one-turn overage window as HandleChatSend.
+		defer armOverageForTurn(body.TokenV2, body.UserID, body.SpaceID)()
 		payload, threadID := buildSendPayload(body)
 		streamInference(w, body.TokenV2, body.UserID, body.SpaceID, threadID, payload)
 	}
@@ -1095,6 +1194,10 @@ func HandleChatSurvey(auth *DashboardAuth) http.HandlerFunc {
 			http.Error(w, `{"error":"token_v2, space_id, thread_id, survey_step_id and answers are required"}`, http.StatusBadRequest)
 			return
 		}
+
+		// Answering a survey re-runs the agent, so it needs the same one-turn
+		// overage window as a plain message.
+		defer armOverageForTurn(body.TokenV2, body.UserID, body.SpaceID)()
 
 		isCustom := body.Agent != "" && body.Agent != "default"
 		createdSource := "ai_module"
@@ -1156,7 +1259,7 @@ func HandleChatSurvey(auth *DashboardAuth) http.HandlerFunc {
 			"id":             injID,
 			"type":           "user-injected",
 			"actualMessage":  actual,
-			"displayMessage": [][]string{ {"These are my answers"} },
+			"displayMessage": [][]string{{"These are my answers"}},
 			"userId":         body.UserID,
 			"createdAt":      time.Now().Format("2006-01-02T15:04:05.000-07:00"),
 			"surveyStepId":   body.SurveyStepID,

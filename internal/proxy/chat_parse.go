@@ -1,9 +1,11 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"sort"
 	"strings"
+	"time"
 )
 
 // chat_parse.go holds the ndjson / record-map parsing for the chat proxy plus
@@ -11,6 +13,46 @@ import (
 // manageable size.
 
 // ---- record-map shapes ----
+
+// notionTime accepts both shapes Notion uses for timestamps: an ISO-8601
+// string and epoch milliseconds as a number. Decoding into a plain string made
+// one numeric createdAt fail the whole record map (history + message edit).
+type notionTime struct {
+	Raw    string
+	Millis int64
+}
+
+func (t *notionTime) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 || string(b) == "null" {
+		return nil
+	}
+	if b[0] == '"' {
+		var s string
+		if err := json.Unmarshal(b, &s); err != nil {
+			return err
+		}
+		t.Raw = s
+		if ts, err := time.Parse(time.RFC3339Nano, s); err == nil {
+			t.Millis = ts.UnixMilli()
+		}
+		return nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(b, &n); err != nil {
+		return err
+	}
+	t.Raw = n.String()
+	if ms, err := n.Int64(); err == nil {
+		if ms < 1e12 { // seconds turn up occasionally
+			ms *= 1000
+		}
+		t.Millis = ms
+	}
+	return nil
+}
+
+func (t notionTime) String() string { return t.Raw }
 
 type tmStep struct {
 	Type     string          `json:"type"`
@@ -26,7 +68,7 @@ type tmStep struct {
 	Questions json.RawMessage `json:"questions"`
 	Responses json.RawMessage `json:"responses"`
 	Submitted bool            `json:"submitted"`
-	CreatedAt string          `json:"createdAt"`
+	CreatedAt notionTime      `json:"createdAt"`
 	// User-injected steps (type=="user-injected") are the user's survey answers
 	// rendered back into the transcript as a pseudo user message.
 	ActualMessage  json.RawMessage `json:"actualMessage"`
@@ -37,9 +79,10 @@ type tmStep struct {
 }
 
 type tmInner struct {
-	ID          string `json:"id"`
-	CreatedTime int64  `json:"created_time"`
-	Step        tmStep `json:"step"`
+	ID             string     `json:"id"`
+	CreatedTime    notionTime `json:"created_time"`
+	LastEditedTime notionTime `json:"last_edited_time"`
+	Step           tmStep     `json:"step"`
 }
 
 type tmRecord struct {
@@ -48,8 +91,30 @@ type tmRecord struct {
 	} `json:"value"`
 }
 
+// threadMessageMap is the decoded thread_message table of a record map. Every
+// record is decoded on its own, so a single message of an unexpected shape is
+// skipped instead of taking the entire conversation down with it.
+type threadMessageMap map[string]tmRecord
+
+func (m *threadMessageMap) UnmarshalJSON(b []byte) error {
+	raw := map[string]json.RawMessage{}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	out := make(threadMessageMap, len(raw))
+	for id, item := range raw {
+		var rec tmRecord
+		if err := json.Unmarshal(item, &rec); err != nil {
+			continue
+		}
+		out[id] = rec
+	}
+	*m = out
+	return nil
+}
+
 type recordMapShape struct {
-	ThreadMessage map[string]tmRecord `json:"thread_message"`
+	ThreadMessage threadMessageMap `json:"thread_message"`
 }
 
 type orderedTM struct {
@@ -62,7 +127,7 @@ type orderedTM struct {
 func sortedThreadMessages(rm recordMapShape) []orderedTM {
 	out := make([]orderedTM, 0, len(rm.ThreadMessage))
 	for _, m := range rm.ThreadMessage {
-		out = append(out, orderedTM{created: m.Value.Value.CreatedTime, step: m.Value.Value.Step})
+		out = append(out, orderedTM{created: m.Value.Value.CreatedTime.Millis, step: m.Value.Value.Step})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].created < out[j].created })
 	return out
@@ -127,7 +192,7 @@ func parseSurveyStep(s tmStep) *chatSurvey {
 		StepID:    s.ID,
 		Questions: qs,
 		Submitted: s.Submitted,
-		CreatedAt: s.CreatedAt,
+		CreatedAt: s.CreatedAt.String(),
 	}
 	if isMeaningful(s.Responses) {
 		var r map[string]json.RawMessage
@@ -371,31 +436,82 @@ func parseToolResultStep(s tmStep) chatStep {
 
 // ---- inference parsing ----
 
-// parseInferenceParts splits one agent-inference step.value[] into visible
-// thought steps and the concatenated answer text. tool_use parts are skipped
-// here on purpose: tool calls are surfaced from agent-tool-result records,
-// which also carry the input arguments and the result payload.
-func parseInferenceParts(raw json.RawMessage) (steps []chatStep, text string) {
+// turnBuilder assembles one assistant turn as a chronological ribbon of blocks.
+// Actions that happen back to back pile into the same "steps" block; the text
+// the agent writes after them closes that group and becomes its own "text"
+// block. A turn therefore reads "2 actions -> text -> 11 actions -> text", the
+// way Notion shows it, instead of "28 actions -> every paragraph glued into
+// one".
+type turnBuilder struct {
+	blocks  []chatBlock
+	steps   []chatStep
+	text    strings.Builder
+	pending strings.Builder
+}
+
+// addStep appends one visible action and closes any text written before it.
+func (b *turnBuilder) addStep(s chatStep) {
+	b.flushText()
+	b.steps = append(b.steps, s)
+	if n := len(b.blocks); n > 0 && b.blocks[n-1].Kind == "steps" {
+		b.blocks[n-1].Steps = append(b.blocks[n-1].Steps, s)
+		return
+	}
+	b.blocks = append(b.blocks, chatBlock{Kind: "steps", Steps: []chatStep{s}})
+}
+
+// addText buffers a piece of answer text. Pieces that arrive back to back stay
+// one paragraph run; only an action in between splits them into two blocks.
+func (b *turnBuilder) addText(s string) {
+	b.pending.WriteString(s)
+}
+
+// flushText closes the buffered text run. Blank runs are dropped so trailing
+// whitespace neither creates an empty paragraph nor breaks an action group.
+func (b *turnBuilder) flushText() {
+	s := b.pending.String()
+	b.pending.Reset()
+	if strings.TrimSpace(s) == "" {
+		return
+	}
+	if b.text.Len() > 0 {
+		b.text.WriteString("\n\n")
+	}
+	b.text.WriteString(s)
+	b.blocks = append(b.blocks, chatBlock{Kind: "text", Text: s})
+}
+
+// done finalises the turn: the flat text, the flat action list (both kept for
+// backwards compatibility) and the ordered ribbon of blocks.
+func (b *turnBuilder) done() (string, []chatStep, []chatBlock) {
+	b.flushText()
+	return b.text.String(), b.steps, b.blocks
+}
+
+// foldInferenceParts folds one agent-inference step.value[] into the turn in
+// document order: thinking parts become visible thought steps, text parts feed
+// the answer. tool_use parts are skipped here on purpose: tool calls are
+// surfaced from agent-tool-result records, which also carry the input arguments
+// and the result payload.
+func foldInferenceParts(raw json.RawMessage, tb *turnBuilder) {
 	var parts []struct {
 		Type    string `json:"type"`
 		Content string `json:"content"`
 		Name    string `json:"name"`
 	}
 	if json.Unmarshal(raw, &parts) != nil {
-		return nil, ""
+		return
 	}
-	var b strings.Builder
 	for _, p := range parts {
 		switch p.Type {
 		case "thinking":
 			if strings.TrimSpace(p.Content) != "" {
-				steps = append(steps, chatStep{Kind: "thought", Text: p.Content})
+				tb.addStep(chatStep{Kind: "thought", Text: p.Content})
 			}
 		case "text":
-			b.WriteString(p.Content)
+			tb.addText(p.Content)
 		}
 	}
-	return steps, b.String()
 }
 
 // parseUserText extracts the plain text of a "user" step value ([["text"]]).
@@ -417,9 +533,11 @@ func parseUserText(raw json.RawMessage) string {
 
 // extractTurn folds a record-map (ordered by created_time) into the latest
 // assistant turn: its concatenated text, the title, the visible steps (thoughts
-// interleaved with tool calls), the trailing survey (if the agent is asking for
+// interleaved with tool calls), the same turn as an ordered ribbon of action
+// groups and text paragraphs, the trailing survey (if the agent is asking for
 // details) and any pages it created/edited this turn.
-func extractTurn(rm recordMapShape) (text, title string, steps []chatStep, survey *chatSurvey, pages []chatPageRef) {
+func extractTurn(rm recordMapShape) (text, title string, steps []chatStep, blocks []chatBlock, survey *chatSurvey, pages []chatPageRef) {
+	var tb turnBuilder
 	for _, m := range sortedThreadMessages(rm) {
 		switch m.step.Type {
 		case "title":
@@ -428,21 +546,20 @@ func extractTurn(rm recordMapShape) (text, title string, steps []chatStep, surve
 				title = s
 			}
 		case "agent-inference":
-			st, t := parseInferenceParts(m.step.Value)
-			steps = append(steps, st...)
-			text += t
+			foldInferenceParts(m.step.Value, &tb)
 			if pr := parseEditReferenceMap(m.step.EditReferenceMap); len(pr) > 0 {
 				pages = append(pages, pr...)
 			}
 		case "agent-tool-result":
-			steps = append(steps, parseToolResultStep(m.step))
+			tb.addStep(parseToolResultStep(m.step))
 		case "survey":
 			if sv := parseSurveyStep(m.step); sv != nil {
 				survey = sv
 			}
 		}
 	}
-	return text, title, steps, survey, pages
+	text, steps, blocks = tb.done()
+	return text, title, steps, blocks, survey, pages
 }
 
 // parseInferenceStream walks the ndjson patch stream. It prefers the final,
@@ -450,7 +567,7 @@ func extractTurn(rm recordMapShape) (text, title string, steps []chatStep, surve
 // the streamed answer-text deltas (thinking deltas are excluded so the answer
 // body never contains the model's reasoning). It also surfaces the trailing
 // survey + open-page references from the record-map.
-func parseInferenceStream(raw []byte) (text, title string, steps []chatStep, survey *chatSurvey, pages []chatPageRef) {
+func parseInferenceStream(raw []byte) (text, title string, steps []chatStep, blocks []chatBlock, survey *chatSurvey, pages []chatPageRef) {
 	var fallback strings.Builder
 	var sItems []sMeta
 	for _, line := range strings.Split(string(raw), "\n") {
@@ -480,12 +597,12 @@ func parseInferenceStream(raw []byte) (text, title string, steps []chatStep, sur
 			var rmLine struct {
 				RecordMap recordMapShape `json:"recordMap"`
 				V         struct {
-					RecordMap     recordMapShape      `json:"recordMap"`
-					ThreadMessage map[string]tmRecord `json:"thread_message"`
+					RecordMap     recordMapShape   `json:"recordMap"`
+					ThreadMessage threadMessageMap `json:"thread_message"`
 				} `json:"v"`
 				Value struct {
-					RecordMap     recordMapShape      `json:"recordMap"`
-					ThreadMessage map[string]tmRecord `json:"thread_message"`
+					RecordMap     recordMapShape   `json:"recordMap"`
+					ThreadMessage threadMessageMap `json:"thread_message"`
 				} `json:"value"`
 			}
 			if json.Unmarshal([]byte(line), &rmLine) != nil {
@@ -502,7 +619,7 @@ func parseInferenceStream(raw []byte) (text, title string, steps []chatStep, sur
 				if len(c.ThreadMessage) == 0 {
 					continue
 				}
-				t, ti, st, sv, pg := extractTurn(c)
+				t, ti, st, bl, sv, pg := extractTurn(c)
 				if t != "" {
 					text = t
 				}
@@ -511,6 +628,9 @@ func parseInferenceStream(raw []byte) (text, title string, steps []chatStep, sur
 				}
 				if len(st) > 0 {
 					steps = st
+				}
+				if len(bl) > 0 {
+					blocks = bl
 				}
 				if sv != nil {
 					survey = sv
@@ -565,6 +685,12 @@ func parseInferenceStream(raw []byte) (text, title string, steps []chatStep, sur
 	}
 	if strings.TrimSpace(text) == "" {
 		text = strings.TrimSpace(fallback.String())
+		// The record map carried actions but no answer text (or no record map
+		// arrived at all): close the ribbon with the streamed text so the turn
+		// still ends with the answer instead of with an action group.
+		if text != "" {
+			blocks = append(blocks, chatBlock{Kind: "text", Text: text})
+		}
 	}
-	return text, title, steps, survey, pages
+	return text, title, steps, blocks, survey, pages
 }

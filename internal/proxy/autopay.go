@@ -479,7 +479,8 @@ func (m *AutoPayManager) runOnce() {
 				// balance and switch the space back to Free once it runs low
 				// (<= autoPayLowCreditThreshold remaining). This is the
 				// «меньше 50 токенов → тариф фри» rule.
-				used, limit := fetchSpaceAIUsage(token, ws.UserID, sp.SpaceID)
+				aiUsage := fetchSpaceAIUsage(token, ws.UserID, sp.SpaceID)
+				used, limit := aiUsage.PremiumUsed, aiUsage.PremiumLimit
 				if limit <= 0 {
 					log.Printf("[autopay]   – %s (%s): платный (tier=%q), AI-бюджет не определён — пропуск", name, shortID, tier)
 					continue

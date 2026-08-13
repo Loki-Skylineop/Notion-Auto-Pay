@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
+  type ChatBlock,
   type ChatModel,
   type ChatPageRef,
   type ChatStatus,
@@ -121,7 +122,7 @@ export function hashMessages(messages: ChatMessage[]): string {
   const basis = messages
     .map(
       (m) =>
-        `${m.role}|${m.text}|${m.steps?.length || 0}|${m.survey?.id || ''}|${m.survey?.submitted ? 1 : 0}|${(m.pages || []).map((p) => p.url).join(',')}`,
+        `${m.role}|${m.text}|${m.steps?.length || 0}|${m.blocks?.length || 0}|${m.survey?.id || ''}|${m.survey?.submitted ? 1 : 0}|${(m.pages || []).map((p) => p.url).join(',')}`,
     )
     .join('\u0001')
   for (let i = 0; i < basis.length; i += 1) {
@@ -174,9 +175,14 @@ export interface SpaceOption {
 }
 
 export interface ChatMessage {
+  // Files uploaded together with this message (user turns only).
+  attachments?: AttachmentRef[]
   role: 'user' | 'assistant'
   text: string
   steps?: ChatStep[]
+  // The turn as an ordered ribbon of action groups and text paragraphs. Threads
+  // cached before this existed have none, and then flat text/steps is rendered.
+  blocks?: ChatBlock[]
   survey?: ChatSurvey
   pages?: ChatPageRef[]
 }
@@ -401,6 +407,31 @@ export function CopyButton({ text }: { text: string }) {
   )
 }
 
+// Icon-only copy control for a user message: it sits in the same hover row as
+// the pencil, while the assistant keeps the labelled CopyButton under its text.
+export function CopyIconButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false)
+  const onCopy = useCallback(async () => {
+    const ok = await copyToClipboard(text)
+    if (ok) {
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1200)
+    }
+  }, [text])
+  if (!text) return null
+  return (
+    <button
+      type="button"
+      onClick={onCopy}
+      title="Скопировать сообщение"
+      aria-label="Скопировать сообщение"
+      className="shrink-0 mb-1 w-6 h-6 flex items-center justify-center rounded-md border-none bg-transparent text-white/25 opacity-0 group-hover:opacity-100 focus:opacity-100 hover:text-white/80 hover:bg-white/[0.07] transition-all cursor-pointer"
+    >
+      {copied ? <span className="text-[11px] text-emerald-400">✓</span> : <CopyIcon />}
+    </button>
+  )
+}
+
 // --- agent steps (tree view) ---
 
 // DetailBox renders the pretty-printed Input or Response payload of a tool call
@@ -409,7 +440,7 @@ export function DetailBox({ title, text }: { title: string; text: string }) {
   return (
     <div className="rounded-md border border-white/[0.07] bg-white/[0.02] overflow-hidden">
       <div className="px-2 py-1 border-b border-white/[0.06] text-[10px] uppercase tracking-wide text-text-muted">{title}</div>
-      <pre className="px-2 py-1.5 text-[11.5px] font-mono leading-relaxed text-[#8a8a8a] whitespace-pre-wrap wrap-anywhere max-h-72 overflow-y-auto">{text}</pre>
+      <pre className="no-scrollbar px-2 py-1.5 text-[11.5px] font-mono leading-relaxed text-[#8a8a8a] whitespace-pre-wrap wrap-anywhere max-h-72 overflow-y-auto">{text}</pre>
     </div>
   )
 }
@@ -510,9 +541,9 @@ export function StepsTree({ steps }: { steps: ChatStep[] }) {
 // user's turn and the answer, mirroring how Notion renders its steps. Expanded
 // by default; the small header folds long lists away. (Replaces the old
 // collapsed-by-default "Шаги агента · N" blob.)
-export function StepsBlock({ steps }: { steps: ChatStep[] }) {
+export function StepsBlock({ steps, defaultOpen = true }: { steps: ChatStep[]; defaultOpen?: boolean }) {
   const shown = visibleSteps(steps)
-  const [open, setOpen] = useState(true)
+  const [open, setOpen] = useState(defaultOpen)
   if (shown.length === 0) return null
   return (
     <div className="mb-2.5 min-w-0">
@@ -525,6 +556,48 @@ export function StepsBlock({ steps }: { steps: ChatStep[] }) {
         <span>{shown.length} {stepCountWord(shown.length)}</span>
       </button>
       {open ? <StepsTree steps={shown} /> : null}
+    </div>
+  )
+}
+
+// visibleBlocks prepares a turn ribbon for rendering: housekeeping actions are
+// dropped, groups left empty disappear, and paragraphs that became neighbours
+// because the actions between them were hidden merge back into one paragraph.
+export function visibleBlocks(blocks?: ChatBlock[]): ChatBlock[] {
+  const out: ChatBlock[] = []
+  for (const b of blocks || []) {
+    if (b.kind === 'steps') {
+      const shown = visibleSteps(b.steps || [])
+      if (shown.length > 0) out.push({ kind: 'steps', steps: shown })
+      continue
+    }
+    const text = (b.text || '').trim()
+    if (!text) continue
+    const last = out[out.length - 1]
+    if (last && last.kind === 'text') {
+      out[out.length - 1] = { kind: 'text', text: `${last.text}\n\n${text}` }
+      continue
+    }
+    out.push({ kind: 'text', text })
+  }
+  return out
+}
+
+// TurnRibbon renders a finished assistant turn the way Notion does: each group
+// of actions folds behind its own header, and the text the agent wrote after
+// that group follows it as a paragraph, in chronological order.
+export function TurnRibbon({ blocks }: { blocks: ChatBlock[] }) {
+  return (
+    <div className="min-w-0">
+      {blocks.map((b, i) =>
+        b.kind === 'steps' ? (
+          <StepsBlock key={i} steps={b.steps || []} defaultOpen={false} />
+        ) : (
+          <div key={i} className="mb-2.5 last:mb-0 text-[13.5px] leading-relaxed text-[#8a8a8a]">
+            <MessageBody text={b.text || ''} />
+          </div>
+        ),
+      )}
     </div>
   )
 }
@@ -595,7 +668,7 @@ export function CodeBlock({ code, lang }: { code: string; lang?: string }) {
       >
         {copied ? <span className="text-ok text-[11px]">✓</span> : <CopyIcon />}
       </button>
-      <pre className="p-3 pr-9 rounded-lg bg-white/[0.03] border border-white/[0.06] overflow-x-auto max-w-full text-[12.5px] font-mono leading-relaxed text-[#cfcfcf]">
+      <pre className="no-scrollbar p-3 pr-9 rounded-lg bg-white/[0.03] border border-white/[0.06] overflow-x-auto max-w-full text-[12.5px] font-mono leading-relaxed text-[#cfcfcf]">
         {lang ? <div className="mb-1 text-[10px] uppercase tracking-wide text-text-muted">{lang}</div> : null}
         <code>{code}</code>
       </pre>
@@ -633,7 +706,7 @@ export function renderBlocks(text: string): React.ReactNode[] {
         i += 1
       }
       blocks.push(
-        <div key={key++} className="my-2 overflow-x-auto max-w-full">
+        <div key={key++} className="no-scrollbar my-2 overflow-x-auto max-w-full">
           <table className="w-full border-collapse text-[13px]">
             <thead>
               <tr>
@@ -765,15 +838,212 @@ export function PageCards({ pages }: { pages: ChatPageRef[] }) {
   )
 }
 
+// --- attachments & inline message editing --------------------------------
+
+// One file already stored in Notion's bucket. Kept structural on purpose, so
+// callers can hand over api.ts' ChatAttachment without an extra import.
+export type AttachmentRef = { file_url: string; file_name: string; content_type: string; file_size: number }
+
+// One upload still in flight, shown in the composer while bytes are on the wire.
+export type UploadTask = { id: string; name: string; progress: number }
+
+// Human-readable size for attachment chips: 3 B / 12.4 KB / 1.2 MB.
+export function formatBytes(n: number): string {
+  if (!n || n < 0) return '0 B'
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} KB`
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`
+}
+
+export function PaperclipIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M21.44 11.05l-9.19 9.19a5.5 5.5 0 0 1-7.78-7.78l9.19-9.19a3.5 3.5 0 0 1 4.95 4.95l-9.2 9.19a1.5 1.5 0 0 1-2.12-2.12l8.49-8.49" />
+    </svg>
+  )
+}
+
+export function FileIcon({ size = 13 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M14 3v5h5" />
+      <path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8l-5-5z" />
+    </svg>
+  )
+}
+
+export function PencilIcon({ size = 13 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
+    </svg>
+  )
+}
+
+// Files attached to a sent message: compact chips above the message text.
+export function AttachmentList({ items }: { items: AttachmentRef[] }) {
+  return (
+    <div className="flex flex-wrap gap-1.5 mb-2">
+      {items.map((a, i) => (
+        <span
+          key={a.file_url + i}
+          title={a.file_name}
+          className="inline-flex items-center gap-1.5 max-w-full px-2 py-1 rounded-lg bg-white/[0.05] border border-white/[0.09] text-[11.5px] text-[#c8c8c8] animate-[chip-in_.18s_ease-out]"
+        >
+          <span className="shrink-0 text-white/40">
+            <FileIcon />
+          </span>
+          <span className="truncate max-w-[170px]">{a.file_name}</span>
+          <span className="shrink-0 text-[10px] text-white/25 tabular-nums">{formatBytes(a.file_size)}</span>
+        </span>
+      ))}
+    </div>
+  )
+}
+
+// Inline editor for the last user message. The bubble turns into a textarea in
+// place: Enter saves and re-asks the agent, Esc cancels. Same flow as Notion's
+// own edit affordance (it rewrites the step and re-runs the turn).
+function MessageEditor({
+  text,
+  busy,
+  onCancel,
+  onSubmit,
+}: {
+  text: string
+  busy?: boolean
+  onCancel?: () => void
+  onSubmit?: (next: string) => void
+}) {
+  const [value, setValue] = useState(text)
+  const ref = useRef<HTMLTextAreaElement>(null)
+
+  // Focus with the caret at the end and grow to fit the existing text.
+  useEffect(() => {
+    const el = ref.current
+    if (!el) return
+    el.focus()
+    el.setSelectionRange(el.value.length, el.value.length)
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, 240)}px`
+  }, [])
+
+  const save = useCallback(() => {
+    const next = value.trim()
+    if (!next || busy) return
+    if (next === text.trim()) {
+      if (onCancel) onCancel()
+      return
+    }
+    if (onSubmit) onSubmit(next)
+  }, [value, busy, text, onCancel, onSubmit])
+
+  return (
+    <div className="flex justify-end min-w-0">
+      <div className="w-full sm:max-w-[85%] min-w-0 px-3 py-2.5 rounded-2xl rounded-tr-sm bg-[#141414] border border-white/[0.16] animate-[chip-in_.15s_ease-out]">
+        <textarea
+          ref={ref}
+          value={value}
+          disabled={busy}
+          onChange={(e) => {
+            setValue(e.target.value)
+            const el = e.target
+            el.style.height = 'auto'
+            el.style.height = `${Math.min(el.scrollHeight, 240)}px`
+          }}
+          onKeyDown={(e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault()
+              save()
+            } else if (e.key === 'Escape') {
+              e.preventDefault()
+              if (onCancel) onCancel()
+            }
+          }}
+          rows={1}
+          className="no-scrollbar w-full resize-none max-h-[240px] overflow-y-auto bg-transparent border-none outline-none text-[#e8e8e8] text-[13.5px] leading-relaxed disabled:opacity-50"
+        />
+        <div className="flex items-center gap-2 mt-2">
+          <span className="mr-auto text-[10px] text-[#3a3a3a] hidden sm:block">Enter — сохранить и переспросить · Esc — отмена</span>
+          <button
+            type="button"
+            onClick={onCancel}
+            disabled={busy}
+            className="px-2.5 py-1 rounded-lg text-[11.5px] text-white/50 hover:text-white/80 hover:bg-white/[0.06] transition-colors border-none bg-transparent cursor-pointer disabled:opacity-40"
+          >
+            Отмена
+          </button>
+          <button
+            type="button"
+            onClick={save}
+            disabled={busy || value.trim() === ''}
+            className="px-2.5 py-1 rounded-lg text-[11.5px] bg-white text-black hover:bg-[#f0f0f0] transition-colors border-none cursor-pointer disabled:opacity-25 disabled:cursor-not-allowed"
+          >
+            Сохранить и отправить
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 // A single rendered message. Memoised so typing in the composer (which lives in
 // its own component) never re-runs the markdown renderer for the whole log.
 // Mockup layout: user turns sit in a compact right-aligned bubble, assistant
 // turns are full-width with a small ✦ avatar and dimmed body text.
-export const MessageRow = memo(function MessageRow({ role, text, steps, pages }: { role: 'user' | 'assistant'; text: string; steps?: ChatStep[]; pages?: ChatPageRef[] }) {
+export const MessageRow = memo(function MessageRow({
+  role,
+  text,
+  steps,
+  blocks,
+  pages,
+  attachments,
+  canEdit,
+  editing,
+  editBusy,
+  onEditStart,
+  onEditCancel,
+  onEditSubmit,
+}: {
+  role: 'user' | 'assistant'
+  text: string
+  steps?: ChatStep[]
+  blocks?: ChatBlock[]
+  pages?: ChatPageRef[]
+  // Files that travelled with this message (rendered as chips above the text).
+  attachments?: AttachmentRef[]
+  // Only the last user message can be edited, exactly like in Notion.
+  canEdit?: boolean
+  editing?: boolean
+  editBusy?: boolean
+  onEditStart?: () => void
+  onEditCancel?: () => void
+  onEditSubmit?: (next: string) => void
+}) {
+  // Prepared once per render: hiding housekeeping actions can leave an empty
+  // group behind or split one paragraph in two, which visibleBlocks repairs.
+  const ribbon = useMemo(() => visibleBlocks(blocks), [blocks])
   if (role === 'user') {
+    if (editing) {
+      return <MessageEditor text={text} busy={editBusy} onCancel={onEditCancel} onSubmit={onEditSubmit} />
+    }
     return (
-      <div className="flex justify-end min-w-0">
+      <div className="group flex justify-end items-end gap-1.5 min-w-0">
+        <CopyIconButton text={text} />
+        {canEdit && onEditStart ? (
+          <button
+            type="button"
+            onClick={onEditStart}
+            title="Изменить сообщение"
+            aria-label="Изменить сообщение"
+            className="shrink-0 mb-1 w-6 h-6 flex items-center justify-center rounded-md border-none bg-transparent text-white/25 opacity-0 group-hover:opacity-100 focus:opacity-100 hover:text-white/80 hover:bg-white/[0.07] transition-all cursor-pointer"
+          >
+            <PencilIcon />
+          </button>
+        ) : null}
         <div className="max-w-[80%] min-w-0 px-3.5 py-2.5 rounded-2xl rounded-tr-sm bg-[#141414] border border-white/[0.07] text-[#e8e8e8] text-[13.5px] leading-relaxed wrap-anywhere">
+          {attachments && attachments.length > 0 ? <AttachmentList items={attachments} /> : null}
           <MessageBody text={text} />
         </div>
       </div>
@@ -785,10 +1055,16 @@ export const MessageRow = memo(function MessageRow({ role, text, steps, pages }:
         <span className="text-[9px] text-white/60">✦</span>
       </div>
       <div className="min-w-0 flex-1">
-        {steps && steps.length > 0 ? <StepsBlock steps={steps} /> : null}
-        <div className="text-[13.5px] leading-relaxed text-[#8a8a8a]">
-          <MessageBody text={text} />
-        </div>
+        {ribbon.length > 0 ? (
+          <TurnRibbon blocks={ribbon} />
+        ) : (
+          <>
+            {steps && steps.length > 0 ? <StepsBlock steps={steps} /> : null}
+            <div className="text-[13.5px] leading-relaxed text-[#8a8a8a]">
+              <MessageBody text={text} />
+            </div>
+          </>
+        )}
         {pages && pages.length > 0 ? <PageCards pages={pages} /> : null}
         <CopyButton text={text} />
       </div>
@@ -831,6 +1107,248 @@ export const dotDelay0: React.CSSProperties = { animationDelay: '0ms' }
 export const dotDelay1: React.CSSProperties = { animationDelay: '160ms' }
 export const dotDelay2: React.CSSProperties = { animationDelay: '320ms' }
 
+// --- remembered model ---
+
+// Remembered model per workspace: { "<spaceId>": "agave-flan" }. Keyed by space
+// because the available model list differs per workspace, so a single global
+// value would be wrong the moment you switch workspaces.
+export const CHAT_MODEL_KEY = 'nmp_chat_model'
+
+export function loadRememberedModels(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(CHAT_MODEL_KEY)
+    const parsed = raw ? JSON.parse(raw) : null
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, string>) : {}
+  } catch {
+    return {}
+  }
+}
+
+export function saveRememberedModel(spaceId: string, modelId: string): void {
+  if (!spaceId) return
+  try {
+    const all = loadRememberedModels()
+    if (modelId) all[spaceId] = modelId
+    else delete all[spaceId]
+    localStorage.setItem(CHAT_MODEL_KEY, JSON.stringify(all))
+  } catch {
+    // ignore quota / privacy-mode failures
+  }
+}
+
+// --- reasoning effort (thinking budget) ---
+
+// Notion ships a per-model list of reasoning efforts inside getAvailableModels
+// (modelConfiguration.supportedReasoningEfforts) and the sets really do differ:
+// GPT-5.6 Sol -> none/low/medium/high/xhigh/max, Opus 5 -> low/medium/high/max,
+// Opus 4.7 -> high only, Haiku 4.5 -> none at all. So we never hardcode a list;
+// we only need a canonical weak-to-strong order to rank whatever the API sent.
+export const EFFORT_ORDER = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
+
+export const EFFORT_LABELS: Record<string, string> = {
+  none: 'Без размышлений',
+  minimal: 'Минимальная',
+  low: 'Низкая',
+  medium: 'Средняя',
+  high: 'Высокая',
+  xhigh: 'Очень высокая',
+  max: 'Максимальная',
+}
+
+export function effortLabel(effort: string): string {
+  return EFFORT_LABELS[effort] || effort
+}
+
+// Sort an effort list weak -> strong. Values we do not know yet (a future
+// Notion tier) are kept and pushed to the end rather than dropped, so a
+// server-side addition degrades gracefully instead of vanishing.
+export function sortEfforts(efforts: string[]): string[] {
+  const unique = Array.from(new Set((efforts || []).filter(Boolean)))
+  return unique.sort((a, b) => {
+    const ia = EFFORT_ORDER.indexOf(a)
+    const ib = EFFORT_ORDER.indexOf(b)
+    if (ia === -1 && ib === -1) return a.localeCompare(b)
+    if (ia === -1) return 1
+    if (ib === -1) return -1
+    return ia - ib
+  })
+}
+
+// Default = the strongest effort the model supports, with Notion own default
+// as a fallback for models that report an empty list.
+export function strongestEffort(efforts: string[], fallback?: string): string {
+  const sorted = sortEfforts(efforts)
+  return sorted.length > 0 ? sorted[sorted.length - 1] : fallback || ''
+}
+
+// Map an effort onto 1..4 signal bars. Models with <= 4 tiers get one bar per
+// tier; richer models (GPT-5.6 has six) are squeezed onto four bars so the glyph
+// stays legible at 14px. Either way the strongest effort lights them all.
+export function effortBars(efforts: string[], effort: string): { level: number; bars: number } {
+  const sorted = sortEfforts(efforts)
+  const n = sorted.length
+  if (n === 0) return { level: 0, bars: 4 }
+  const idx = Math.max(0, sorted.indexOf(effort))
+  if (n <= 4) return { level: idx + 1, bars: n }
+  return { level: Math.max(1, Math.round(((idx + 1) / n) * 4)), bars: 4 }
+}
+
+// Remembered effort per model codename: { "agave-flan": "medium" }. Keyed by
+// model because the legal values differ per model, so a single global value
+// would be wrong the moment you switch models.
+export const CHAT_EFFORT_KEY = 'nmp_chat_effort'
+
+export function loadEfforts(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(CHAT_EFFORT_KEY)
+    const parsed = raw ? JSON.parse(raw) : null
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, string>) : {}
+  } catch {
+    return {}
+  }
+}
+
+export function saveEffort(modelId: string, effort: string): void {
+  if (!modelId) return
+  try {
+    const all = loadEfforts()
+    if (effort) all[modelId] = effort
+    else delete all[modelId]
+    localStorage.setItem(CHAT_EFFORT_KEY, JSON.stringify(all))
+  } catch {
+    // ignore quota / privacy-mode failures
+  }
+}
+
+// Which effort to use for a model right now: the remembered pick when the model
+// still supports it (this is what survives a reload and model switching),
+// otherwise the strongest available. '' means the model has no effort knob.
+export function resolveEffort(model: ChatModel | undefined, remembered: Record<string, string>): string {
+  if (!model) return ''
+  const efforts = sortEfforts(model.efforts || [])
+  if (efforts.length === 0) return ''
+  const saved = remembered[model.id]
+  if (saved && efforts.includes(saved)) return saved
+  return strongestEffort(efforts, model.default_effort)
+}
+
+// Signal-bars glyph: the number of lit bars tracks the effort rank, so the icon
+// visibly changes for every tier and is fully lit on the strongest one.
+export function SignalIcon({ level, bars = 4 }: { level: number; bars?: number }) {
+  const total = Math.max(1, Math.min(4, bars))
+  const heights = [5, 9, 13, 17]
+  const offset = 4 - total
+  return (
+    <svg width="14" height="14" viewBox="0 0 20 20" fill="none" aria-hidden="true">
+      {Array.from({ length: total }, (_, i) => (
+        <rect
+          key={i}
+          x={2 + i * 4.5}
+          y={18 - heights[offset + i]}
+          width="3"
+          height={heights[offset + i]}
+          rx="1"
+          fill="currentColor"
+          opacity={i < level ? 1 : 0.2}
+        />
+      ))}
+    </svg>
+  )
+}
+
+// The effort picker sits next to the model dropdown in the composer. It renders
+// nothing for models without reasoning efforts, so the composer stays clean.
+export const EffortPicker = memo(function EffortPicker({
+  efforts,
+  value,
+  onChange,
+  disabled = false,
+}: {
+  efforts: string[]
+  value: string
+  onChange: (effort: string) => void
+  disabled?: boolean
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+  const sorted = useMemo(() => sortEfforts(efforts), [efforts])
+
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent) => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false)
+    }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+
+  if (sorted.length === 0) return null
+
+  const current = sorted.includes(value) ? value : sorted[sorted.length - 1]
+  const shown = effortBars(sorted, current)
+
+  return (
+    <div ref={rootRef} className="relative shrink-0">
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={() => setOpen((v) => !v)}
+        title={`Эффективность: ${effortLabel(current)}`}
+        aria-label={`Эффективность модели: ${effortLabel(current)}`}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        className={`flex items-center justify-center rounded-lg border px-2 py-1.5 transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed ${
+          open
+            ? 'border-white/[0.18] bg-white/[0.06] text-[#e8e8e8]'
+            : 'border-white/[0.09] bg-transparent text-[#9a9a9a] hover:text-[#d0d0d0] hover:border-white/[0.14]'
+        }`}
+      >
+        <SignalIcon level={shown.level} bars={shown.bars} />
+      </button>
+
+      {open ? (
+        <div
+          role="listbox"
+          aria-label="Эффективность модели"
+          className="no-scrollbar absolute z-50 bottom-full right-0 mb-1 w-max min-w-[180px] max-h-64 overflow-y-auto rounded-md border border-white/[0.1] bg-[#0c0c0c] py-1 shadow-lg"
+        >
+          <div className="px-2.5 py-1 text-[10px] uppercase tracking-wider text-[#5a5a5a]">Эффективность</div>
+          {sorted.map((effort) => {
+            const active = effort === current
+            const row = effortBars(sorted, effort)
+            return (
+              <button
+                key={effort}
+                type="button"
+                role="option"
+                aria-selected={active}
+                onClick={() => {
+                  onChange(effort)
+                  setOpen(false)
+                }}
+                className={`w-full flex items-center gap-2 px-2.5 py-1.5 text-left text-[12px] bg-transparent border-none cursor-pointer transition-colors ${
+                  active ? 'text-[#e8e8e8] bg-white/[0.06]' : 'text-[#999] hover:text-[#ccc] hover:bg-white/[0.04]'
+                }`}
+              >
+                <SignalIcon level={row.level} bars={row.bars} />
+                <span className="flex-1 truncate">{effortLabel(effort)}</span>
+                {active ? <span className="shrink-0 text-[10px] text-notion-blue">✓</span> : null}
+              </button>
+            )
+          })}
+        </div>
+      ) : null}
+    </div>
+  )
+})
+
 // The message composer owns its own input state so keystrokes don't re-render
 // the (potentially long) message log — this fixes typing lag on big threads.
 // The textarea auto-grows with the message (up to a cap) like the mockup.
@@ -841,9 +1359,16 @@ export const Composer = memo(function Composer({
   models,
   selectedModel,
   onModelChange,
+  selectedEffort,
+  onEffortChange,
   onSend,
   onStop,
   draftKey,
+  attachments = [],
+  uploads = [],
+  onPickFiles,
+  onRemoveAttachment,
+  busyElsewhere = false,
 }: {
   hasSpace: boolean
   sending: boolean
@@ -851,12 +1376,35 @@ export const Composer = memo(function Composer({
   models: ChatModel[]
   selectedModel: string
   onModelChange: (id: string) => void
+  selectedEffort: string
+  onEffortChange: (effort: string) => void
   onSend: (text: string) => void
   onStop: () => void
   draftKey: string
+  // Files already uploaded and waiting to travel with the next message.
+  attachments?: AttachmentRef[]
+  // Uploads still running; they drive the progress chips and the spinner.
+  uploads?: UploadTask[]
+  onPickFiles?: (files: File[]) => void
+  onRemoveAttachment?: (index: number) => void
+  // Ход агента идёт в ДРУГОМ чате: отсюда отправлять нельзя (состояние хода в
+  // ChatTab одно на всю вкладку), но и «Стоп» показывать неправильно — он бы
+  // остановил чужой ход.
+  busyElsewhere?: boolean
 }) {
   const [text, setText] = useState(() => getDraft(draftKey))
   const taRef = useRef<HTMLTextAreaElement>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
+  // Sending waits for the bytes to land, so a file always leaves together with
+  // the message it belongs to.
+  const busyUploading = uploads.length > 0
+
+  // Efforts always come from the currently selected model, so the picker
+  // rebuilds itself on every model change and hides for models without any.
+  const activeEfforts = useMemo(() => {
+    const model = models.find((m) => m.id === selectedModel)
+    return sortEfforts(model?.efforts || [])
+  }, [models, selectedModel])
 
   const resize = useCallback(() => {
     const el = taRef.current
@@ -877,7 +1425,7 @@ export const Composer = memo(function Composer({
 
   const submit = useCallback(() => {
     const t = text.trim()
-    if (!t || !hasSpace || sending) return
+    if (!t || !hasSpace || sending || busyUploading || busyElsewhere) return
     onSend(t)
     setText('')
     saveDraft(draftKey, '')
@@ -885,7 +1433,7 @@ export const Composer = memo(function Composer({
       const el = taRef.current
       if (el) el.style.height = 'auto'
     })
-  }, [text, hasSpace, sending, onSend, draftKey])
+  }, [text, hasSpace, sending, busyUploading, busyElsewhere, onSend, draftKey])
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -899,7 +1447,50 @@ export const Composer = memo(function Composer({
 
   return (
     <div className="relative z-10 px-4 md:px-6 pb-4 pt-2">
-      <div className="flex items-end gap-2.5 rounded-xl border border-white/[0.09] bg-[#080808] px-3.5 py-2.5 focus-within:border-white/[0.18] transition-colors">
+      <div className="rounded-xl border border-white/[0.09] bg-[#080808] px-3.5 py-2.5 focus-within:border-white/[0.18] transition-colors">
+        {attachments.length > 0 || uploads.length > 0 ? (
+          <div className="flex flex-wrap gap-1.5 pb-2">
+            {attachments.map((a, i) => (
+              <span
+                key={a.file_url + i}
+                title={a.file_name}
+                className="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg bg-white/[0.05] border border-white/[0.09] text-[11.5px] text-[#d0d0d0] animate-[chip-in_.18s_ease-out]"
+              >
+                <span className="shrink-0 text-white/40">
+                  <FileIcon />
+                </span>
+                <span className="truncate max-w-[160px]">{a.file_name}</span>
+                <span className="shrink-0 text-[10px] text-white/25 tabular-nums">{formatBytes(a.file_size)}</span>
+                <button
+                  type="button"
+                  onClick={() => onRemoveAttachment && onRemoveAttachment(i)}
+                  title="Убрать"
+                  aria-label="Убрать"
+                  className="shrink-0 ml-0.5 w-4 h-4 flex items-center justify-center rounded text-white/25 hover:text-white/80 hover:bg-white/[0.08] transition-colors border-none bg-transparent cursor-pointer leading-none"
+                >
+                  <CloseIcon />
+                </button>
+              </span>
+            ))}
+            {uploads.map((u) => (
+              <span
+                key={u.id}
+                title={u.name}
+                className="relative inline-flex items-center gap-1.5 px-2 py-1 rounded-lg bg-white/[0.03] border border-white/[0.09] text-[11.5px] text-[#9a9a9a] overflow-hidden animate-[chip-in_.18s_ease-out]"
+              >
+                <span
+                  className="absolute left-0 top-0 bottom-0 bg-white/[0.08] transition-[width] duration-200 ease-out"
+                  style={{ width: `${Math.round(u.progress * 100)}%` }}
+                />
+                <span className="absolute inset-0 bg-gradient-to-r from-transparent via-white/[0.07] to-transparent animate-[upload-shimmer_1.1s_linear_infinite]" />
+                <span className="relative shrink-0 w-3 h-3 rounded-full border-2 border-white/25 border-t-transparent animate-spin" />
+                <span className="relative truncate max-w-[150px]">{u.name}</span>
+                <span className="relative shrink-0 text-[10px] text-white/30 tabular-nums">{Math.round(u.progress * 100)}%</span>
+              </span>
+            ))}
+          </div>
+        ) : null}
+        <div className="flex items-end gap-2.5">
         <textarea
           ref={taRef}
           value={text}
@@ -912,8 +1503,34 @@ export const Composer = memo(function Composer({
           rows={1}
           placeholder={hasSpace ? 'Напишите сообщение…' : 'Сначала выберите пространство'}
           disabled={!hasSpace}
-          className="flex-1 min-w-0 resize-none max-h-[220px] overflow-y-auto bg-transparent border-none outline-none text-[#e8e8e8] text-[13.5px] placeholder-[#333] leading-relaxed py-0.5 disabled:opacity-50"
+          className="no-scrollbar flex-1 min-w-0 resize-none max-h-[220px] overflow-y-auto bg-transparent border-none outline-none text-[#e8e8e8] text-[13.5px] placeholder-[#333] leading-relaxed py-0.5 disabled:opacity-50"
         />
+        <input
+          ref={fileRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={(e) => {
+            const list = Array.from(e.target.files || [])
+            if (list.length > 0 && onPickFiles) onPickFiles(list)
+            // Reset so picking the very same file again still fires onChange.
+            e.target.value = ''
+          }}
+        />
+        <button
+          type="button"
+          onClick={() => fileRef.current && fileRef.current.click()}
+          disabled={!hasSpace || busyUploading}
+          title="Прикрепить файл"
+          aria-label="Прикрепить файл"
+          className="shrink-0 w-7 h-7 flex items-center justify-center rounded-full border-none bg-transparent text-white/40 hover:text-white/85 hover:bg-white/[0.07] transition-colors disabled:opacity-25 disabled:cursor-not-allowed cursor-pointer"
+        >
+          {busyUploading ? (
+            <span className="w-3.5 h-3.5 rounded-full border-2 border-white/30 border-t-transparent animate-spin" />
+          ) : (
+            <PaperclipIcon />
+          )}
+        </button>
         {showModelPicker ? (
           <Dropdown
             value={selectedModel}
@@ -928,6 +1545,9 @@ export const Composer = memo(function Composer({
             options={models.filter((m) => !m.disabled).map((m) => ({ value: m.id, label: m.label }))}
           />
         ) : null}
+        {showModelPicker && activeEfforts.length > 0 ? (
+          <EffortPicker efforts={activeEfforts} value={selectedEffort} onChange={onEffortChange} disabled={!hasSpace} />
+        ) : null}
         {sending ? (
           <button
             type="button"
@@ -941,15 +1561,18 @@ export const Composer = memo(function Composer({
           <button
             type="button"
             onClick={submit}
-            disabled={!hasSpace || text.trim() === ''}
-            title="Отправить"
+            disabled={!hasSpace || busyUploading || busyElsewhere || text.trim() === ''}
+            title={busyElsewhere ? 'Агент сейчас занят ходом в другом чате' : 'Отправить'}
             className="shrink-0 w-7 h-7 flex items-center justify-center rounded-full bg-white text-black hover:bg-[#f0f0f0] transition-colors disabled:opacity-25 disabled:cursor-not-allowed border-none cursor-pointer"
           >
             <SendIcon />
           </button>
         )}
+        </div>
       </div>
-      <p className="text-center text-[10px] text-[#3a3a3a] mt-1.5">Enter — отправить · Shift+Enter — новая строка</p>
+      <p className="text-center text-[10px] text-[#3a3a3a] mt-1.5">
+        {busyElsewhere ? 'Агент отвечает в другом чате — дождитесь конца хода' : 'Enter — отправить · Shift+Enter — новая строка'}
+      </p>
     </div>
   )
 })

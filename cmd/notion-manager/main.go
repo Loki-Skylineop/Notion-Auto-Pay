@@ -5,8 +5,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"notion-manager/internal/proxy"
@@ -88,6 +90,9 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	// Subscription payment endpoints
 	mux.HandleFunc("/admin/subscribe", proxy.HandleSubscribe(accountsDir, dashAuth))
 	mux.HandleFunc("/admin/subscribe/checkout", proxy.HandleSubscribeCheckout(proxy.AppConfig.Stripe.Key, dashAuth))
+	// Free trial activation (no card at all). Replays the payload captured
+	// from the Notion web client: updateSubscription + trialData + trialEnd.
+	mux.HandleFunc("/admin/subscribe/trial", proxy.HandleSubscribeTrial(dashAuth))
 
 	// Workspace discovery endpoint
 	mux.HandleFunc("/admin/discover", proxy.HandleDiscoverWorkspaces(dashAuth))
@@ -95,6 +100,24 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	// pool straight from the server (e.g. a fresh incognito window with an
 	// empty localStorage cache) instead of relying only on the browser cache.
 	mux.HandleFunc("/admin/workspaces", proxy.HandleListWorkspaces(pool, dashAuth))
+	// Bulk-create brand new workspaces (random names) for one account token.
+	mux.HandleFunc("/admin/workspaces/create", proxy.HandleCreateWorkspaces(dashAuth))
+	// Delete workspaces. Replays the web client's single async task per space
+	// (enqueueTask{deleteSpace}) and then polls getTasks until Notion reports
+	// success. Irreversible. See internal/proxy/workspace_delete.go.
+	mux.HandleFunc("/admin/workspaces/delete", proxy.HandleDeleteWorkspaces(dashAuth))
+	// Attach an MCP server to a single workspace. Replays the exact four-step
+	// sequence the Notion web client performs: validateMcpConnection ->
+	// createAgentChatModule -> postWorkflowsMcpServerConnect ->
+	// addAgentChatModule. See internal/proxy/mcp_connect.go.
+	mux.HandleFunc("/admin/mcp/connect", proxy.HandleMcpConnect(dashAuth))
+	// Detach an MCP server from a workspace. Replays the web client's single
+	// disconnectPersonalMcpServer transaction: drop the module pointer from
+	// space_view.settings.agent_chat_modules and mark the backing
+	// workflow_module alive:false, both inside one transaction.
+	// See internal/proxy/mcp_disconnect.go.
+	mux.HandleFunc("/admin/mcp/disconnect", proxy.HandleMcpDisconnect(dashAuth))
+	mux.HandleFunc("/admin/overage/toggle", proxy.HandleOverageToggle(dashAuth))
 
 	// Chat tab. Proxies the private Notion AI chat protocol per workspace so
 	// the dashboard can list agents, list threads, load a thread's history and
@@ -115,6 +138,12 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	// Submit the user's answers to an agent survey (Уточню пару деталей…)
 	// and continue the turn, streaming the agent's reply just like /stream.
 	mux.HandleFunc("/admin/chat/survey", proxy.HandleChatSurvey(dashAuth))
+	// Rewrite the last user message and re-run the agent, mirroring the web
+	// client's AgentUserStep.saveUserStepChanges + runInferenceTranscript.
+	mux.HandleFunc("/admin/chat/edit", proxy.HandleChatEdit(dashAuth))
+	// Upload a composer attachment (presigned S3 POST) and get back the
+	// "computer-file" descriptor the next message carries. See chat_edit.go.
+	mux.HandleFunc("/admin/chat/upload", proxy.HandleChatUpload(dashAuth))
 
 	// Server-side auto-pay config + manual trigger. The actual paying is done
 	// by the background scheduler (AutoPayManager.Start) so it keeps running
@@ -297,6 +326,12 @@ func main() {
 	log.Printf("  GET  /admin/settings              (search/proxy/ASK settings)")
 	log.Printf("  GET  /admin/stats                 (token usage stats)")
 	log.Printf("  GET  /admin/workspaces            (all-accounts workspace list)")
+	log.Printf("  POST /admin/workspaces/create     (bulk create random workspaces)")
+	log.Printf("  POST /admin/workspaces/delete     (delete workspaces, irreversible)")
+	log.Printf("  POST /admin/mcp/connect           (attach an MCP server to a space)")
+	log.Printf("  POST /admin/mcp/disconnect        (detach an MCP server from a space)")
+	log.Printf("  POST /admin/overage/toggle        (toggle 'use additional credits')")
+	log.Printf("  POST /admin/subscribe/trial       (activate free trial, no card)")
 	log.Printf("  POST /admin/chat/agents           (list chat agents for a space)")
 	log.Printf("  POST /admin/chat/models           (list available models for a space)")
 	log.Printf("  POST /admin/chat/threads          (list chat threads for a space)")
@@ -315,7 +350,28 @@ func main() {
 	log.Printf("  GET  /admin/register/jobs/{id}/events (SSE progress)")
 	log.Printf("  GET  /ai                          (Reverse Proxy -> notion.so)")
 
+	// Phones cannot use http://localhost - that name means "this device" on the
+	// phone too. They need this machine's LAN address, which Windows Firewall
+	// blocks by default, so the port is opened here and closed again below.
+	lanCleanup := proxy.EnableLanAccess(port)
+	for _, ip := range proxy.LanAddresses() {
+		log.Printf("From a phone on the same network: http://%s:%s/dashboard/", ip, port)
+	}
+
+	// Ctrl+C and closing the console window both arrive here - Windows turns the
+	// close event into SIGTERM and waits a few seconds - which is what keeps the
+	// firewall rule from outliving this process.
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-stop
+		log.Printf("Shutting down...")
+		lanCleanup()
+		os.Exit(0)
+	}()
+
 	if err := http.ListenAndServe(":"+port, cors(apiKeyAuthMiddleware(apiKey, mux))); err != nil {
+		lanCleanup()
 		log.Fatalf("Server error: %v", err)
 	}
 }

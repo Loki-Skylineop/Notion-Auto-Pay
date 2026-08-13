@@ -258,15 +258,18 @@ func notionAPICallRaw(client *http.Client, acc *Account, endpoint string, body i
 }
 
 // uploadToS3 uploads file data to S3 using presigned POST fields.
-// Uses a plain http.Client (not Chrome TLS) because S3 presigned POST requires HTTP/1.1.
+// Uses the shared HTTP/1.1-only S3 client (never the Chrome http2 round
+// tripper) because the bucket answers presigned POSTs in HTTP/1.1, and it
+// keeps the upload on the same proxy hop as the rest of the Notion traffic.
 func uploadToS3(_ *http.Client, postURL string, fields map[string]string, data []byte, contentType string) error {
-	s3Client := &http.Client{Timeout: 30 * time.Second}
+	s3Client := getS3HTTPClient(30 * time.Second)
 	var buf bytes.Buffer
 	writer := multipart.NewWriter(&buf)
 
-	// Write all presigned fields first (order matters for S3)
-	for k, v := range fields {
-		if err := writer.WriteField(k, v); err != nil {
+	// Write all presigned fields first, in the captured browser order; "file"
+	// must be the last part of the form.
+	for _, k := range orderedUploadFields(fields) {
+		if err := writer.WriteField(k, fields[k]); err != nil {
 			return fmt.Errorf("write field %s: %w", k, err)
 		}
 	}
