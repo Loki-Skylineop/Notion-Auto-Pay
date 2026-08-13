@@ -518,6 +518,25 @@ func foldInferenceParts(raw json.RawMessage, tb *turnBuilder) {
 	}
 }
 
+// queuedStepText inspects a transcript step that the stream appended mid-turn.
+// ok reports that it is a user message, queued reports that Notion marked it
+// "queued": true -- which is what a message sent while the agent was still
+// working looks like (see chat_queue.go).
+func queuedStepText(raw json.RawMessage) (text string, queued, ok bool) {
+	var rec struct {
+		Type   string          `json:"type"`
+		Value  json.RawMessage `json:"value"`
+		Queued bool            `json:"queued"`
+	}
+	if json.Unmarshal(raw, &rec) != nil {
+		return "", false, false
+	}
+	if rec.Type != "user" {
+		return "", false, false
+	}
+	return parseUserText(rec.Value), rec.Queued, true
+}
+
 // parseUserText extracts the plain text of a "user" step value ([["text"]]).
 func parseUserText(raw json.RawMessage) string {
 	var v [][]interface{}
@@ -541,14 +560,35 @@ func parseUserText(raw json.RawMessage) string {
 // groups and text paragraphs, the trailing survey (if the agent is asking for
 // details) and any pages it created/edited this turn.
 func extractTurn(rm recordMapShape) (text, title string, steps []chatStep, blocks []chatBlock, survey *chatSurvey, pages []chatPageRef) {
+	msgs := sortedThreadMessages(rm)
+	// A message sent while the agent was still working is appended to the
+	// RUNNING transcript as a user step (queueAgentChatMessage) and Notion
+	// answers it with a second agent-inference inside the same stream. What came
+	// before that step is the answer to the previous message, already rendered
+	// in its own bubble, so the turn built here starts after the LAST user step:
+	// otherwise both replies would be folded into one message and the first
+	// answer would be repeated.
+	start := 0
+	for i, m := range msgs {
+		if m.step.Type == "user" || m.step.Type == "user-injected" {
+			start = i + 1
+		}
+	}
 	var tb turnBuilder
-	for _, m := range sortedThreadMessages(rm) {
-		switch m.step.Type {
-		case "title":
+	for i, m := range msgs {
+		// The generated title is a thread-level step and may sit anywhere in the
+		// record map, so it is picked up regardless of the split point.
+		if m.step.Type == "title" {
 			var s string
 			if json.Unmarshal(m.step.Value, &s) == nil && s != "" {
 				title = s
 			}
+			continue
+		}
+		if i < start {
+			continue
+		}
+		switch m.step.Type {
 		case "agent-inference":
 			foldInferenceParts(m.step.Value, &tb)
 			if pr := parseEditReferenceMap(m.step.EditReferenceMap); len(pr) > 0 {
@@ -663,6 +703,11 @@ func parseInferenceStream(raw []byte) (text, title string, steps []chatStep, blo
 					}
 					if json.Unmarshal(op.V, &rec) == nil && rec.Type == "title" && rec.Value != "" && title == "" {
 						title = rec.Value
+					}
+					// A message queued mid-turn starts a new answer: the deltas
+					// that follow belong to it, so the fallback text starts over.
+					if _, queued, isUser := queuedStepText(op.V); isUser && (queued || fallback.Len() > 0) {
+						fallback.Reset()
 					}
 				} else if op.O == "x" && strings.HasSuffix(op.P, "/content") {
 					var s string

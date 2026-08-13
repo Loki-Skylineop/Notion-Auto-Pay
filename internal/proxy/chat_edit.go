@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -421,6 +422,9 @@ func HandleChatEdit(auth *DashboardAuth) http.HandlerFunc {
 		}
 
 		writeStreamErr := func(msg string) {
+			// Раньше сбой правки уходил в никуда: в UI пустота, в логе
+			// ничего. Теперь каждая причина видна в консоли сервера.
+			log.Printf("[chat] edit failed (thread %s): %s", body.ThreadID, msg)
 			w.Header().Set("Content-Type", "application/x-ndjson")
 			b, _ := json.Marshal(map[string]interface{}{"event": "error", "error": msg})
 			w.Write(b)
@@ -432,9 +436,10 @@ func HandleChatEdit(auth *DashboardAuth) http.HandlerFunc {
 		resolvedID, resolvedTrailing, err := resolveLastUserMessage(body.TokenV2, body.UserID, body.SpaceID, body.ThreadID)
 		if err != nil {
 			if msgID == "" {
-				writeStreamErr(err.Error())
+				writeStreamErr(fmt.Sprintf("не нашёл сообщение для правки: %v", err))
 				return
 			}
+			log.Printf("[chat] edit: resolve failed, falling back to client message_id %s: %v", msgID, err)
 		} else if msgID == "" || msgID == resolvedID {
 			msgID = resolvedID
 			trailing = resolvedTrailing
@@ -443,6 +448,7 @@ func HandleChatEdit(auth *DashboardAuth) http.HandlerFunc {
 			writeStreamErr("не удалось найти сообщение для правки")
 			return
 		}
+		log.Printf("[chat] edit thread %s: step %s, dropping %d step(s) after it", body.ThreadID, msgID, len(trailing))
 
 		// Re-running costs credits just like a normal turn.
 		defer armOverageForTurn(body.TokenV2, body.UserID, body.SpaceID)()
@@ -480,13 +486,15 @@ func HandleChatEdit(auth *DashboardAuth) http.HandlerFunc {
 		})
 		saveResp, err := notionChatRequest(body.TokenV2, body.UserID, body.SpaceID, "saveTransactionsFanout", saveBody, "application/json", chatAPITimeout())
 		if err != nil {
-			writeStreamErr(err.Error())
+			writeStreamErr(fmt.Sprintf("правка не сохранилась: %v", err))
 			return
 		}
-		io.ReadAll(saveResp.Body)
+		saveRaw, _ := io.ReadAll(saveResp.Body)
 		saveResp.Body.Close()
 		if saveResp.StatusCode != 200 {
-			writeStreamErr(fmt.Sprintf("notion %d", saveResp.StatusCode))
+			// Тело ответа Notion раньше выбрасывалось, и наверх шло голое
+			// "notion 400" без причины — диагностировать было нечем.
+			writeStreamErr(fmt.Sprintf("правка не сохранилась: notion %d: %s", saveResp.StatusCode, truncate(string(saveRaw), 300)))
 			return
 		}
 

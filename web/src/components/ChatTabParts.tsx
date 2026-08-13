@@ -1455,8 +1455,12 @@ export const Composer = memo(function Composer({
   const resize = useCallback(() => {
     const el = taRef.current
     if (!el) return
+    // Если scrollHeight=0, элемент спрятан (вкладка не активна) — пропускаем,
+    // иначе textarea получает height:0px и визуально исчезает до следующего ререндера.
     el.style.height = 'auto'
-    el.style.height = `${Math.min(el.scrollHeight, 220)}px`
+    const sh = el.scrollHeight
+    if (sh === 0) return
+    el.style.height = `${Math.min(sh, 220)}px`
   }, [])
 
   useEffect(() => {
@@ -1468,6 +1472,17 @@ export const Composer = memo(function Composer({
   useEffect(() => {
     setText(getDraft(draftKey))
   }, [draftKey])
+
+  // Когда вкладка становится видимой (переключили вкладку на «Чат»), resize уже прошёл
+  // с scrollHeight=0 и ничего не поменял. Даём браузеру один раз отрисовать
+  // и запускаем resize в requestAnimationFrame, чтобы layout успел пересчитаться.
+  const prevActive = useRef(false)
+  useEffect(() => {
+    if (!prevActive.current) {
+      prevActive.current = true
+      requestAnimationFrame(resize)
+    }
+  }, [resize])
 
   // Работающий агент больше не блокирует отправку: ChatTab сам решит, начать
   // ход сразу или поставить сообщение в очередь до конца текущего ответа.
@@ -1572,6 +1587,7 @@ export const Composer = memo(function Composer({
           rows={1}
           placeholder={hasSpace ? 'Напишите сообщение…' : 'Сначала выберите пространство'}
           disabled={!hasSpace}
+          style={{ minHeight: '1.25rem' }}
           className="no-scrollbar w-full sm:flex-1 min-w-0 resize-none max-h-[220px] overflow-y-auto bg-transparent border-none outline-none text-[#e8e8e8] text-[13.5px] placeholder-[#333] leading-relaxed py-0.5 disabled:opacity-50"
         />
         {/* РќР° С‚РµР»РµС„РѕРЅРµ РїРѕР»Рµ РІРІРѕРґР° Р·Р°РЅРёРјР°РµС‚ РІСЃСЋ С€РёСЂРёРЅСѓ, Р° РёРєРѕРЅРєРё СѓРµР·Р¶Р°СЋС‚ РЅР° СЃРІРѕСЋ

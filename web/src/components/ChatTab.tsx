@@ -5,6 +5,7 @@ import {
   chatEdit,
   chatHistory,
   chatModels,
+  chatQueue,
   chatStream,
   chatSurvey,
   chatThreads,
@@ -13,9 +14,11 @@ import {
   type ChatModel,
   type ChatStatus,
   type ChatStep,
+  type ChatStreamMeta,
   type ChatSurvey,
   type ChatSurveyAnswer,
   type ChatThread,
+  setOverage,
 } from '../api'
 import { fetchAutoPayConfig, type ServerAutoPayConfig } from '../autopay'
 import type { DiscoveredAccount } from './WorkspacePool'
@@ -71,7 +74,15 @@ import {
 // (иначе уход на «Оплату» рвал бы идущий ход), но пока он спрятан, у панели
 // нулевая высота: холст частиц крутить незачем, а автоскролл всё равно ничего
 // не прокрутит — и лог открылся бы в самом начале переписки.
-export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccount[]; active?: boolean }) {
+export function ChatTab({
+  accounts,
+  active = true,
+  onPoolChange,
+}: {
+  accounts: DiscoveredAccount[]
+  active?: boolean
+  onPoolChange?: (next: DiscoveredAccount[]) => void
+}) {
   const [autoCfg, setAutoCfg] = useState<ServerAutoPayConfig | null>(null)
   const [spaceKey, setSpaceKey] = useState(() => {
     try {
@@ -204,6 +215,18 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
     setLiveText('')
   }, [])
 
+  // Ref на колбэк, обновляющий discovered в App (для апдейта overage).
+  const onPoolChangeRef = useRef(onPoolChange)
+  // Ref на текущий список аккаунтов (для оптимистичного апдейта).
+  const accountsRef = useRef(accounts)
+  // Ref, зеркалящий activeSpace (обновляется на каждом рендере): нужен для
+  // доступа к актуальному пространству внутри makeOnStatus с пустыми deps.
+  const activeSpaceRef = useRef<SpaceOption | null>(null)
+  // Флаги по ключу хода: true — setOverage уже вызван в этом ходу.
+  // Сбрасываются в finally каждого обработчика, чтобы следующий ход
+  // снова мог сработать.
+  const overageFiredRef = useRef<Record<string, boolean>>({})
+
   // Очередь сообщений по ключу чата. Пока в чате идёт ход, отправленный текст
   // не теряется и не ломает текущий стрим: он ждёт здесь и уходит сам, как
   // только ход закончился. Ref — чтобы читать очередь из эффектов и асинхронных
@@ -235,6 +258,19 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
     queuedRef.current = rest
     setQueuedMessages(rest)
   }, [])
+
+  // Сообщения, уже ДОПИСАННЫЕ в идущий ход на сервере (queueAgentChatMessage).
+  // Ждём, что этот же стрим пришлёт по ним событие "user": тогда агент ответит
+  // на них вторым сообщением внутри того же хода. Если ход успел закончиться и
+  // не подхватил их, они уйдут обычной отправкой — потерять их нельзя.
+  const pendingQueueRef = useRef<Record<string, string[]>>({})
+  // Сколько наших «оптимистичных» пузырей висит в хвосте списка. Ответ, который
+  // печатается прямо сейчас, на сервере стоит ПЕРЕД ними, поэтому при фиксации
+  // его надо вставить, а не дописать в конец.
+  const queuedTailRef = useRef<Record<string, number>>({})
+  // Зеркала живого буфера для колбэков стрима (они вызываются вне рендера).
+  const liveTextRef = useRef('')
+  const liveStepsRef = useRef<ChatStep[]>([])
 
   const rememberThreadAgent = useCallback((threadId: string, agent: string) => {
     if (!threadId) return
@@ -362,6 +398,10 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
     () => spaceOptions.find((s) => s.key === spaceKey) || null,
     [spaceOptions, spaceKey],
   )
+  // Всегда актуальные значения для рефов-замыканий (makeOnStatus, и т.п.)
+  activeSpaceRef.current = activeSpace
+  onPoolChangeRef.current = onPoolChange
+  accountsRef.current = accounts
 
   useEffect(() => {
     if (spaceOptions.length === 0) {
@@ -913,6 +953,9 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
     }
     // Стоп отменяет и то, что ждало очереди: ход прерван осознанно.
     dequeueMessage(key)
+    // Как и то, что уже дописано в ход: после осознанного стопа отправлять это
+    // заново не нужно.
+    pendingQueueRef.current[key] = []
     releaseLive(key)
     setMessages((prev) => [
       ...prev,
@@ -946,6 +989,37 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
     // События хода, который больше не владеет живым буфером, игнорируем:
     // его прогресс всё равно приедет из опроса сервера.
     if (liveOwnerRef.current !== key) return
+    // Авто-сброс «доп. токенов»: при первом же событии от агента (text / tool /
+    // thought) — значит запрос дошёл — выключаем overage ровно один раз за ход.
+    if (!overageFiredRef.current[key]) {
+      overageFiredRef.current[key] = true
+      const _sp = activeSpaceRef.current
+      if (_sp) {
+        const _si = _sp.account.spaces?.find((si) => si.space_id === _sp.spaceId)
+        if (_si?.overage_enabled) {
+          setOverage({
+            tokenV2: _sp.account.token_v2,
+            userId: _sp.account.user_id || '',
+            spaceId: _sp.spaceId,
+            enabled: false,
+          }).then((res) => {
+            if (!res.error) {
+              // Оптимистичный апдейт: гасим бейдж «ДОП» в App.tsx без лишнего
+              // discoverWorkspaces-запроса. Работает аналогично refreshAccount +
+              // persistPool в WorkspacePool.
+              const _spId = _sp.spaceId
+              const updated = accountsRef.current.map((a) => ({
+                ...a,
+                spaces: a.spaces?.map((s) =>
+                  s.space_id === _spId ? { ...s, overage_enabled: false } : s
+                ),
+              }))
+              onPoolChangeRef.current?.(updated)
+            }
+          }).catch(() => {})
+        }
+      }
+    }
     setStatus(s)
     if (s.kind === 'text') {
       if (s.detail) setLiveText(s.detail)
@@ -990,17 +1064,127 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
     })
   }, [])
 
+  // Живой буфер зеркалим в ref: колбэки стрима живут вне рендера и не видят
+  // актуальный state.
+  useEffect(() => {
+    liveTextRef.current = liveText
+  }, [liveText])
+  useEffect(() => {
+    liveStepsRef.current = liveSteps
+  }, [liveSteps])
+
+  // События того же стрима помимо status/done. Notion разрешает дописывать
+  // сообщения в уже идущий ход, и ответ на дописанное сообщение приходит вторым
+  // куском ЭТОГО же стрима — его надо развести в отдельный пузырь.
+  const makeStreamMeta = useCallback(
+    (key: string): ChatStreamMeta => ({
+      onThread: (threadId: string) => {
+        // Новый чат узнаёт свой id ещё до первой буквы ответа: без него
+        // сообщение, написанное во время самого первого хода, дописать некуда.
+        if (threadId) threadIdsRef.current[key] = threadId
+      },
+      onUserMessage: (text: string) => {
+        const trimmed = (text || '').trim()
+        // Дошло и подхвачено ходом — страховочный список больше не нужен.
+        pendingQueueRef.current[key] = (pendingQueueRef.current[key] || []).filter((t) => t !== trimmed)
+        if (liveOwnerRef.current !== key) return
+        const answer = liveTextRef.current.trim()
+        const carried = liveStepsRef.current
+        // Ответ на предыдущее сообщение закончен: фиксируем его пузырь и
+        // начинаем новый, иначе два ответа склеились бы в один.
+        if (viewKeyRef.current === key && (answer !== '' || carried.length > 0)) {
+          const tail = queuedTailRef.current[key] || 0
+          setMessages((prev) => {
+            const at = Math.max(0, prev.length - tail)
+            return [...prev.slice(0, at), { role: 'assistant', text: answer, steps: carried }, ...prev.slice(at)]
+          })
+        }
+        if (trimmed && (queuedTailRef.current[key] || 0) > 0) {
+          queuedTailRef.current[key] = (queuedTailRef.current[key] || 0) - 1
+        } else if (trimmed && viewKeyRef.current === key) {
+          // Сообщение дописали не из этого окна (или пузырь не рисовали) —
+          // показываем его сами, чтобы второй ответ не выглядел «из воздуха».
+          setMessages((prev) => [...prev, { role: 'user', text: trimmed }])
+        }
+        liveTextRef.current = ''
+        liveStepsRef.current = []
+        setLiveText('')
+        setLiveSteps([])
+        setStatus(null)
+      },
+    }),
+    [],
+  )
+
   const handleSend = useCallback(
     async (msg: string) => {
       const text = msg.trim()
       const originKey = activeThreadId || newKey
       if (!text || !activeSpace) return
       // В этом чате уже идёт ход — наш стрим или подхваченный опросом. Второй
-      // параллельный ход в тот же тред ломает и транскрипт, и живой буфер,
-      // поэтому сообщение уходит в очередь и отправляется сразу после ответа.
+      // параллельный ход в тот же тред сломал бы и транскрипт, и живой буфер,
+      // поэтому сообщение не ЖДЁТ конца ответа, а дописывается прямо в идущий
+      // ход — ровно как это делает сам Notion (queueAgentChatMessage). Агент
+      // подхватит его в этом же стриме и ответит вторым сообщением.
       const busyInThisChat =
         !!runningKeys[originKey] || (!!activeThreadId && !!busyThreads[activeThreadId]) || remoteBusy
       if (busyInThisChat) {
+        const runningThread = threadIdsRef.current[originKey] || activeThreadId || ''
+        if (!runningThread) {
+          // Ход начался секунду назад и сервер ещё не назвал id треда —
+          // дописывать некуда, страхуемся локальной очередью.
+          enqueueMessage(originKey, text)
+          return
+        }
+        // Вложения уходят вместе с дописанным сообщением, поле сразу пустое.
+        const queuedAttachments = attachments
+        setAttachments([])
+        setEditingIdx(-1)
+        instantScrollRef.current = true
+        setError('')
+        pendingQueueRef.current[originKey] = [...(pendingQueueRef.current[originKey] || []), text]
+        if (viewKeyRef.current === originKey) {
+          // Пузырь появляется мгновенно, а ответ, который печатается прямо
+          // сейчас, встанет ПЕРЕД ним, когда агент его закончит.
+          queuedTailRef.current[originKey] = (queuedTailRef.current[originKey] || 0) + 1
+          setMessages((prev) => [
+            ...prev,
+            { role: 'user', text, attachments: queuedAttachments.length > 0 ? queuedAttachments : undefined },
+          ])
+        }
+        const queueRes = await chatQueue({
+          token_v2: activeSpace.account.token_v2,
+          user_id: activeSpace.account.user_id,
+          user_name: activeSpace.account.user_name,
+          user_email: activeSpace.account.user_email,
+          space_id: activeSpace.spaceId,
+          space_view_id: activeSpace.spaceViewId,
+          space_name: activeSpace.spaceName,
+          timezone: browserTimezone(),
+          agent: agentId,
+          thread_id: runningThread,
+          attachments: queuedAttachments.length > 0 ? queuedAttachments : undefined,
+          message: text,
+        })
+        if (queueRes.queued) {
+          // Ход продолжается: опрос догонит транскрипт, даже если стрим ведёт
+          // другой чат или уже оборвался.
+          startPolling(activeSpace, runningThread)
+          return
+        }
+        // Notion не принял (ход закончился мгновение назад) — снимаем
+        // оптимистичный пузырь и уходим в локальную очередь.
+        pendingQueueRef.current[originKey] = (pendingQueueRef.current[originKey] || []).filter((t) => t !== text)
+        if (viewKeyRef.current === originKey && (queuedTailRef.current[originKey] || 0) > 0) {
+          queuedTailRef.current[originKey] = (queuedTailRef.current[originKey] || 0) - 1
+          setMessages((prev) => {
+            for (let i = prev.length - 1; i >= 0; i--) {
+              if (prev[i].role === 'user' && prev[i].text === text) return [...prev.slice(0, i), ...prev.slice(i + 1)]
+            }
+            return prev
+          })
+        }
+        if (queuedAttachments.length > 0) setAttachments(queuedAttachments)
         enqueueMessage(originKey, text)
         return
       }
@@ -1048,6 +1232,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
             message: text,
           },
           makeOnStatus(originKey),
+          makeStreamMeta(originKey),
         )
         if (res.thread_id) {
           threadIdsRef.current[originKey] = res.thread_id
@@ -1094,10 +1279,27 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         if (turnSeqRef.current[originKey] === myTurn) {
           setRunning(originKey, false)
           releaseLive(originKey)
+          // Сбрасываем флаг, чтобы следующий ход снова мог выключить overage.
+          overageFiredRef.current[originKey] = false
+          // Страховка: сообщение дописали в ход, но он успел закончиться и не
+          // подхватил его (события "user" по нему так и не пришло). Тогда
+          // досылаем его обычным ходом, как только чат освободится: молча
+          // потерять сообщение нельзя.
+          const leftovers = pendingQueueRef.current[originKey] || []
+          if (leftovers.length > 0) {
+            const tail = queuedTailRef.current[originKey] || 0
+            pendingQueueRef.current[originKey] = []
+            queuedTailRef.current[originKey] = 0
+            if (tail > 0 && viewKeyRef.current === originKey) {
+              setMessages((prev) => prev.slice(0, Math.max(0, prev.length - tail)))
+            }
+            const tid = threadIdsRef.current[originKey] || originKey
+            for (const t of leftovers) enqueueMessage(tid, t)
+          }
         }
       }
     },
-    [activeSpace, runningKeys, busyThreads, remoteBusy, enqueueMessage, migrateQueue, newKey, activeThreadId, agentId, selectedModel, selectedEffort, attachments, pendingThreadId, makeOnStatus, rememberThreadAgent, rememberThreadModel, startPolling, setRunning, claimLive, releaseLive],
+    [activeSpace, runningKeys, busyThreads, remoteBusy, enqueueMessage, migrateQueue, newKey, activeThreadId, agentId, selectedModel, selectedEffort, attachments, pendingThreadId, makeOnStatus, makeStreamMeta, rememberThreadAgent, rememberThreadModel, startPolling, setRunning, claimLive, releaseLive],
   )
 
   // Свежая ссылка на handleSend: очередь дёргает её из эффекта, минуя
@@ -1159,7 +1361,14 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
   const handleEditLast = useCallback(
     async (index: number, next: string) => {
       const text = next.trim()
-      if (!text || !activeSpace || runningKeys[activeThreadId] || editBusy) return
+      if (!text || !activeSpace) return
+      // Здесь был молчаливый return: пока идёт ответ (или предыдущая
+      // правка) кнопка «Сохранить и отправить» не делала ничего, а
+      // редактор оставался открытым — выглядит как «не отправляется».
+      if (runningKeys[activeThreadId] || editBusy) {
+        setError('Дождитесь окончания текущего ответа — потом можно править сообщение')
+        return
+      }
       if (!activeThreadId) {
         setError('Правка доступна только в сохранённом чате')
         setEditingIdx(-1)
@@ -1208,6 +1417,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
             message: text,
           },
           makeOnStatus(originKey),
+          makeStreamMeta(originKey),
         )
         if (viewKeyRef.current === originKey && !stopKeysRef.current[originKey]) {
           setMessages((prev) => [
@@ -1218,20 +1428,21 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         if (res.thread_id) startPolling(activeSpace, res.thread_id)
       } catch (e) {
         if (viewKeyRef.current === originKey && !stopKeysRef.current[originKey]) {
-          // The edited message is already saved server-side, so reconcile through
-          // polling rather than pushing a phantom failure bubble.
+          // Ошибку больше не глотаем: ветка с setError была недостижима,
+          // потому что threadIdsRef здесь заполнен всегда — любой сбой
+          // выглядел как «сохранил, а оно не отправилось». Состояние всё
+          // равно подтягиваем опросом: транзакция могла уже примениться.
+          const msg = e instanceof Error ? e.message : 'Не удалось изменить сообщение'
+          setError(msg)
+          setMessages((prev) => [...prev, { role: 'assistant', text: `⚠️ ${msg}` }])
           const tid = threadIdsRef.current[originKey]
-          if (tid) {
-            startPolling(activeSpace, tid)
-          } else {
-            setError(e instanceof Error ? e.message : 'Не удалось изменить сообщение')
-            setMessages((prev) => [...prev, { role: 'assistant', text: '⚠️ Не удалось получить ответ. Попробуйте ещё раз.' }])
-          }
+          if (tid) startPolling(activeSpace, tid)
         }
       } finally {
         if (turnSeqRef.current[originKey] === myTurn) {
           setRunning(originKey, false)
           releaseLive(originKey)
+          overageFiredRef.current[originKey] = false
         }
         setEditBusy(false)
         // Щит снимаем только когда правка полностью отработала.
@@ -1290,6 +1501,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
             answers,
           },
           makeOnStatus(originKey),
+          makeStreamMeta(originKey),
         )
         if (res.thread_id) {
           threadIdsRef.current[originKey] = res.thread_id
@@ -1313,19 +1525,12 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         if (turnSeqRef.current[originKey] === myTurn) {
           setRunning(originKey, false)
           releaseLive(originKey)
+          overageFiredRef.current[originKey] = false
         }
       }
     },
-    [activeSpace, runningKeys, activeThreadId, agentId, selectedModel, selectedEffort, makeOnStatus, rememberThreadAgent, rememberThreadModel, startPolling, setRunning, claimLive, releaseLive],
+    [activeSpace, runningKeys, activeThreadId, agentId, selectedModel, selectedEffort, makeOnStatus, makeStreamMeta, rememberThreadAgent, rememberThreadModel, startPolling, setRunning, claimLive, releaseLive],
   )
-
-  if (accounts.length === 0) {
-    return (
-      <div className="p-8 text-center text-text-secondary">
-        Сначала добавьте рабочие пространства на вкладке «Оплата», чтобы начать чат.
-      </div>
-    )
-  }
 
   // Only the newest user message gets the edit affordance, exactly like Notion.
   const lastUserIdx = useMemo(() => {
@@ -1362,6 +1567,18 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
     !showThinking && lastMessage && lastMessage.role === 'assistant' && lastMessage.survey && !lastMessage.survey.submitted
       ? lastMessage.survey
       : null
+
+  // Экран «нет рабочих пространств» обязан стоять ПОСЛЕ всех хуков. Пока он
+  // висел выше useMemo/useEffect, переход accounts с 0 на N менял число
+  // хуков между рендерами, React падал с ошибкой #310 и обнулял всё дерево —
+  // это и был чёрный экран.
+  if (accounts.length === 0) {
+    return (
+      <div className="p-8 text-center text-text-secondary">
+        Сначала добавьте рабочие пространства на вкладке «Оплата», чтобы начать чат.
+      </div>
+    )
+  }
 
   return (
     <div className="relative mx-auto" style={isDesktop ? { width: outerWidth, maxWidth: '100%' } : undefined}>

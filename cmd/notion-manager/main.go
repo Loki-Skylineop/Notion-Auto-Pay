@@ -129,6 +129,10 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	mux.HandleFunc("/admin/chat/delete", proxy.HandleChatDelete(dashAuth))
 	mux.HandleFunc("/admin/chat/send", proxy.HandleChatSend(dashAuth))
 	mux.HandleFunc("/admin/chat/stream", proxy.HandleChatStream(dashAuth))
+	// Append a message to a thread whose turn is still running, exactly like the
+	// web client's queueAgentChatMessage: the agent picks it up inside the same
+	// stream instead of the browser sitting on the message until the turn ends.
+	mux.HandleFunc("/admin/chat/queue", proxy.HandleChatQueue(dashAuth))
 	// Stop an in-flight chat turn (clears the thread's current_inference_id
 	// via saveTransactionsFanout, mirroring the web client's Stop button).
 	mux.HandleFunc("/admin/chat/stop", proxy.HandleChatStop(dashAuth))
@@ -339,6 +343,7 @@ func main() {
 	log.Printf("  POST /admin/chat/delete           (soft-delete a chat thread)")
 	log.Printf("  POST /admin/chat/send             (run one chat turn)")
 	log.Printf("  POST /admin/chat/stream           (run one chat turn, live status)")
+	log.Printf("  POST /admin/chat/queue            (append a message to a running turn)")
 	log.Printf("  POST /admin/chat/stop             (stop an in-flight chat turn)")
 	log.Printf("  POST /admin/chat/sync             (poll a thread's live state)")
 	log.Printf("  POST /admin/chat/survey           (submit survey answers + continue)")

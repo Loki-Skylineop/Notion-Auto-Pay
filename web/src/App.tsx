@@ -1,7 +1,8 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { addAccount, discoverWorkspaces, checkAuth, login as apiLogin, logout as apiLogout } from './api'
+import { addAccount, discoverWorkspaces, checkAuth, deleteAccount, login as apiLogin, logout as apiLogout } from './api'
 import { WorkspacePool, type DiscoveredAccount } from './components/WorkspacePool'
 import { ChatTab } from './components/ChatTab'
+import { ErrorBoundary } from './components/ErrorBoundary'
 
 // Pull the persisted accounts + their workspaces straight from the server so
 // the pool shows up even in a fresh browser / incognito window where the
@@ -21,13 +22,17 @@ async function fetchServerWorkspaces(): Promise<DiscoveredAccount[]> {
     token_v2?: string
     spaces?: DiscoveredAccount['spaces']
   }>)
-    .filter(a => a.token_v2 && a.spaces && a.spaces.length > 0)
+    // Раньше отбрасывались аккаунты, по которым discovery вернул ноль
+    // пространств: сервер про такой аккаунт молчал, а localStorage его
+    // продолжал показывать. Теперь состав аккаунтов = ровно то, что есть
+    // на сервере, а пустые spaces при гидрации подставятся из кэша.
+    .filter(a => !!a.token_v2)
     .map(a => ({
       user_id: a.user_id,
       user_name: a.user_name,
       user_email: a.user_email,
       token_v2: a.token_v2 as string,
-      spaces: a.spaces as DiscoveredAccount['spaces'],
+      spaces: (a.spaces || []) as DiscoveredAccount['spaces'],
     }))
 }
 
@@ -380,6 +385,19 @@ function AddAccountModal({ onClose, onDiscovered }: { onClose: () => void; onDis
   )
 }
 
+// Идентичность аккаунта. user_id живёт дольше почты и токена, поэтому он
+// первый: при переоткрытии сессии token_v2 меняется, и ключ по токену
+// раздваивал один и тот же аккаунт в списке.
+function accountKey(a: { user_id?: string; user_email?: string; token_v2?: string }): string {
+  return a.user_id || a.user_email || a.token_v2 || ''
+}
+
+// Пул отдаёт наверх ключ, который посчитал сам (email или токен), поэтому
+// сверяем аккаунт по всем трём идентификаторам.
+function matchesAccountKey(a: DiscoveredAccount, key: string): boolean {
+  return a.user_id === key || a.user_email === key || a.token_v2 === key
+}
+
 function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const [showAddModal, setShowAddModal] = useState(false)
   const [tab, setTab] = useState<'pay' | 'chat'>(() => {
@@ -398,11 +416,17 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
       return []
     }
   })
+  // Единственная точка записи кэша. Раньше в этот же ключ писал ещё и
+  // WorkspacePool, и после «Обновить» два писателя расходились между собой.
   useEffect(() => {
     try {
       localStorage.setItem('nmp_discovered_workspaces', JSON.stringify(discovered))
     } catch { /* ignore */ }
   }, [discovered])
+
+  // Свежий список для колбэков с пустыми зависимостями (removeDiscovered).
+  const discoveredRef = useRef<DiscoveredAccount[]>(discovered)
+  useEffect(() => { discoveredRef.current = discovered }, [discovered])
 
   // Remember which tab the user was on so a reload reopens the same one.
   useEffect(() => {
@@ -416,28 +440,53 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
     let cancelled = false
     fetchServerWorkspaces()
       .then(serverAccounts => {
-        if (cancelled || serverAccounts.length === 0) return
-        setDiscovered(prev => {
-          const byKey = new Map<string, DiscoveredAccount>()
-          for (const a of prev) byKey.set(a.user_email || a.token_v2, a)
-          for (const a of serverAccounts) byKey.set(a.user_email || a.token_v2, a)
-          return Array.from(byKey.values())
-        })
+        if (cancelled) return
+        // Сервер — единственный источник истины по составу аккаунтов.
+        // Раньше здесь склеивались два множества (кэш + ответ сервера), из-за
+        // чего удалённый аккаунт навсегда оставался в localStorage и всплывал
+        // при каждом входе. Теперь кэш нужен только чтобы список не мигал на
+        // первой отрисовке: нет аккаунта на сервере — нет и в интерфейсе.
+        setDiscovered(prev => serverAccounts.map(fresh => {
+          const cached = prev.find(p => accountKey(p) === accountKey(fresh))
+          if (!cached) return fresh
+          // Если discovery по аккаунту временно вернул пусто (Notion прилёг,
+          // токен отвалился), показываем прошлые пространства — но сам состав
+          // всё равно берём из ответа сервера.
+          return {
+            ...fresh,
+            user_name: fresh.user_name || cached.user_name,
+            user_email: fresh.user_email || cached.user_email,
+            spaces: fresh.spaces && fresh.spaces.length > 0 ? fresh.spaces : cached.spaces,
+          }
+        }))
       })
-      .catch(() => { /* server hydration is best-effort */ })
+      .catch(() => { /* сервер не ответил — оставляем кэш как был */ })
       .finally(() => { if (!cancelled) setHydrating(false) })
     return () => { cancelled = true }
   }, [])
 
   const upsertDiscovered = useCallback((acc: DiscoveredAccount) => {
     setDiscovered(prev => {
-      const key = acc.user_email || acc.token_v2
-      const rest = prev.filter(a => (a.user_email || a.token_v2) !== key)
+      const key = accountKey(acc)
+      const rest = prev.filter(a => accountKey(a) !== key)
       return [acc, ...rest]
     })
   }, [])
+
+  // Удаление аккаунта из пула. Раньше отсюда только фильтровался React-стейт:
+  // файл аккаунта на сервере оставался жить, /admin/workspaces продолжал его
+  // отдавать, и «удалённый» аккаунт возвращался при следующем входе.
   const removeDiscovered = useCallback((key: string) => {
-    setDiscovered(prev => prev.filter(a => (a.user_email || a.token_v2) !== key))
+    const acc = discoveredRef.current.find(a => matchesAccountKey(a, key))
+    setDiscovered(prev => prev.filter(a => !matchesAccountKey(a, key)))
+    const email = acc?.user_email
+    if (!email) {
+      console.warn('remove account: у аккаунта нет email, серверный файл не удалён', key)
+      return
+    }
+    deleteAccount(email).catch(err => {
+      console.error('remove account: сервер не удалил аккаунт', email, err)
+    })
   }, [])
 
   const accountCount = discovered.length
@@ -477,11 +526,14 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
               </div>
             )
           ) : (
-            <WorkspacePool accounts={discovered} onRemoveAccount={removeDiscovered} onPaid={() => {}} />
+            <WorkspacePool accounts={discovered} onRemoveAccount={removeDiscovered} onPoolChange={setDiscovered} onPaid={() => {}} />
           )}
         </div>
         <div hidden={tab !== 'chat'}>
-          <ChatTab accounts={discovered} active={tab === 'chat'} />
+          {/* Своя граница ошибок на чат: его падение больше не гасит вкладку «Оплата». */}
+          <ErrorBoundary>
+            <ChatTab accounts={discovered} active={tab === 'chat'} onPoolChange={setDiscovered} />
+          </ErrorBoundary>
         </div>
       </main>
 

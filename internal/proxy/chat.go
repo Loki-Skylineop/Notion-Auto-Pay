@@ -1081,6 +1081,16 @@ func processStreamLine(line []byte, sItems *[]sMeta, answer *strings.Builder, em
 			if op.O == "a" && strings.HasSuffix(op.P, "/s/-") {
 				m := metaFromItem(op.V)
 				*sItems = append(*sItems, m)
+				// A message the user sent while this turn was running arrives as a
+				// "user" step appended to the transcript, and Notion answers it with
+				// a second agent-inference inside this very stream. Tell the browser
+				// to close the bubble it is typing into and open a fresh one, and
+				// start accumulating the answer from scratch -- otherwise the two
+				// replies end up glued together.
+				if txt, queued, isUser := queuedStepText(op.V); isUser && (queued || answer.Len() > 0) {
+					answer.Reset()
+					emit(map[string]interface{}{"event": "user", "text": txt, "queued": queued})
+				}
 				emitStep(emit, "", m)
 			} else if op.O == "x" {
 				idx, part, ok := parseContentPath(op.P)
@@ -1123,6 +1133,10 @@ func streamInference(w http.ResponseWriter, tokenV2, userID, spaceID, threadID s
 			flusher.Flush()
 		}
 	}
+	// Hand the thread id over before the first byte of the answer: a brand-new
+	// chat mints it right here, and the browser needs it to be able to queue a
+	// message into this very turn (POST /admin/chat/queue).
+	emit(map[string]interface{}{"event": "thread", "thread_id": threadID})
 	reqBody, _ := json.Marshal(payload)
 	resp, err := notionChatRequest(tokenV2, userID, spaceID, "runInferenceTranscript", reqBody, "application/x-ndjson", 600*time.Second)
 	if err != nil {

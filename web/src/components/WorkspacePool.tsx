@@ -48,9 +48,9 @@ export interface DiscoveredAccount {
   spaces: WorkspaceInfo[]
 }
 
-// Same localStorage key App uses to hydrate the pool, so a refresh here keeps
-// the persisted copy current across reloads.
-const STORAGE_KEY = 'nmp_discovered_workspaces'
+// Кэш списка аккаунтов теперь пишет только App (см. onPoolChange): раньше в
+// ключ nmp_discovered_workspaces писали оба компонента, и после «Обновить»
+// сохранённая копия расходилась с состоянием App до перезагрузки страницы.
 
 const PLAN_LABELS: Record<string, string> = {
   free: 'Free',
@@ -732,10 +732,14 @@ function CreateWorkspaceMenu({ token, onCreated }: { token: string; onCreated: (
 export function WorkspacePool({
   accounts,
   onRemoveAccount,
+  onPoolChange,
   onPaid,
 }: {
   accounts: DiscoveredAccount[]
   onRemoveAccount: (key: string) => void
+  // Обновлённый список уходит в App: там он ложится в state и ровно один раз
+  // записывается в localStorage.
+  onPoolChange?: (next: DiscoveredAccount[]) => void
   onPaid: () => void
 }) {
   const [pool, setPool] = useState<DiscoveredAccount[]>(accounts)
@@ -787,9 +791,11 @@ export function WorkspacePool({
     return () => document.removeEventListener('mousedown', handler)
   }, [showSettings])
 
+  // Никакой записи в localStorage: отдаём свежий список наверх, чтобы состояние
+  // App и кэш обновлялись из одного места.
   const persistPool = useCallback((next: DiscoveredAccount[]) => {
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)) } catch { /* ignore */ }
-  }, [])
+    onPoolChange?.(next)
+  }, [onPoolChange])
 
   // Manual list refresh: re-discovers plans + counts for display only. Paying
   // is handled server-side, so this no longer charges anything.
@@ -950,7 +956,7 @@ export function WorkspacePool({
                       <IconBolt />Проверить и оплатить сейчас
                     </button>
 
-                    {cfg && cfg.log.length > 0 && (
+                    {cfg && Array.isArray(cfg.log) && cfg.log.length > 0 && (
                       <div>
                         <div className="text-[10px] text-text-muted uppercase tracking-wider mb-2">Последние автооплаты</div>
                         <div className="max-h-28 overflow-y-auto space-y-0.5">

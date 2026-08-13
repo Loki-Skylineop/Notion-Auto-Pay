@@ -10,6 +10,17 @@ declare global {
 
 export const STRIPE_KEY = 'pk_live_vuNO27XGTCbXjVwneiECILjT'
 
+// Stripe.js с живым ключом (pk_live_) работает только по HTTPS; единственное
+// исключение — localhost. На http://192.168.x.x он бросает IntegrationError прямо
+// из window.Stripe(...), а до появления границы ошибок это гасило всю панель
+// чёрным экраном. Проверяем окружение заранее.
+export function stripeEnvOk(): boolean {
+  if (typeof window === 'undefined') return false
+  if (window.location.protocol === 'https:') return true
+  const h = window.location.hostname
+  return h === 'localhost' || h === '127.0.0.1' || h === '::1' || h === '[::1]'
+}
+
 export interface PlanOption {
   id: string
   name: string
@@ -56,6 +67,15 @@ export function SubscribeModal({
   const [error, setError] = useState('')
   const [result, setResult] = useState<string | null>(null)
   const [stripeLoaded, setStripeLoaded] = useState(false)
+  // Новая карта вводится только по HTTPS или с localhost. В остальных
+  // случаях показываем причину и оставляем рабочими триал и оплату
+  // сохранённой картой (она считается на сервере и Stripe.js не требует).
+  const cardOk = stripeEnvOk()
+  const [stripeError, setStripeError] = useState(
+    cardOk
+      ? ''
+      : 'Живой ключ Stripe требует HTTPS, а панель открыта по HTTP. Откройте её на http://localhost:8081/dashboard/ или по HTTPS — тогда появится поле карты. Триал и оплата сохранённой картой работают и здесь.',
+  )
   // Saved card (from the server-side auto-pay config / last payment). When
   // present and we're paying a specific workspace, we offer a one-click
   // "оплатить сохранённой картой" path that charges on the server without
@@ -63,7 +83,7 @@ export function SubscribeModal({
   const [savedLast4, setSavedLast4] = useState('')
   const [savedLoading, setSavedLoading] = useState(false)
   // Метод оплаты: карта через Stripe или триал вообще без карты.
-  const [method, setMethod] = useState<PayMethod>('card')
+  const [method, setMethod] = useState<PayMethod>(cardOk ? 'card' : 'trial')
   const [trialDays, setTrialDays] = useState(14)
   const [trialCaptcha, setTrialCaptcha] = useState('')
   const [trialLoading, setTrialLoading] = useState(false)
@@ -97,6 +117,9 @@ export function SubscribeModal({
 
   // Load Stripe.js and mount card element
   useEffect(() => {
+    // По HTTP с живым ключом Stripe.js грузить бессмысленно: любой вызов
+    // window.Stripe(...) закончится IntegrationError.
+    if (!cardOk) return
     if (window.Stripe) {
       initStripeCard()
       return
@@ -104,11 +127,16 @@ export function SubscribeModal({
     const script = document.createElement('script')
     script.src = 'https://js.stripe.com/v3/'
     script.onload = () => initStripeCard()
+    script.onerror = () => setStripeError('Не удалось загрузить Stripe.js — проверьте интернет и блокировщики.')
     document.head.appendChild(script)
-  }, [])
+  }, [cardOk])
 
+  // Любая ошибка Stripe обязана оставаться внутри модалки: исключение из
+  // эффекта ловит граница ошибок и сносит всё дерево — раньше это был
+  // тот самый чёрный экран после открытия окна оплаты.
   function initStripeCard() {
     if (!window.Stripe || !cardRef.current) return
+    try {
     // Reuse the cached instance if Stripe.js fires more than once.
     const stripe = stripeRef.current || window.Stripe(STRIPE_KEY)
     stripeRef.current = stripe
@@ -123,6 +151,14 @@ export function SubscribeModal({
     elementsRef.current = elements
     cardElementRef.current = card
     setStripeLoaded(true)
+    setStripeError('')
+    } catch (err) {
+      stripeRef.current = null
+      cardElementRef.current = null
+      setStripeLoaded(false)
+      setStripeError(err instanceof Error ? err.message : 'Stripe.js не инициализировался')
+      console.error('[stripe init]', err)
+    }
   }
 
   // Триал без карты. Сервер повторяет запрос из HAR: POST
@@ -303,11 +339,18 @@ export function SubscribeModal({
             ))}
           </div>
 
+          {stripeError && (
+            <div className="mb-3 p-3 bg-bg-secondary border border-border rounded-lg">
+              <div className="text-err text-[12px] font-medium mb-1">Оплата новой картой недоступна</div>
+              <div className="text-[12px] text-text-secondary">{stripeError}</div>
+            </div>
+          )}
+
           {/* Карточный блок НЕ размонтируем при переходе на триал: внутри живёт
               Stripe Element, поэтому просто прячем его через hidden. */}
           <div className={method === 'card' ? '' : 'hidden'}>
-            <label className="text-[11px] text-text-muted mb-1 block">Данные карты</label>
-            <div ref={cardRef} className="py-2.5 px-3 bg-bg-input border border-border rounded-lg min-h-[40px] mb-3" />
+            <label className="text-[11px] text-text-muted mb-1 block" hidden={!!stripeError}>Данные карты</label>
+            <div ref={cardRef} className="py-2.5 px-3 bg-bg-input border border-border rounded-lg min-h-[40px] mb-3" hidden={!!stripeError} />
           </div>
 
           {method === 'trial' && (

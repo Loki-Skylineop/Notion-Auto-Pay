@@ -951,6 +951,53 @@ export type ChatSendParams = ChatAccountRef & {
   attachments?: ChatAttachment[]
 }
 
+// Extra stream callbacks. The proxy emits two rows besides plain status/done,
+// both of which exist because a turn can now grow while it runs.
+export interface ChatStreamMeta {
+  // Thread this turn runs in, emitted before the first answer byte. A brand-new
+  // chat learns its server-minted id here, which is what makes it possible to
+  // queue a message into the very first turn.
+  onThread?: (threadId: string) => void
+  // A message the user sent while the agent was working got appended to the
+  // running transcript: the answer streamed so far is final, and what follows
+  // is a NEW answer to that message.
+  onUserMessage?: (text: string, queued: boolean) => void
+}
+
+export type ChatQueueParams = ChatAccountRef & {
+  timezone?: string
+  agent: string
+  thread_id: string
+  message: string
+  attachments?: ChatAttachment[]
+}
+
+export interface ChatQueueResult {
+  queued: boolean
+  step_id?: string
+  message_ids?: string[]
+  error?: string
+}
+
+// chatQueue appends a message to a thread whose turn is STILL RUNNING
+// (Notion's queueAgentChatMessage). The agent picks it up inside the inference
+// that is already in flight, so nothing waits for the current answer to end.
+// queued:false means Notion refused it (typically the turn finished a moment
+// ago) and the caller should fall back to a normal chatStream turn.
+export async function chatQueue(params: ChatQueueParams): Promise<ChatQueueResult> {
+  const resp = await fetch('/admin/chat/queue', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify(params),
+  })
+  const data = (await resp.json().catch(() => null)) as ChatQueueResult | null
+  if (!resp.ok || !data || !data.queued) {
+    return { queued: false, error: (data && data.error) || `HTTP ${resp.status}` }
+  }
+  return data
+}
+
 export async function chatSend(params: ChatSendParams): Promise<ChatSendResult> {
   const resp = await fetch('/admin/chat/send', {
     method: 'POST',
@@ -966,7 +1013,7 @@ export async function chatSend(params: ChatSendParams): Promise<ChatSendResult> 
 // works, then a final {event:"done",…} with the full answer. onStatus is
 // called for every status event so the UI can show what the agent is doing
 // right now.
-export async function chatStream(params: ChatSendParams, onStatus: (s: ChatStatus) => void): Promise<ChatSendResult> {
+export async function chatStream(params: ChatSendParams, onStatus: (s: ChatStatus) => void, meta?: ChatStreamMeta): Promise<ChatSendResult> {
   const resp = await fetch('/admin/chat/stream', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
@@ -977,7 +1024,7 @@ export async function chatStream(params: ChatSendParams, onStatus: (s: ChatStatu
     // Fall back to the synchronous endpoint if streaming is unavailable.
     return chatSend(params)
   }
-  return readChatNdjson(resp, onStatus)
+  return readChatNdjson(resp, onStatus, meta)
 }
 
 // readChatNdjson consumes the server's newline-delimited JSON event stream,
@@ -1046,7 +1093,7 @@ export type ChatEditParams = ChatSendParams & { thread_id: string; message_id?: 
 // chatEdit rewrites the last user message of a thread and re-runs the agent on
 // it. The server drops the old answer first (listRemove) and streams the new
 // one back as the very same ndjson protocol chatStream uses.
-export async function chatEdit(params: ChatEditParams, onStatus: (s: ChatStatus) => void): Promise<ChatSendResult> {
+export async function chatEdit(params: ChatEditParams, onStatus: (s: ChatStatus) => void, meta?: ChatStreamMeta): Promise<ChatSendResult> {
   const resp = await fetch('/admin/chat/edit', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
@@ -1057,10 +1104,10 @@ export async function chatEdit(params: ChatEditParams, onStatus: (s: ChatStatus)
     const data = await resp.json().catch(() => null)
     throw new Error((data && data.error) || `HTTP ${resp.status}`)
   }
-  return readChatNdjson(resp, onStatus)
+  return readChatNdjson(resp, onStatus, meta)
 }
 
-async function readChatNdjson(resp: Response, onStatus: (s: ChatStatus) => void): Promise<ChatSendResult> {
+async function readChatNdjson(resp: Response, onStatus: (s: ChatStatus) => void, meta?: ChatStreamMeta): Promise<ChatSendResult> {
   if (!resp.body) throw new Error('Пустой ответ от сервера')
   const reader = resp.body.getReader()
   const decoder = new TextDecoder()
@@ -1087,8 +1134,14 @@ async function readChatNdjson(resp: Response, onStatus: (s: ChatStatus) => void)
               input: ev.input || '',
               result: ev.result || '',
             })
+          } else if (ev.event === 'thread') {
+            if (meta?.onThread && ev.thread_id) meta.onThread(ev.thread_id as string)
+          } else if (ev.event === 'user') {
+            // Sent while the agent was working: everything typed out so far is
+            // the answer to the PREVIOUS message, what follows is a new answer.
+            if (meta?.onUserMessage) meta.onUserMessage((ev.text as string) || '', !!ev.queued)
           } else if (ev.event === 'done') {
-            result = { thread_id: ev.thread_id, title: ev.title, text: ev.text, steps: ev.steps, survey: ev.survey || undefined, pages: ev.pages || undefined }
+            result = { thread_id: ev.thread_id, title: ev.title, text: ev.text, steps: ev.steps, blocks: ev.blocks || undefined, survey: ev.survey || undefined, pages: ev.pages || undefined }
           } else if (ev.event === 'error') {
             streamError = ev.error || 'Ошибка потока'
           }
@@ -1126,7 +1179,7 @@ export type ChatSurveyParams = ChatAccountRef & {
 
 // chatSurvey submits the user's answers to an agent survey and continues the
 // same turn, streaming the agent's reply exactly like chatStream.
-export async function chatSurvey(params: ChatSurveyParams, onStatus: (s: ChatStatus) => void): Promise<ChatSendResult> {
+export async function chatSurvey(params: ChatSurveyParams, onStatus: (s: ChatStatus) => void, meta?: ChatStreamMeta): Promise<ChatSendResult> {
   const resp = await fetch('/admin/chat/survey', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/x-ndjson' },
@@ -1139,5 +1192,5 @@ export async function chatSurvey(params: ChatSurveyParams, onStatus: (s: ChatSta
     if (text) { try { const d = JSON.parse(text); if (d?.error) msg = d.error } catch { /* ignore */ } }
     throw new Error(msg)
   }
-  return readChatNdjson(resp, onStatus)
+  return readChatNdjson(resp, onStatus, meta)
 }
