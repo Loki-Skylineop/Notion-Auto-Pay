@@ -1410,6 +1410,8 @@ export const Composer = memo(function Composer({
   onPickFiles,
   onRemoveAttachment,
   busyElsewhere = false,
+  queuedText = '',
+  onCancelQueued,
 }: {
   hasSpace: boolean
   sending: boolean
@@ -1428,10 +1430,13 @@ export const Composer = memo(function Composer({
   uploads?: UploadTask[]
   onPickFiles?: (files: File[]) => void
   onRemoveAttachment?: (index: number) => void
-  // Ход агента идёт в ДРУГОМ чате: отсюда отправлять нельзя (состояние хода в
-  // ChatTab одно на всю вкладку), но и «Стоп» показывать неправильно — он бы
-  // остановил чужой ход.
+  // Ход агента идёт в ДРУГОМ чате — здесь это только подсказка под полем
+  // ввода: писать и отправлять отсюда можно параллельно.
   busyElsewhere?: boolean
+  // Сообщение, написанное во время работы агента в ЭТОМ чате: ждёт конца
+  // текущего ответа и уходит само. Пустая строка — очереди нет.
+  queuedText?: string
+  onCancelQueued?: () => void
 }) {
   const [text, setText] = useState(() => getDraft(draftKey))
   const taRef = useRef<HTMLTextAreaElement>(null)
@@ -1464,9 +1469,11 @@ export const Composer = memo(function Composer({
     setText(getDraft(draftKey))
   }, [draftKey])
 
+  // Работающий агент больше не блокирует отправку: ChatTab сам решит, начать
+  // ход сразу или поставить сообщение в очередь до конца текущего ответа.
   const submit = useCallback(() => {
     const t = text.trim()
-    if (!t || !hasSpace || sending || busyUploading) return
+    if (!t || !hasSpace || busyUploading) return
     onSend(t)
     setText('')
     saveDraft(draftKey, '')
@@ -1474,7 +1481,7 @@ export const Composer = memo(function Composer({
       const el = taRef.current
       if (el) el.style.height = 'auto'
     })
-  }, [text, hasSpace, sending, busyUploading, onSend, draftKey])
+  }, [text, hasSpace, busyUploading, onSend, draftKey])
 
   const onKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -1489,6 +1496,27 @@ export const Composer = memo(function Composer({
   return (
     <div className="relative z-10 px-4 md:px-6 pb-4 pt-2">
       <div className="rounded-xl border border-white/[0.09] bg-[#080808] px-3.5 py-2.5 focus-within:border-white/[0.18] transition-colors">
+        {queuedText ? (
+          <div className="flex flex-wrap gap-1.5 pb-2">
+            <span
+              title={queuedText}
+              className="inline-flex items-center gap-1.5 max-w-full px-2 py-1 rounded-lg bg-white/[0.04] border border-white/[0.09] text-[11.5px] text-[#9a9a9a] animate-[chip-in_.18s_ease-out]"
+            >
+              <span className="shrink-0 w-1.5 h-1.5 rounded-full bg-white/40 animate-pulse" />
+              <span className="truncate max-w-[260px]">{queuedText}</span>
+              <span className="shrink-0 text-[10px] text-white/30">уйдёт после ответа</span>
+              <button
+                type="button"
+                onClick={onCancelQueued}
+                title="Отменить"
+                aria-label="Отменить"
+                className="shrink-0 ml-0.5 w-4 h-4 flex items-center justify-center rounded text-white/25 hover:text-white/80 hover:bg-white/[0.08] transition-colors border-none bg-transparent cursor-pointer leading-none"
+              >
+                <CloseIcon />
+              </button>
+            </span>
+          </div>
+        ) : null}
         {attachments.length > 0 || uploads.length > 0 ? (
           <div className="flex flex-wrap gap-1.5 pb-2">
             {attachments.map((a, i) => (
@@ -1594,7 +1622,10 @@ export const Composer = memo(function Composer({
         {showModelPicker && activeEfforts.length > 0 ? (
           <EffortPicker efforts={activeEfforts} value={selectedEffort} onChange={onEffortChange} disabled={!hasSpace} />
         ) : null}
-        {sending ? (
+        {/* Пока агент работает — «Стоп», но как только в поле появился текст,
+            кнопка становится «Отправить»: сообщение можно послать не дожидаясь
+            конца ответа. */}
+        {sending && text.trim() === '' ? (
           <button
             type="button"
             onClick={onStop}
@@ -1608,7 +1639,7 @@ export const Composer = memo(function Composer({
             type="button"
             onClick={submit}
             disabled={!hasSpace || busyUploading || text.trim() === ''}
-            title="Отправить"
+            title={sending ? 'Отправить после текущего ответа' : 'Отправить'}
             className="shrink-0 w-7 h-7 flex items-center justify-center rounded-full bg-white text-black hover:bg-[#f0f0f0] transition-colors disabled:opacity-25 disabled:cursor-not-allowed border-none cursor-pointer"
           >
             <SendIcon />
@@ -1618,7 +1649,11 @@ export const Composer = memo(function Composer({
         </div>
       </div>
       <p className="text-center text-[10px] text-[#3a3a3a] mt-1.5">
-        {busyElsewhere ? 'Агент отвечает в другом чате — здесь можно писать параллельно' : 'Enter — отправить · Shift+Enter — новая строка'}
+        {sending && text.trim() !== ''
+          ? 'Enter — сообщение уйдёт сразу после текущего ответа'
+          : busyElsewhere
+            ? 'Агент отвечает в другом чате — здесь можно писать параллельно'
+            : 'Enter — отправить · Shift+Enter — новая строка'}
       </p>
     </div>
   )

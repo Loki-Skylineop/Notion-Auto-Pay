@@ -204,6 +204,38 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
     setLiveText('')
   }, [])
 
+  // Очередь сообщений по ключу чата. Пока в чате идёт ход, отправленный текст
+  // не теряется и не ломает текущий стрим: он ждёт здесь и уходит сам, как
+  // только ход закончился. Ref — чтобы читать очередь из эффектов и асинхронных
+  // хвостов без устаревших замыканий, состояние — только для отрисовки.
+  const [queuedMessages, setQueuedMessages] = useState<Record<string, string>>({})
+  const queuedRef = useRef<Record<string, string>>({})
+  const enqueueMessage = useCallback((key: string, text: string) => {
+    const prev = queuedRef.current[key]
+    queuedRef.current = { ...queuedRef.current, [key]: prev ? `${prev}\n\n${text}` : text }
+    setQueuedMessages(queuedRef.current)
+  }, [])
+  const dequeueMessage = useCallback((key: string) => {
+    const text = queuedRef.current[key]
+    if (!text) return ''
+    const rest = { ...queuedRef.current }
+    delete rest[key]
+    queuedRef.current = rest
+    setQueuedMessages(rest)
+    return text
+  }, [])
+  // Новый чат живёт под временным ключом, пока сервер не выдаст id треда:
+  // очередь надо перевесить, иначе она застрянет на старом ключе.
+  const migrateQueue = useCallback((from: string, to: string) => {
+    if (!to || from === to || !queuedRef.current[from]) return
+    const rest = { ...queuedRef.current }
+    const text = rest[from]
+    delete rest[from]
+    rest[to] = rest[to] ? `${rest[to]}\n\n${text}` : text
+    queuedRef.current = rest
+    setQueuedMessages(rest)
+  }, [])
+
   const rememberThreadAgent = useCallback((threadId: string, agent: string) => {
     if (!threadId) return
     threadAgentsRef.current = { ...threadAgentsRef.current, [threadId]: agent }
@@ -879,6 +911,8 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
       stopKeysRef.current[key] = true
       setRunning(key, false)
     }
+    // Стоп отменяет и то, что ждало очереди: ход прерван осознанно.
+    dequeueMessage(key)
     releaseLive(key)
     setMessages((prev) => [
       ...prev,
@@ -899,7 +933,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         thread_id: tid,
       }).then(() => reconcileFromServer(activeSpace, tid))
     }
-  }, [viewKey, runningKeys, activeThreadId, liveText, liveSteps, activeSpace, reconcileFromServer, stopPolling, setRunning, releaseLive])
+  }, [viewKey, runningKeys, activeThreadId, liveText, liveSteps, activeSpace, reconcileFromServer, stopPolling, setRunning, releaseLive, dequeueMessage])
 
   // Shared live-status reducer for both chatStream (handleSend) and chatSurvey
   // (handleSurveySubmit). The backend tags every event with a kind: "tool" (a
@@ -960,8 +994,16 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
     async (msg: string) => {
       const text = msg.trim()
       const originKey = activeThreadId || newKey
-      // Блокируем только второй ход в ЭТОМ же чате: остальные свободны.
-      if (!text || !activeSpace || runningKeys[originKey]) return
+      if (!text || !activeSpace) return
+      // В этом чате уже идёт ход — наш стрим или подхваченный опросом. Второй
+      // параллельный ход в тот же тред ломает и транскрипт, и живой буфер,
+      // поэтому сообщение уходит в очередь и отправляется сразу после ответа.
+      const busyInThisChat =
+        !!runningKeys[originKey] || (!!activeThreadId && !!busyThreads[activeThreadId]) || remoteBusy
+      if (busyInThisChat) {
+        enqueueMessage(originKey, text)
+        return
+      }
       const agentUsed = agentId
       const myTurn = (turnSeqRef.current[originKey] = (turnSeqRef.current[originKey] || 0) + 1)
       stopKeysRef.current[originKey] = false
@@ -1012,6 +1054,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
           rememberThreadAgent(res.thread_id, agentUsed)
           // Сразу фиксируем модель хода — и для только что созданного треда.
           if (agentUsed === 'default' && selectedModel) rememberThreadModel(res.thread_id, selectedModel, selectedEffort || undefined)
+          migrateQueue(originKey, res.thread_id)
           setThreads((prev) =>
             prev.some((t) => t.id === res.thread_id)
               ? prev
@@ -1054,8 +1097,15 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         }
       }
     },
-    [activeSpace, runningKeys, newKey, activeThreadId, agentId, selectedModel, selectedEffort, attachments, pendingThreadId, makeOnStatus, rememberThreadAgent, rememberThreadModel, startPolling, setRunning, claimLive, releaseLive],
+    [activeSpace, runningKeys, busyThreads, remoteBusy, enqueueMessage, migrateQueue, newKey, activeThreadId, agentId, selectedModel, selectedEffort, attachments, pendingThreadId, makeOnStatus, rememberThreadAgent, rememberThreadModel, startPolling, setRunning, claimLive, releaseLive],
   )
+
+  // Свежая ссылка на handleSend: очередь дёргает её из эффекта, минуя
+  // устаревшие замыкания хука.
+  const handleSendRef = useRef(handleSend)
+  useEffect(() => {
+    handleSendRef.current = handleSend
+  }, [handleSend])
 
   // Push picked files straight into Notion's bucket (the proxy signs the S3
   // POST for us). Every file gets its own progress chip in the composer and,
@@ -1297,6 +1347,14 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
   // our own stream, or one the polling loop is still driving (reload, dropped
   // stream, reopened chat). Before, it vanished mid-run in those cases.
   const stoppableHere = sendingHere || busyHere || remoteBusy
+  // Ход в открытом чате закончился — отправляем то, что было написано, пока
+  // агент работал.
+  const queuedHere = queuedMessages[viewKey] || ''
+  useEffect(() => {
+    if (stoppableHere || !queuedHere) return
+    const next = dequeueMessage(viewKey)
+    if (next) handleSendRef.current(next)
+  }, [stoppableHere, queuedHere, viewKey, dequeueMessage])
   const showModelPicker = agentId === 'default' && models.filter((m) => !m.disabled).length > 0
   const activeThreadTitle = threads.find((t) => t.id === activeThreadId)?.title || 'Новый чат'
   const lastMessage = messages[messages.length - 1]
@@ -1538,6 +1596,8 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
           onEffortChange={handleEffortChange}
           onSend={handleSend}
           onStop={handleStop}
+          queuedText={queuedHere}
+          onCancelQueued={() => dequeueMessage(viewKey)}
           draftKey={viewKey}
           attachments={attachments}
           uploads={uploads}
