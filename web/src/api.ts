@@ -886,6 +886,11 @@ export interface ChatHistoryResult {
   messages: ChatHistoryMessage[]
   // Agent detected server-side for this thread ("default" or a custom agent id).
   agent_id?: string
+  // Model codename this thread was last run with, read server-side from the
+  // thread's own steps (config.model / agent-inference.model), plus the
+  // reasoning effort recorded with it. Lets the picker show what was used here.
+  model?: string
+  reasoning_effort?: string
 }
 
 export async function chatHistory(ref: { token_v2: string; user_id?: string; space_id: string; thread_id: string }): Promise<ChatHistoryResult> {
@@ -899,6 +904,9 @@ export async function chatHistory(ref: { token_v2: string; user_id?: string; spa
   return {
     messages: Array.isArray(data?.messages) ? data.messages : [],
     agent_id: typeof data?.agent_id === 'string' ? data.agent_id : undefined,
+    model: typeof data?.model === 'string' && data.model ? data.model : undefined,
+    reasoning_effort:
+      typeof data?.reasoning_effort === 'string' && data.reasoning_effort ? data.reasoning_effort : undefined,
   }
 }
 

@@ -76,6 +76,10 @@ type tmStep struct {
 	// Agent-inference steps may carry an editReferenceMap describing the pages
 	// the agent created or edited this turn (powers the open-page cards).
 	EditReferenceMap json.RawMessage `json:"editReferenceMap"`
+	// Notion stamps every finished agent-inference (and transcript-summary) step
+	// with the codename of the model that produced it, e.g. "agave-flan". This is
+	// how the web app knows which model a reopened chat was running on.
+	Model string `json:"model"`
 }
 
 type tmInner struct {

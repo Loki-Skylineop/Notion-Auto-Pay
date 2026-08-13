@@ -45,6 +45,9 @@ import {
   resolveEffort,
   loadRememberedModels,
   saveRememberedModel,
+  loadThreadModels,
+  saveThreadModels,
+  type ThreadModelChoice,
   hashMessages,
   readCachedHistory,
   writeCachedHistory,
@@ -144,6 +147,9 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
   const suppressAutoScrollRef = useRef(false)
   const viewKeyRef = useRef(NEW_KEY)
   const threadAgentsRef = useRef<Record<string, string>>(loadThreadAgents())
+  // Модель, которой отвечали в конкретном чате: главный источник — сервер
+  // (шаги треда), а эта копия нужна для мгновенной отрисовки из кэша.
+  const threadModelsRef = useRef<Record<string, ThreadModelChoice>>(loadThreadModels())
   // Всё, что раньше было одиночным состоянием хода, разложено по ключам
   // чатов — иначе параллельные ходы затирали бы друг другу флаги.
   const stopKeysRef = useRef<Record<string, boolean>>({})
@@ -207,6 +213,38 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
       // ignore quota / privacy-mode failures
     }
   }, [])
+
+  // Запоминаем, какой моделью (и с каким уровнем размышления) шёл ход
+  // в этом чате, чтобы при следующем открытии сразу поставить её же.
+  const rememberThreadModel = useCallback((threadId: string, model: string, effort?: string) => {
+    if (!threadId || !model) return
+    const prev = threadModelsRef.current[threadId]
+    if (prev && prev.model === model && (prev.effort || '') === (effort || '')) return
+    threadModelsRef.current = {
+      ...threadModelsRef.current,
+      [threadId]: effort ? { model, effort } : { model },
+    }
+    saveThreadModels(threadModelsRef.current)
+  }, [])
+
+  // Ставим в пикер модель чата. Список моделей грузится асинхронно,
+  // поэтому пустой список — не повод отказываться: эффект загрузки
+  // моделей сохранит наш выбор, если модель доступна в воркспейсе.
+  // Уровень размышления пишем в память по модели — иначе его сразу
+  // перебьёт resolveEffort при смене модели.
+  const applyThreadModel = useCallback(
+    (model: string, effort?: string) => {
+      if (!model) return
+      const enabled = models.filter((m) => !m.disabled)
+      if (enabled.length > 0 && !enabled.some((m) => m.id === model)) return
+      setSelectedModel(model)
+      if (effort) {
+        saveEffort(model, effort)
+        setRememberedEfforts((prev) => (prev[model] === effort ? prev : { ...prev, [model]: effort }))
+      }
+    },
+    [models],
+  )
 
   useEffect(() => {
     fetchAutoPayConfig().then(setAutoCfg).catch(() => {})
@@ -664,7 +702,13 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
     setVisibleCount(PAGE_SIZE)
     setError('')
     setSidebarOpen(false)
-  }, [])
+    // Возвращаем модель воркспейса: пикер не должен «залипать» на модели
+    // старого чата, из которого мы только что вышли.
+    if (activeSpace) {
+      const rememberedSpaceModel = loadRememberedModels()[activeSpace.spaceId]
+      if (rememberedSpaceModel) applyThreadModel(rememberedSpaceModel)
+    }
+  }, [activeSpace, applyThreadModel])
 
   const openThread = useCallback(
     async (t: ChatThread) => {
@@ -683,6 +727,9 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
       // browser-local state was trusted.
       const detectedAgent = t.agent_id
       const rememberedAgent = threadAgentsRef.current[t.id]
+      // Модель этого чата из локальной памяти — сразу, до ответа сервера.
+      const rememberedModel = threadModelsRef.current[t.id]
+      if (rememberedModel) applyThreadModel(rememberedModel.model, rememberedModel.effort)
       const initialAgent =
         detectedAgent && agents.some((a) => a.id === detectedAgent)
           ? detectedAgent
@@ -723,6 +770,13 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
           setAgentId((prev) => (prev === initialAgent ? hist.agent_id! : prev))
           rememberThreadAgent(t.id, hist.agent_id)
         }
+        // То же самое с моделью: сервер берёт её из шагов треда
+        // (config.model / agent-inference.model) — это и есть та модель, которой
+        // в этом чате реально отвечали.
+        if (hist.model) {
+          rememberThreadModel(t.id, hist.model, hist.reasoning_effort)
+          if (viewKeyRef.current === t.id) applyThreadModel(hist.model, hist.reasoning_effort)
+        }
         // Keep mirroring the server while the thread is open so a turn that is
         // still running (or was started elsewhere) streams in, and the final
         // state lands without a manual reopen. The loop stops itself once the
@@ -735,7 +789,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         setHistoryLoading(false)
       }
     },
-    [activeSpace, agents, startPolling, stopPolling, rememberThreadAgent],
+    [activeSpace, agents, startPolling, stopPolling, rememberThreadAgent, applyThreadModel, rememberThreadModel],
   )
 
   // On first load, reopen the chat the user was last viewing -- restoring its
@@ -956,6 +1010,8 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         if (res.thread_id) {
           threadIdsRef.current[originKey] = res.thread_id
           rememberThreadAgent(res.thread_id, agentUsed)
+          // Сразу фиксируем модель хода — и для только что созданного треда.
+          if (agentUsed === 'default' && selectedModel) rememberThreadModel(res.thread_id, selectedModel, selectedEffort || undefined)
           setThreads((prev) =>
             prev.some((t) => t.id === res.thread_id)
               ? prev
@@ -998,7 +1054,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         }
       }
     },
-    [activeSpace, runningKeys, newKey, activeThreadId, agentId, selectedModel, selectedEffort, attachments, pendingThreadId, makeOnStatus, rememberThreadAgent, startPolling, setRunning, claimLive, releaseLive],
+    [activeSpace, runningKeys, newKey, activeThreadId, agentId, selectedModel, selectedEffort, attachments, pendingThreadId, makeOnStatus, rememberThreadAgent, rememberThreadModel, startPolling, setRunning, claimLive, releaseLive],
   )
 
   // Push picked files straight into Notion's bucket (the proxy signs the S3
@@ -1188,6 +1244,8 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         if (res.thread_id) {
           threadIdsRef.current[originKey] = res.thread_id
           rememberThreadAgent(res.thread_id, agentUsed)
+          // Сразу фиксируем модель хода — и для только что созданного треда.
+          if (agentUsed === 'default' && selectedModel) rememberThreadModel(res.thread_id, selectedModel, selectedEffort || undefined)
         }
         if (viewKeyRef.current === originKey && !stopKeysRef.current[originKey]) {
           setMessages((prev) => [
@@ -1208,7 +1266,7 @@ export function ChatTab({ accounts, active = true }: { accounts: DiscoveredAccou
         }
       }
     },
-    [activeSpace, runningKeys, activeThreadId, agentId, selectedModel, selectedEffort, makeOnStatus, rememberThreadAgent, startPolling, setRunning, claimLive, releaseLive],
+    [activeSpace, runningKeys, activeThreadId, agentId, selectedModel, selectedEffort, makeOnStatus, rememberThreadAgent, rememberThreadModel, startPolling, setRunning, claimLive, releaseLive],
   )
 
   if (accounts.length === 0) {

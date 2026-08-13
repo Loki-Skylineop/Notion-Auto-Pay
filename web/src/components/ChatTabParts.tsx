@@ -1136,6 +1136,47 @@ export function saveRememberedModel(spaceId: string, modelId: string): void {
   }
 }
 
+// --- модель конкретного чата ---
+
+// { "<threadId>": { model, effort } }. Notion записывает выбранную модель в сами
+// шаги треда (шаг config: model + reasoningEffort, шаг agent-inference:
+// model, которой сгенерирован ответ), и наш бэкенд отдаёт это в
+// /admin/chat/history. Локальная копия нужна, чтобы при открытии чата
+// пикер сразу показывал нужную модель, не ждав ответа сервера.
+export const THREAD_MODEL_KEY = 'nmp_thread_model'
+
+export type ThreadModelChoice = { model: string; effort?: string }
+
+export function loadThreadModels(): Record<string, ThreadModelChoice> {
+  try {
+    const raw = localStorage.getItem(THREAD_MODEL_KEY)
+    const parsed = raw ? JSON.parse(raw) : null
+    if (!parsed || typeof parsed !== 'object') return {}
+    const out: Record<string, ThreadModelChoice> = {}
+    for (const [threadId, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof value === 'string') {
+        if (value) out[threadId] = { model: value }
+        continue
+      }
+      const v = value as ThreadModelChoice | null
+      if (v && typeof v.model === 'string' && v.model) {
+        out[threadId] = typeof v.effort === 'string' && v.effort ? { model: v.model, effort: v.effort } : { model: v.model }
+      }
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+export function saveThreadModels(all: Record<string, ThreadModelChoice>): void {
+  try {
+    localStorage.setItem(THREAD_MODEL_KEY, JSON.stringify(all))
+  } catch {
+    // ignore quota / privacy-mode failures
+  }
+}
+
 // --- reasoning effort (thinking budget) ---
 
 // Notion ships a per-model list of reasoning efforts inside getAvailableModels

@@ -497,7 +497,8 @@ func syncRecordValues(tokenV2, userID, spaceID string, pointers []map[string]str
 // HandleChatHistory rebuilds the full message history of a single thread. The
 // response also carries agent_id — the custom agent (workflow) the thread
 // belongs to per its parent pointer, or "default" — so the dashboard can show
-// the correct agent instead of guessing from browser-local state.
+// the correct agent instead of guessing from browser-local state, plus model and
+// reasoning_effort — what this particular chat was last run with.
 func HandleChatHistory(auth *DashboardAuth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -563,7 +564,10 @@ func HandleChatHistory(auth *DashboardAuth) http.HandlerFunc {
 		json.Unmarshal(msgData, &wrap)
 
 		messages := buildHistory(wrap.RecordMap, order)
-		json.NewEncoder(w).Encode(map[string]interface{}{"messages": messages, "agent_id": agentID})
+		// Which model this chat ran on, so reopening it restores the picker
+		// instead of showing whatever happened to be selected last.
+		model, effort := threadModelChoice(wrap.RecordMap, order)
+		json.NewEncoder(w).Encode(map[string]interface{}{"messages": messages, "agent_id": agentID, "model": model, "reasoning_effort": effort})
 	}
 }
 
@@ -621,6 +625,49 @@ func buildHistory(rm recordMapShape, order []string) []chatHistMsg {
 	}
 	flush()
 	return out
+}
+
+// threadModelChoice reports which model (and reasoning effort) a thread was last
+// run with, the same way Notion's own client restores its picker when you reopen
+// a chat:
+//
+//	• every turn persists a "config" thread_message whose value carries
+//	  model + reasoningEffort (modelFromUser marks an explicit user pick);
+//	• every finished "agent-inference" step is stamped with step.model, the
+//	  model that actually produced that answer.
+//
+// The newest config wins; the inference stamp is the fallback for threads whose
+// config step is missing (older chats, agent-started turns).
+func threadModelChoice(rm recordMapShape, order []string) (string, string) {
+	cfgModel, cfgEffort, inferredModel := "", "", ""
+	for _, id := range order {
+		rec, ok := rm.ThreadMessage[id]
+		if !ok {
+			continue
+		}
+		step := rec.Value.Value.Step
+		switch step.Type {
+		case "config", "updated-config":
+			var v struct {
+				Model           string `json:"model"`
+				ReasoningEffort string `json:"reasoningEffort"`
+			}
+			if len(step.Value) == 0 || json.Unmarshal(step.Value, &v) != nil {
+				continue
+			}
+			if m := strings.TrimSpace(v.Model); m != "" {
+				cfgModel, cfgEffort = m, strings.TrimSpace(v.ReasoningEffort)
+			}
+		case "agent-inference":
+			if m := strings.TrimSpace(step.Model); m != "" {
+				inferredModel = m
+			}
+		}
+	}
+	if cfgModel != "" {
+		return cfgModel, cfgEffort
+	}
+	return inferredModel, ""
 }
 
 // ---- Send ----
