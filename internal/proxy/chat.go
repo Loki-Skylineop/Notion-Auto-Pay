@@ -464,6 +464,9 @@ type chatHistMsg struct {
 	Steps  []chatStep    `json:"steps,omitempty"`
 	Survey *chatSurvey   `json:"survey,omitempty"`
 	Pages  []chatPageRef `json:"pages,omitempty"`
+	// Confirm is set when the message ends with the agent waiting for
+	// permission, so the confirm card survives a reload.
+	Confirm *chatConfirm `json:"confirm,omitempty"`
 
 	// Blocks is the same turn as an ordered ribbon of action groups and text
 	// paragraphs. Text and Steps stay filled so the copy button, the history
@@ -616,6 +619,10 @@ func buildHistory(rm recordMapShape, order []string) []chatHistMsg {
 		case "agent-tool-result":
 			ensure()
 			tb.addStep(parseToolResultStep(step))
+			// The agent stopped mid-turn to ask for permission.
+			if c := parseConfirmStep(step); c != nil {
+				cur.Confirm = c
+			}
 		case "survey":
 			ensure()
 			if sv := parseSurveyStep(step); sv != nil {
@@ -631,10 +638,10 @@ func buildHistory(rm recordMapShape, order []string) []chatHistMsg {
 // run with, the same way Notion's own client restores its picker when you reopen
 // a chat:
 //
-//	• every turn persists a "config" thread_message whose value carries
-//	  model + reasoningEffort (modelFromUser marks an explicit user pick);
-//	• every finished "agent-inference" step is stamped with step.model, the
-//	  model that actually produced that answer.
+//   - every turn persists a "config" thread_message whose value carries
+//     model + reasoningEffort (modelFromUser marks an explicit user pick);
+//   - every finished "agent-inference" step is stamped with step.model, the
+//     model that actually produced that answer.
 //
 // The newest config wins; the inference stamp is the fallback for threads whose
 // config step is missing (older chats, agent-started turns).
@@ -964,16 +971,26 @@ type sMeta struct {
 	result    string
 	thinking  string
 	partTypes []string
+	// Live confirmation state: id is the thread_message id that goes back as
+	// confirmToolStepIds, state flips to "confirmation:requested" while the
+	// agent waits for the user. See chat_confirm.go.
+	id          string
+	state       string
+	confirmType string
+	confirmURLs []string
 }
 
 func metaFromItem(raw json.RawMessage) sMeta {
 	var it struct {
-		Type     string          `json:"type"`
-		ToolName string          `json:"toolName"`
-		Input    json.RawMessage `json:"input"`
-		Output   json.RawMessage `json:"output"`
-		Result   json.RawMessage `json:"result"`
-		Value    []struct {
+		Type                 string          `json:"type"`
+		ToolName             string          `json:"toolName"`
+		ID                   string          `json:"id"`
+		State                string          `json:"state"`
+		PendingConfirmations json.RawMessage `json:"pendingConfirmations"`
+		Input                json.RawMessage `json:"input"`
+		Output               json.RawMessage `json:"output"`
+		Result               json.RawMessage `json:"result"`
+		Value                []struct {
 			Type    string `json:"type"`
 			Content string `json:"content"`
 		} `json:"value"`
@@ -983,6 +1000,9 @@ func metaFromItem(raw json.RawMessage) sMeta {
 		return m
 	}
 	m.typ = it.Type
+	m.id = it.ID
+	m.state = it.State
+	m.confirmType, m.confirmURLs = parsePendingConfirmations(it.PendingConfirmations)
 	if len(it.Input) > 0 || it.ToolName != "" {
 		var in struct {
 			Function string          `json:"function"`
@@ -1028,6 +1048,11 @@ func parseContentPath(p string) (int, int, bool) {
 // emitStep sends a live status event describing the current step. The frontend
 // uses kind/tool/server/input/result to render the live agent tree.
 func emitStep(emit func(map[string]interface{}), label string, m sMeta) {
+	// A step parked on the user gets its own row, so the browser can show the
+	// confirm card while the turn is still open.
+	if c := m.pendingConfirm(); c != nil {
+		emitConfirm(emit, c)
+	}
 	switch m.typ {
 	case "agent-tool-result":
 		emit(map[string]interface{}{
@@ -1092,6 +1117,21 @@ func processStreamLine(line []byte, sItems *[]sMeta, answer *strings.Builder, em
 					emit(map[string]interface{}{"event": "user", "text": txt, "queued": queued})
 				}
 				emitStep(emit, "", m)
+			} else if idx, field, ok := parseStepFieldPath(op.P); ok && (field == "state" || field == "pendingConfirmations") {
+				// A step already in the transcript changed state: this is how
+				// "the agent is waiting for your permission" arrives mid-turn.
+				if idx < len(*sItems) {
+					meta := &(*sItems)[idx]
+					if field == "state" {
+						var st string
+						if json.Unmarshal(op.V, &st) == nil {
+							meta.state = st
+						}
+					} else {
+						meta.confirmType, meta.confirmURLs = parsePendingConfirmations(op.V)
+					}
+					emitConfirm(emit, meta.pendingConfirm())
+				}
 			} else if op.O == "x" {
 				idx, part, ok := parseContentPath(op.P)
 				if !ok || idx >= len(*sItems) {
@@ -1164,11 +1204,15 @@ func streamInference(w http.ResponseWriter, tokenV2, userID, spaceID, threadID s
 		processStreamLine(lineCopy, &sItems, &answer, emit)
 	}
 	text, title, steps, blocks, survey, pages := parseInferenceStream(acc.Bytes())
+	// Did the turn end with the agent waiting for permission? Then the card has
+	// to outlive this stream: the browser needs it to call /admin/chat/confirm.
+	confirm := pendingConfirmFromStream(acc.Bytes())
 	if strings.TrimSpace(text) == "" {
 		text = "(агент не вернул текстового ответа)"
 	}
 	emit(map[string]interface{}{
 		"event":     "done",
+		"confirm":   confirm,
 		"thread_id": threadID,
 		"title":     title,
 		"text":      text,

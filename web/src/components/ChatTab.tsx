@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import {
   chatAgents,
+  chatConfirmTool,
   chatDelete,
   chatEdit,
   chatHistory,
@@ -11,6 +12,7 @@ import {
   chatThreads,
   chatUpload,
   type ChatAgent,
+  type ChatConfirm,
   type ChatModel,
   type ChatStatus,
   type ChatStep,
@@ -18,7 +20,7 @@ import {
   type ChatSurvey,
   type ChatSurveyAnswer,
   type ChatThread,
-  setOverage,
+  forceOverageOff,
 } from '../api'
 import { fetchAutoPayConfig, type ServerAutoPayConfig } from '../autopay'
 import type { DiscoveredAccount } from './WorkspacePool'
@@ -66,6 +68,7 @@ import {
   StreamingRow,
   Composer,
   SurveyCard,
+  ConfirmCard,
   type SpaceOption,
   type ChatMessage,
 } from './ChatTabParts'
@@ -121,6 +124,10 @@ export function ChatTab({
   const [historyLoading, setHistoryLoading] = useState(false)
   const [threadsLoading, setThreadsLoading] = useState(false)
   const [error, setError] = useState('')
+  // Запрос разрешения, пришедший строкой живого стрима (событие confirm):
+  // карточка «Подтвердите действие» появляется сразу, не дожидаясь done.
+  const [liveConfirms, setLiveConfirms] = useState<Record<string, ChatConfirm | null>>({})
+  const [confirmBusy, setConfirmBusy] = useState(false)
   // Files already uploaded to Notion and waiting to travel with the next
   // message, plus the uploads still in flight (they drive the progress chips).
   const [attachments, setAttachments] = useState<{ file_url: string; file_name: string; content_type: string; file_size: number }[]>([])
@@ -222,10 +229,44 @@ export function ChatTab({
   // Ref, зеркалящий activeSpace (обновляется на каждом рендере): нужен для
   // доступа к актуальному пространству внутри makeOnStatus с пустыми deps.
   const activeSpaceRef = useRef<SpaceOption | null>(null)
-  // Флаги по ключу хода: true — setOverage уже вызван в этом ходу.
+  // Флаги по ключу хода: true — выключение overage в этом ходу уже запущено.
   // Сбрасываются в finally каждого обработчика, чтобы следующий ход
   // снова мог сработать.
   const overageFiredRef = useRef<Record<string, boolean>>({})
+
+  // Выключение «доп. токенов» для активного пространства. Раньше здесь был один
+  // POST, да ещё и под условием overage_enabled из кеша пула — а кеш почти
+  // всегда говорит «выключено», потому что сервер включает overage сам, на время
+  // хода, и во фронт это не приезжает. Из-за этого запрос часто вообще не уходил
+  // и переключатель оставался включённым. Теперь состояние из кеша не
+  // спрашиваем вовсе: выключаем всегда, с перечиткой настройки из Notion,
+  // повторами и контрольной проверкой через 5 секунд (см. forceOverageOff).
+  // force — для конца хода и стопа: там надо сработать ещё раз, даже если по
+  // этому ходу выключение уже запускали.
+  const killOverage = useCallback((key: string, force = false) => {
+    if (!force && overageFiredRef.current[key]) return
+    overageFiredRef.current[key] = true
+    const sp = activeSpaceRef.current
+    if (!sp) return
+    const spaceId = sp.spaceId
+    forceOverageOff({
+      tokenV2: sp.account.token_v2,
+      userId: sp.account.user_id || '',
+      spaceId,
+      onConfirmed: () => {
+        // Оптимистичный апдейт: гасим бейдж «ДОП» в App.tsx без лишнего
+        // discoverWorkspaces-запроса. Работает аналогично refreshAccount +
+        // persistPool в WorkspacePool.
+        const updated = accountsRef.current.map((a) => ({
+          ...a,
+          spaces: a.spaces?.map((s) =>
+            s.space_id === spaceId ? { ...s, overage_enabled: false } : s
+          ),
+        }))
+        onPoolChangeRef.current?.(updated)
+      },
+    }).catch(() => {})
+  }, [])
 
   // Очередь сообщений по ключу чата. Пока в чате идёт ход, отправленный текст
   // не теряется и не ломает текущий стрим: он ждёт здесь и уходит сам, как
@@ -672,7 +713,7 @@ export function ChatTab({
           const guard = editGuardRef.current
           const stale = !!guard && guard.threadId === threadId && !!res.messages && res.messages.length > guard.maxLen
           if (res.changed && res.messages && !stale) {
-            const mapped = res.messages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, blocks: m.blocks, survey: m.survey, pages: m.pages }))
+            const mapped = res.messages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, blocks: m.blocks, survey: m.survey, confirm: m.confirm, pages: m.pages }))
             // Кэш пишем всегда, даже когда чат не на экране: иначе при возврате
             // в него на миг покажется устаревшая история.
             writeCachedHistory(threadId, mapped)
@@ -830,7 +871,7 @@ export function ChatTab({
           space_id: activeSpace.spaceId,
           thread_id: t.id,
         })
-        const mapped: ChatMessage[] = hist.messages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, blocks: m.blocks, survey: m.survey, pages: m.pages }))
+        const mapped: ChatMessage[] = hist.messages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, blocks: m.blocks, survey: m.survey, confirm: m.confirm, pages: m.pages }))
         if (viewKeyRef.current === t.id && (!cached || cached.hash !== hashMessages(mapped))) {
           setMessages(mapped)
         }
@@ -920,7 +961,7 @@ export function ChatTab({
       if (guard && guard.threadId === threadId && hist.messages.length > guard.maxLen) return
       const histMessages = hist.messages
       if (histMessages.length > 0 && histMessages[histMessages.length - 1].role === 'assistant') {
-        const mapped = histMessages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, blocks: m.blocks, survey: m.survey, pages: m.pages }))
+        const mapped = histMessages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, blocks: m.blocks, survey: m.survey, confirm: m.confirm, pages: m.pages }))
         // Кэш обновляем и для фонового чата, чтобы открытие было мгновенным и
         // сразу правильным.
         writeCachedHistory(threadId, mapped)
@@ -957,6 +998,9 @@ export function ChatTab({
     // заново не нужно.
     pendingQueueRef.current[key] = []
     releaseLive(key)
+    // Оборванный ход — самый частый случай, когда переключатель оставался
+    // включённым: серверный defer мог не доехать. Добиваем принудительно.
+    killOverage(key, true)
     setMessages((prev) => [
       ...prev,
       {
@@ -976,7 +1020,7 @@ export function ChatTab({
         thread_id: tid,
       }).then(() => reconcileFromServer(activeSpace, tid))
     }
-  }, [viewKey, runningKeys, activeThreadId, liveText, liveSteps, activeSpace, reconcileFromServer, stopPolling, setRunning, releaseLive, dequeueMessage])
+  }, [viewKey, runningKeys, activeThreadId, liveText, liveSteps, activeSpace, reconcileFromServer, stopPolling, setRunning, releaseLive, dequeueMessage, killOverage])
 
   // Shared live-status reducer for both chatStream (handleSend) and chatSurvey
   // (handleSurveySubmit). The backend tags every event with a kind: "tool" (a
@@ -989,37 +1033,11 @@ export function ChatTab({
     // События хода, который больше не владеет живым буфером, игнорируем:
     // его прогресс всё равно приедет из опроса сервера.
     if (liveOwnerRef.current !== key) return
-    // Авто-сброс «доп. токенов»: при первом же событии от агента (text / tool /
-    // thought) — значит запрос дошёл — выключаем overage ровно один раз за ход.
-    if (!overageFiredRef.current[key]) {
-      overageFiredRef.current[key] = true
-      const _sp = activeSpaceRef.current
-      if (_sp) {
-        const _si = _sp.account.spaces?.find((si) => si.space_id === _sp.spaceId)
-        if (_si?.overage_enabled) {
-          setOverage({
-            tokenV2: _sp.account.token_v2,
-            userId: _sp.account.user_id || '',
-            spaceId: _sp.spaceId,
-            enabled: false,
-          }).then((res) => {
-            if (!res.error) {
-              // Оптимистичный апдейт: гасим бейдж «ДОП» в App.tsx без лишнего
-              // discoverWorkspaces-запроса. Работает аналогично refreshAccount +
-              // persistPool в WorkspacePool.
-              const _spId = _sp.spaceId
-              const updated = accountsRef.current.map((a) => ({
-                ...a,
-                spaces: a.spaces?.map((s) =>
-                  s.space_id === _spId ? { ...s, overage_enabled: false } : s
-                ),
-              }))
-              onPoolChangeRef.current?.(updated)
-            }
-          }).catch(() => {})
-        }
-      }
-    }
+    // Агент заговорил (text / tool / thought) — значит запрос дошёл, и «доп.
+    // токены» ему больше не нужны: гасим их сразу же, не дожидаясь конца хода.
+    // Дальше forceOverageOff сам перечитает настройку и через 5 секунд
+    // проверит ещё раз, что она действительно выключилась.
+    killOverage(key)
     setStatus(s)
     if (s.kind === 'text') {
       if (s.detail) setLiveText(s.detail)
@@ -1082,6 +1100,11 @@ export function ChatTab({
         // Новый чат узнаёт свой id ещё до первой буквы ответа: без него
         // сообщение, написанное во время самого первого хода, дописать некуда.
         if (threadId) threadIdsRef.current[key] = threadId
+      },
+      // Агент остановился и просит разрешение: Notion держит стрим открытым,
+      // поэтому карточку показываем сразу, а кнопка оживёт, когда ход договорит.
+      onConfirm: (confirm: ChatConfirm) => {
+        setLiveConfirms((prev) => ({ ...prev, [key]: confirm }))
       },
       onUserMessage: (text: string) => {
         const trimmed = (text || '').trim()
@@ -1253,7 +1276,7 @@ export function ChatTab({
           if (res.thread_id && res.thread_id !== activeThreadId) setActiveThreadId(res.thread_id)
           setMessages((prev) => [
             ...prev,
-            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, blocks: res.blocks, survey: res.survey, pages: res.pages },
+            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, blocks: res.blocks, survey: res.survey, confirm: res.confirm, pages: res.pages },
           ])
         }
         // Keep polling the freshly persisted thread state so the message list
@@ -1279,7 +1302,11 @@ export function ChatTab({
         if (turnSeqRef.current[originKey] === myTurn) {
           setRunning(originKey, false)
           releaseLive(originKey)
-          // Сбрасываем флаг, чтобы следующий ход снова мог выключить overage.
+          // Ход закончился — ещё один принудительный заход на выключение, уже
+          // с контрольной перечиткой через 5 секунд. И только после него
+          // сбрасываем флаг, чтобы следующий ход снова мог сработать по первому
+          // событию агента.
+          killOverage(originKey, true)
           overageFiredRef.current[originKey] = false
           // Страховка: сообщение дописали в ход, но он успел закончиться и не
           // подхватил его (события "user" по нему так и не пришло). Тогда
@@ -1422,7 +1449,7 @@ export function ChatTab({
         if (viewKeyRef.current === originKey && !stopKeysRef.current[originKey]) {
           setMessages((prev) => [
             ...prev,
-            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, blocks: res.blocks, survey: res.survey, pages: res.pages },
+            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, blocks: res.blocks, survey: res.survey, confirm: res.confirm, pages: res.pages },
           ])
         }
         if (res.thread_id) startPolling(activeSpace, res.thread_id)
@@ -1512,7 +1539,7 @@ export function ChatTab({
         if (viewKeyRef.current === originKey && !stopKeysRef.current[originKey]) {
           setMessages((prev) => [
             ...prev,
-            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, blocks: res.blocks, survey: res.survey, pages: res.pages },
+            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, blocks: res.blocks, survey: res.survey, confirm: res.confirm, pages: res.pages },
           ])
         }
         if (res.thread_id) startPolling(activeSpace, res.thread_id)
@@ -1530,6 +1557,76 @@ export function ChatTab({
       }
     },
     [activeSpace, runningKeys, activeThreadId, agentId, selectedModel, selectedEffort, makeOnStatus, makeStreamMeta, rememberThreadAgent, rememberThreadModel, startPolling, setRunning, claimLive, releaseLive],
+  )
+
+  // Продолжить ход, разрешив то, о чём агент спросил. Зеркало handleSurveySubmit,
+  // только вместо ответов назад уходит id шага, который Notion отложил в
+  // состоянии confirmation:requested.
+  const handleConfirm = useCallback(
+    async (confirm: ChatConfirm) => {
+      if (!activeSpace) return
+      const tid = activeThreadId
+      if (!tid || !confirm || !confirm.id || confirm.confirmed) return
+      const originKey = tid
+      if (runningKeys[originKey] || confirmBusy) return
+      const agentUsed = agentId
+      const myTurn = (turnSeqRef.current[originKey] = (turnSeqRef.current[originKey] || 0) + 1)
+      stopKeysRef.current[originKey] = false
+      threadIdsRef.current[originKey] = tid
+      instantScrollRef.current = true
+      setError('')
+      setConfirmBusy(true)
+      // Карточка остаётся в логе, но уже без кнопки: действие подтверждено.
+      setMessages((prev) =>
+        prev.map((m) => (m.confirm && m.confirm.id === confirm.id ? { ...m, confirm: { ...m.confirm, confirmed: true } } : m)),
+      )
+      setLiveConfirms((prev) => ({ ...prev, [originKey]: null }))
+      setRunning(originKey, true)
+      claimLive(originKey)
+      startPolling(activeSpace, tid)
+      try {
+        const res = await chatConfirmTool(
+          {
+            token_v2: activeSpace.account.token_v2,
+            user_id: activeSpace.account.user_id,
+            user_name: activeSpace.account.user_name,
+            user_email: activeSpace.account.user_email,
+            space_id: activeSpace.spaceId,
+            space_view_id: activeSpace.spaceViewId,
+            space_name: activeSpace.spaceName,
+            timezone: browserTimezone(),
+            agent: agentUsed,
+            thread_id: tid,
+            tool_step_ids: [confirm.id],
+          },
+          makeOnStatus(originKey),
+          makeStreamMeta(originKey),
+        )
+        if (res.thread_id) {
+          threadIdsRef.current[originKey] = res.thread_id
+          rememberThreadAgent(res.thread_id, agentUsed)
+        }
+        if (viewKeyRef.current === originKey && !stopKeysRef.current[originKey]) {
+          setMessages((prev) => [
+            ...prev,
+            { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, blocks: res.blocks, survey: res.survey, confirm: res.confirm, pages: res.pages },
+          ])
+        }
+        if (res.thread_id) startPolling(activeSpace, res.thread_id)
+      } catch (e) {
+        if (viewKeyRef.current === originKey && !stopKeysRef.current[originKey]) {
+          setError(e instanceof Error ? e.message : 'Не удалось подтвердить действие')
+        }
+      } finally {
+        setConfirmBusy(false)
+        if (turnSeqRef.current[originKey] === myTurn) {
+          setRunning(originKey, false)
+          releaseLive(originKey)
+          overageFiredRef.current[originKey] = false
+        }
+      }
+    },
+    [activeSpace, runningKeys, confirmBusy, activeThreadId, agentId, makeOnStatus, makeStreamMeta, rememberThreadAgent, startPolling, setRunning, claimLive, releaseLive],
   )
 
   // Only the newest user message gets the edit affordance, exactly like Notion.
@@ -1567,6 +1664,13 @@ export function ChatTab({
     !showThinking && lastMessage && lastMessage.role === 'assistant' && lastMessage.survey && !lastMessage.survey.submitted
       ? lastMessage.survey
       : null
+  // Пока ход идёт — берём live-запрос из стрима, после done он уже лежит на
+  // самом сообщении (и выживает перезагрузку вместе с историей).
+  const pendingConfirm =
+    (runningKeys[viewKey] ? liveConfirms[viewKey] : null) ||
+    (lastMessage && lastMessage.role === 'assistant' && lastMessage.confirm && !lastMessage.confirm.confirmed
+      ? lastMessage.confirm
+      : null)
 
   // Экран «нет рабочих пространств» обязан стоять ПОСЛЕ всех хуков. Пока он
   // висел выше useMemo/useEffect, переход accounts с 0 на N менял число
@@ -1795,6 +1899,10 @@ export function ChatTab({
 
         {error ? (
           <div className="relative z-10 px-4 py-2 text-[12px] text-red-400 border-t border-white/[0.06] bg-black/50">{error}</div>
+        ) : null}
+
+        {pendingConfirm ? (
+          <ConfirmCard confirm={pendingConfirm} busy={sendingHere || confirmBusy} onConfirm={handleConfirm} />
         ) : null}
 
         {pendingSurvey ? (

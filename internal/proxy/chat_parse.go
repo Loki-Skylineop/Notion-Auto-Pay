@@ -80,6 +80,11 @@ type tmStep struct {
 	// with the codename of the model that produced it, e.g. "agave-flan". This is
 	// how the web app knows which model a reopened chat was running on.
 	Model string `json:"model"`
+	// A tool call the agent may not run on its own is parked in the transcript
+	// with state "confirmation:requested" and the reason inline, e.g.
+	// pendingConfirmations: {"type":"urlSafety","urls":[...]}. See chat_confirm.go.
+	State                string          `json:"state"`
+	PendingConfirmations json.RawMessage `json:"pendingConfirmations"`
 }
 
 type tmInner struct {

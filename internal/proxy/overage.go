@@ -136,25 +136,55 @@ func setSpaceOveragePolicy(tokenV2, userID, spaceID, policy string) error {
 // be treated as a promise. A single lost write - Notion answering 5xx, the
 // token being briefly rate limited, the turn ending while the workspace is
 // busy - used to leave the switch open until somebody noticed by hand, which
-// is exactly how a workspace quietly keeps spending extra credits. So every
-// disable is now written, read back and retried: a couple of times inside the
-// request, then in the background for as long as it takes.
+// is exactly how a workspace quietly keeps spending extra credits.
+//
+// Worse, a single read-back is not proof either: saveTransactionsFanout is
+// applied asynchronously, so syncRecordValues can still answer with the old
+// value right after a successful write, and a value that reads "disabled"
+// immediately has still been seen to come back on a moment later. Trusting that
+// one read is exactly why the switch "sometimes" stayed on.
+//
+// So a disable is never a single request any more. Each disable is
+//
+//  1. written,
+//  2. read back several times before it is believed,
+//  3. re-checked once more overageConfirmDelay later, when Notion has certainly
+//     applied the transaction,
+//  4. written again from scratch whenever any of those checks disagrees,
+//
+// and the whole cycle repeats in the background until Notion confirms "off",
+// with the watchdog as the last line of defence.
 
 const (
 	// Attempts made while the turn's HTTP handler is still alive. Deliberately
-	// few, so the answer is not delayed; the chaser below does the rest.
-	overageDisableTries = 2
-	overageDisableDelay = 600 * time.Millisecond
-	// Background attempts once the synchronous ones failed. The delay grows
-	// linearly up to overageMaxDelay, covering roughly ten minutes of outage.
-	overageChaseTries = 30
+	// few, so the answer is not delayed; the closer below does the rest.
+	overageDisableTries = 3
+	overageDisableDelay = 400 * time.Millisecond
+
+	// How many times the policy is read back before a disable is believed. One
+	// read is a coin flip against an eventually consistent record cache, so the
+	// verification asks again with a short gap in between.
+	overageVerifyReads = 3
+	overageVerifyGap   = 700 * time.Millisecond
+
+	// The heart of "check it again in five seconds": how long to wait after a
+	// disable before asking Notion once more, and how many write + re-check
+	// rounds one closer runs before it leaves the rest to the watchdog.
+	overageConfirmDelay = 5 * time.Second
+	overageEnsureRounds = 6
+
+	// Attempts inside a background round once the quick ones failed. The delay
+	// grows linearly up to overageMaxDelay.
+	overageChaseTries = 10
 	overageChaseDelay = 5 * time.Second
 	overageMaxDelay   = 30 * time.Second
+
 	// A turn that never released its hold (panic, killed stream, leaked defer)
 	// stops protecting the switch after this long.
 	overageStaleTurn = 15 * time.Minute
+
 	// How often the watchdog looks for workspaces that are still open.
-	overageSweepEvery = time.Minute
+	overageSweepEvery = 20 * time.Second
 )
 
 // overageArm is the bookkeeping for one workspace whose switch this process
@@ -225,36 +255,68 @@ func overageForget(spaceID string) {
 	}
 }
 
+// overageReadOff asks Notion for the current policy up to reads times and
+// reports (off, known). known is false when every read came back empty, i.e.
+// the state could not be established at all - in that case off means nothing
+// and the caller must keep trying rather than declare success. A single read
+// that says "on" is enough to fail the check.
+func overageReadOff(tokenV2, userID, spaceID string, reads int, gap time.Duration) (bool, bool) {
+	if reads < 1 {
+		reads = 1
+	}
+	known := false
+	for i := 1; i <= reads; i++ {
+		policy := fetchSpaceOveragePolicy(tokenV2, userID, spaceID)
+		if strings.TrimSpace(policy) != "" {
+			known = true
+			if overageEnabled(policy) {
+				log.Printf("[overage] %s read %d/%d still reports %q", truncate(spaceID, 8), i, reads, policy)
+				return false, true
+			}
+		}
+		if i < reads {
+			time.Sleep(gap)
+		}
+	}
+	if !known {
+		return false, false
+	}
+	return true, true
+}
+
 // disableOverageOnce writes "disabled" and reads the setting back, so both a
 // failed write and a write that silently did not stick count as a failure.
-func disableOverageOnce(tokenV2, userID, spaceID string) bool {
+// reads controls how thorough the read-back is: one for the inline attempt that
+// must not slow the answer down, overageVerifyReads for the background passes
+// where being sure matters more than being quick.
+func disableOverageOnce(tokenV2, userID, spaceID string, reads int) bool {
 	if err := setSpaceOveragePolicy(tokenV2, userID, spaceID, overagePolicyOff); err != nil {
 		log.Printf("[overage] %s disable failed: %v", truncate(spaceID, 8), err)
 		return false
 	}
-	policy := fetchSpaceOveragePolicy(tokenV2, userID, spaceID)
-	if policy == "" {
+	off, known := overageReadOff(tokenV2, userID, spaceID, reads, overageVerifyGap)
+	if !known {
 		// Read-back unavailable. The write itself reported success, and the
-		// watchdog is still there if Notion disagrees.
+		// delayed re-check plus the watchdog are still there if Notion
+		// disagrees, so this is reported as "probably fine" rather than done.
+		log.Printf("[overage] %s disable written but the read-back is unavailable", truncate(spaceID, 8))
 		return true
 	}
-	if overageEnabled(policy) {
-		log.Printf("[overage] %s still reads %q right after disable", truncate(spaceID, 8), policy)
-		return false
-	}
-	return true
+	return off
 }
 
-// disableOverageInsist retries disableOverageOnce with a growing, capped delay.
-// It stops early when a new turn arms the workspace again - that turn owns the
-// switch now and will close it when it is done.
-func disableOverageInsist(tokenV2, userID, spaceID string, tries int, delay time.Duration) bool {
+// disableOverageLoop retries disableOverageOnce with a growing, capped delay.
+// Unless force is set it stops early when a new turn arms the workspace again -
+// that turn owns the switch now and will close it when it is done. force is for
+// an explicit "off" from the dashboard or the chat UI, which must be obeyed even
+// while a turn is still running.
+func disableOverageLoop(tokenV2, userID, spaceID string, tries int, delay time.Duration, force bool) bool {
 	for i := 1; i <= tries; i++ {
-		if !overageIdle(spaceID) {
+		if !force && !overageIdle(spaceID) {
 			log.Printf("[overage] %s a new turn took over - leaving the switch to it", truncate(spaceID, 8))
 			return true
 		}
-		if disableOverageOnce(tokenV2, userID, spaceID) {
+		if disableOverageOnce(tokenV2, userID, spaceID, overageVerifyReads) {
 			log.Printf("[overage] %s additional credits OFF again (attempt %d/%d)", truncate(spaceID, 8), i, tries)
 			return true
 		}
@@ -270,17 +332,40 @@ func disableOverageInsist(tokenV2, userID, spaceID string, tries int, delay time
 	return false
 }
 
-// overageChase keeps trying in the background after the synchronous attempts
-// gave up, so a lost write cannot leave the workspace open. One chaser per
-// workspace; the watchdog starts another one if this one runs out of tries.
-func overageChase(tokenV2, userID, spaceID string) {
+// disableOverageInsist is the cooperative form of disableOverageLoop, used by
+// everything that runs on behalf of a finished turn.
+func disableOverageInsist(tokenV2, userID, spaceID string, tries int, delay time.Duration) bool {
+	return disableOverageLoop(tokenV2, userID, spaceID, tries, delay, false)
+}
+
+// overageEnsureOff is the background closer, and the reason a disable can be
+// promised rather than hoped for. One closer per workspace runs rounds of
+// "write disabled -> wait overageConfirmDelay -> ask Notion again", and only a
+// confirmed "off" ends it. Anything else - still on, or unreadable - starts
+// another round, because both mean the workspace may still be spending.
+//
+// force skips the checks that hand the switch back to a running turn, for an
+// explicit "off" that must win regardless.
+func overageEnsureOff(tokenV2, userID, spaceID string, force bool) {
+	if strings.TrimSpace(tokenV2) == "" || strings.TrimSpace(spaceID) == "" {
+		return
+	}
+	overageWatchdog.Do(startOverageWatchdog)
 	overageMu.Lock()
 	arm := overageArmed[spaceID]
 	if arm == nil {
 		arm = &overageArm{tokenV2: tokenV2, userID: userID, armedAt: time.Now()}
 		overageArmed[spaceID] = arm
 	}
-	if arm.chasing || arm.turns > 0 {
+	if arm.tokenV2 == "" {
+		arm.tokenV2 = tokenV2
+	}
+	if arm.userID == "" {
+		arm.userID = userID
+	}
+	// One closer per workspace: several of them would only multiply identical
+	// writes. A turn holding the switch wins unless this is a forced off.
+	if arm.chasing || (!force && arm.turns > 0) {
 		overageMu.Unlock()
 		return
 	}
@@ -295,16 +380,46 @@ func overageChase(tokenV2, userID, spaceID string) {
 			}
 			overageMu.Unlock()
 		}()
-		if disableOverageInsist(tokenV2, userID, spaceID, overageChaseTries, overageChaseDelay) {
-			overageForget(spaceID)
-			return
+		for round := 1; round <= overageEnsureRounds; round++ {
+			if !force && !overageIdle(spaceID) {
+				log.Printf("[overage] %s a new turn took over - leaving the switch to it", truncate(spaceID, 8))
+				return
+			}
+			tries, delay := overageDisableTries, overageDisableDelay
+			if round > 1 {
+				// The quick path already failed once, so give later rounds the
+				// patience of a background job.
+				tries, delay = overageChaseTries, overageChaseDelay
+			}
+			if !disableOverageLoop(tokenV2, userID, spaceID, tries, delay, force) {
+				log.Printf("[overage] %s round %d/%d could not close the switch - re-checking anyway", truncate(spaceID, 8), round, overageEnsureRounds)
+			}
+			// The whole point of this pass: never trust the read that happens
+			// straight after the write. Wait until Notion has certainly applied
+			// the transaction, then ask again.
+			time.Sleep(overageConfirmDelay)
+			if !force && !overageIdle(spaceID) {
+				log.Printf("[overage] %s a new turn took over during the re-check", truncate(spaceID, 8))
+				return
+			}
+			off, known := overageReadOff(tokenV2, userID, spaceID, overageVerifyReads, overageVerifyGap)
+			if known && off {
+				log.Printf("[overage] %s additional credits confirmed OFF %s later (round %d/%d)", truncate(spaceID, 8), overageConfirmDelay, round, overageEnsureRounds)
+				overageForget(spaceID)
+				return
+			}
+			if known {
+				log.Printf("[overage] %s STILL ON %s after the disable (round %d/%d) - writing it again", truncate(spaceID, 8), overageConfirmDelay, round, overageEnsureRounds)
+			} else {
+				log.Printf("[overage] %s could not read the switch back (round %d/%d) - writing it again", truncate(spaceID, 8), round, overageEnsureRounds)
+			}
 		}
-		log.Printf("[overage] %s STILL ON after %d background tries - the watchdog will keep going", truncate(spaceID, 8), overageChaseTries)
+		log.Printf("[overage] %s not confirmed OFF after %d rounds - the watchdog will keep going", truncate(spaceID, 8), overageEnsureRounds)
 	}()
 }
 
-// startOverageWatchdog closes switches nobody managed to close: a chaser that
-// ran out of tries, or a turn that hung on to its hold for far too long.
+// startOverageWatchdog closes switches nobody managed to close: a closer that
+// ran out of rounds, or a turn that hung on to its hold for far too long.
 func startOverageWatchdog() {
 	go func() {
 		type pending struct{ tokenV2, userID, spaceID string }
@@ -327,7 +442,7 @@ func startOverageWatchdog() {
 			}
 			overageMu.Unlock()
 			for _, j := range jobs {
-				overageChase(j.tokenV2, j.userID, j.spaceID)
+				overageEnsureOff(j.tokenV2, j.userID, j.spaceID, false)
 			}
 		}
 	}()
@@ -345,10 +460,11 @@ func startOverageWatchdog() {
 // switch that somebody had turned on by hand.
 //
 // The returned closure is the "off" half: it releases this turn's hold and,
-// when it was the last one, insists on the switch being closed - writing,
-// verifying and retrying, in the background if necessary. It is a no-op only
-// when the window was not drained in the first place, so deferring it is always
-// safe, and calling it more than once is safe too.
+// when it was the last one, closes the switch immediately and then keeps
+// proving it stayed closed - one verified write inline, then the background
+// closer with its five-second re-checks. It is a no-op only when the window was
+// not drained in the first place, so deferring it is always safe, and calling it
+// more than once is safe too.
 func armOverageForTurn(tokenV2, userID, spaceID string) func() {
 	noop := func() {}
 	if strings.TrimSpace(tokenV2) == "" || strings.TrimSpace(spaceID) == "" {
@@ -378,12 +494,17 @@ func armOverageForTurn(tokenV2, userID, spaceID string) func() {
 				log.Printf("[overage] %s turn finished, %d still running -> switch stays ON", truncate(spaceID, 8), left)
 				return
 			}
-			if disableOverageInsist(tokenV2, userID, spaceID, overageDisableTries, overageDisableDelay) {
-				overageForget(spaceID)
-				return
+			// One fast, verified attempt inline, so the switch is already closed
+			// by the time the answer is delivered. A single read-back here keeps
+			// the request short; being sure is the closer's job.
+			if disableOverageOnce(tokenV2, userID, spaceID, 1) {
+				log.Printf("[overage] %s additional credits OFF right after the turn - re-checking in %s", truncate(spaceID, 8), overageConfirmDelay)
+			} else {
+				log.Printf("[overage] %s the first disable did not stick - the closer takes over", truncate(spaceID, 8))
 			}
-			log.Printf("[overage] %s could not close the switch in %d tries -> retrying in the background", truncate(spaceID, 8), overageDisableTries)
-			overageChase(tokenV2, userID, spaceID)
+			// And now the part that makes it stick: write again, wait five
+			// seconds, read it back, repeat until Notion confirms "off".
+			overageEnsureOff(tokenV2, userID, spaceID, false)
 		})
 	}
 }
@@ -398,6 +519,13 @@ type overageToggleRequest struct {
 
 // HandleOverageToggle turns "use additional credits" on or off for one
 // workspace, so the indicator in the pool doubles as a switch.
+//
+// "Off" is not a single write here either. It is retried and verified inline,
+// the background closer is kicked so the state is re-checked once more five
+// seconds later, and the answer carries "verified" so the caller knows whether
+// Notion actually confirmed it or only accepted the write. Unlike the end of a
+// turn, this off is forced: the chat UI fires it as soon as the agent starts
+// answering, while the server-side turn is still holding the switch open.
 func HandleOverageToggle(auth *DashboardAuth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -416,21 +544,98 @@ func HandleOverageToggle(auth *DashboardAuth) http.HandlerFunc {
 			http.Error(w, `{"error":"token_v2 and space_id are required"}`, http.StatusBadRequest)
 			return
 		}
-		policy := overagePolicyOff
-		if req.Enabled {
-			policy = overagePolicyOn
+		if !req.Enabled {
+			verified := disableOverageLoop(req.TokenV2, req.UserID, req.SpaceID, overageDisableTries, overageDisableDelay, true)
+			overageEnsureOff(req.TokenV2, req.UserID, req.SpaceID, true)
+			log.Printf("[overage] %s manual disable -> verified=%v, re-checking in %s", truncate(req.SpaceID, 8), verified, overageConfirmDelay)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"ok":       true,
+				"policy":   overagePolicyOff,
+				"enabled":  false,
+				"verified": verified,
+			})
+			return
 		}
-		if err := setSpaceOveragePolicy(req.TokenV2, req.UserID, req.SpaceID, policy); err != nil {
+		if err := setSpaceOveragePolicy(req.TokenV2, req.UserID, req.SpaceID, overagePolicyOn); err != nil {
 			log.Printf("[overage] %s manual toggle failed: %v", truncate(req.SpaceID, 8), err)
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]interface{}{"error": err.Error()})
 			return
 		}
-		log.Printf("[overage] %s manual toggle -> %s", truncate(req.SpaceID, 8), policy)
+		log.Printf("[overage] %s manual toggle -> %s", truncate(req.SpaceID, 8), overagePolicyOn)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"ok":       true,
+			"policy":   overagePolicyOn,
+			"enabled":  true,
+			"verified": true,
+		})
+	}
+}
+
+// overageStatusRequest asks for the live value of one workspace's switch.
+type overageStatusRequest struct {
+	TokenV2 string `json:"token_v2"`
+	UserID  string `json:"user_id"`
+	SpaceID string `json:"space_id"`
+	Reads   int    `json:"reads"`
+}
+
+// HandleOverageStatus reads ai_credit_overage_policy straight from Notion, so
+// the UI can verify a disable instead of assuming it worked. The pool cache is
+// no use for that: the server flips the switch on for the duration of a turn
+// without the frontend ever hearing about it, which is why the old client-side
+// "only disable when overage_enabled" check silently did nothing.
+//
+// known is false when the value could not be read at all - then enabled must be
+// ignored. holding reports whether a turn on this server is still relying on
+// the switch, which makes a lingering "on" expected rather than a bug.
+func HandleOverageStatus(auth *DashboardAuth) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !chatAuthOK(auth, w, r) {
+			return
+		}
+		var req overageStatusRequest
+		if r.Method == http.MethodGet {
+			req.TokenV2 = r.URL.Query().Get("token_v2")
+			req.UserID = r.URL.Query().Get("user_id")
+			req.SpaceID = r.URL.Query().Get("space_id")
+		} else if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
+			return
+		}
+		req.TokenV2 = strings.TrimSpace(req.TokenV2)
+		req.UserID = strings.TrimSpace(req.UserID)
+		req.SpaceID = strings.TrimSpace(req.SpaceID)
+		if req.TokenV2 == "" || req.SpaceID == "" {
+			http.Error(w, `{"error":"token_v2 and space_id are required"}`, http.StatusBadRequest)
+			return
+		}
+		reads := req.Reads
+		if reads < 1 {
+			reads = 1
+		}
+		if reads > overageVerifyReads {
+			reads = overageVerifyReads
+		}
+		policy := ""
+		for i := 1; i <= reads; i++ {
+			policy = fetchSpaceOveragePolicy(req.TokenV2, req.UserID, req.SpaceID)
+			// Stop on the first answer that says "on": that is the one worth
+			// reporting, and re-reading could only hide it.
+			if overageEnabled(policy) {
+				break
+			}
+			if i < reads {
+				time.Sleep(overageVerifyGap)
+			}
+		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"ok":      true,
 			"policy":  policy,
-			"enabled": req.Enabled,
+			"enabled": overageEnabled(policy),
+			"known":   strings.TrimSpace(policy) != "",
+			"holding": !overageIdle(req.SpaceID),
 		})
 	}
 }

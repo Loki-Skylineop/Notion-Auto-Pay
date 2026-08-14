@@ -118,6 +118,7 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	// See internal/proxy/mcp_disconnect.go.
 	mux.HandleFunc("/admin/mcp/disconnect", proxy.HandleMcpDisconnect(dashAuth))
 	mux.HandleFunc("/admin/overage/toggle", proxy.HandleOverageToggle(dashAuth))
+	mux.HandleFunc("/admin/overage/status", proxy.HandleOverageStatus(dashAuth))
 
 	// Chat tab. Proxies the private Notion AI chat protocol per workspace so
 	// the dashboard can list agents, list threads, load a thread's history and
@@ -142,6 +143,7 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	// Submit the user's answers to an agent survey (Уточню пару деталей…)
 	// and continue the turn, streaming the agent's reply just like /stream.
 	mux.HandleFunc("/admin/chat/survey", proxy.HandleChatSurvey(dashAuth))
+	mux.HandleFunc("/admin/chat/confirm", proxy.HandleChatConfirm(dashAuth))
 	// Rewrite the last user message and re-run the agent, mirroring the web
 	// client's AgentUserStep.saveUserStepChanges + runInferenceTranscript.
 	mux.HandleFunc("/admin/chat/edit", proxy.HandleChatEdit(dashAuth))
@@ -335,6 +337,7 @@ func main() {
 	log.Printf("  POST /admin/mcp/connect           (attach an MCP server to a space)")
 	log.Printf("  POST /admin/mcp/disconnect        (detach an MCP server from a space)")
 	log.Printf("  POST /admin/overage/toggle        (toggle 'use additional credits')")
+	log.Printf("  POST /admin/overage/status        (read back 'use additional credits')")
 	log.Printf("  POST /admin/subscribe/trial       (activate free trial, no card)")
 	log.Printf("  POST /admin/chat/agents           (list chat agents for a space)")
 	log.Printf("  POST /admin/chat/models           (list available models for a space)")
@@ -347,6 +350,7 @@ func main() {
 	log.Printf("  POST /admin/chat/stop             (stop an in-flight chat turn)")
 	log.Printf("  POST /admin/chat/sync             (poll a thread's live state)")
 	log.Printf("  POST /admin/chat/survey           (submit survey answers + continue)")
+	log.Printf("  POST /admin/chat/confirm          (approve a tool step + continue)")
 	log.Printf("  GET  /admin/autopay               (server auto-pay config)")
 	log.Printf("  POST /admin/autopay/run           (trigger auto-pay scan now)")
 	log.Printf("  POST /admin/autopay/pay-space     (pay one workspace with saved card)")

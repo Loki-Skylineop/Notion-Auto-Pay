@@ -360,6 +360,7 @@ curl http://localhost:8081/v1/chat/completions \
 | POST | `/admin/chat/upload` | Загрузка файла в чат |
 | POST | `/admin/chat/delete` | Удалить тред |
 | POST | `/admin/chat/survey` | Ответить на опрос агента и продолжить |
+| POST | `/admin/chat/confirm` | Подтвердить действие агента и продолжить |
 
 ### MCP и Overage
 

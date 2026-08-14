@@ -1,6 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   type ChatBlock,
+  type ChatConfirm,
   type ChatModel,
   type ChatPageRef,
   type ChatStatus,
@@ -122,7 +123,7 @@ export function hashMessages(messages: ChatMessage[]): string {
   const basis = messages
     .map(
       (m) =>
-        `${m.role}|${m.text}|${m.steps?.length || 0}|${m.blocks?.length || 0}|${m.survey?.id || ''}|${m.survey?.submitted ? 1 : 0}|${(m.pages || []).map((p) => p.url).join(',')}`,
+        `${m.role}|${m.text}|${m.steps?.length || 0}|${m.blocks?.length || 0}|${m.survey?.id || ''}|${m.survey?.submitted ? 1 : 0}|${m.confirm?.id || ""}|${m.confirm?.confirmed ? 1 : 0}|${(m.pages || []).map((p) => p.url).join(',')}`,
     )
     .join('\u0001')
   for (let i = 0; i < basis.length; i += 1) {
@@ -184,6 +185,9 @@ export interface ChatMessage {
   // cached before this existed have none, and then flat text/steps is rendered.
   blocks?: ChatBlock[]
   survey?: ChatSurvey
+  // Set while the agent waits for permission on this message: the confirm
+  // card is rendered from it, and it is what /admin/chat/confirm resumes.
+  confirm?: ChatConfirm
   pages?: ChatPageRef[]
 }
 
@@ -1778,4 +1782,51 @@ export function SurveyCard({
   )
 }
 
+// --- agent permission request ---
+
+// ConfirmCard renders the agent asking for permission right above the composer:
+// what it wants to do, the urls Notion flagged, and one primary button. Pressing
+// it resumes the SAME turn (see chatConfirmTool), which is exactly what Notion
+// does when you click Allow in its own unsafe-url dialog.
+export function ConfirmCard({
+  confirm,
+  busy,
+  onConfirm,
+}: {
+  confirm: ChatConfirm
+  busy: boolean
+  onConfirm: (confirm: ChatConfirm) => void
+}) {
+  const urls = confirm.urls || []
+  const what = confirm.tool ? (confirm.server ? confirm.tool + " - " + confirm.server : confirm.tool) : ""
+  const done = !!confirm.confirmed
+  return (
+    <div className="relative z-10 mx-4 md:mx-6 mb-2 rounded-xl border border-white/[0.10] bg-[#0c0c0c] p-3.5">
+      <div className="flex items-center justify-between mb-2">
+        <span className="text-[11px] font-medium uppercase tracking-wide text-text-muted">Подтвердите действие</span>
+        {what ? <span className="text-[11px] text-text-muted truncate max-w-[45%]">{what}</span> : null}
+      </div>
+      <div className="text-[13.5px] text-[#e8e8e8] mb-2.5 leading-snug">
+        Агент ждёт разрешения, чтобы продолжить.
+      </div>
+      {urls.length > 0 ? (
+        <div className="mb-2.5 space-y-1">
+          {urls.map((u) => (
+            <div key={u} className="px-3 py-2 rounded-lg border border-white/[0.08] bg-white/[0.02] text-[12px] text-[#9a9a9a] break-all">
+              {u}
+            </div>
+          ))}
+        </div>
+      ) : null}
+      <button
+        type="button"
+        disabled={busy || done}
+        onClick={() => onConfirm(confirm)}
+        className="w-full px-3 py-2 rounded-lg bg-white text-black text-[13px] font-medium hover:bg-[#f0f0f0] transition-colors border-none cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+      >
+        {done ? "Подтверждено" : "Подтвердить"}
+      </button>
+    </div>
+  )
+}
 // --- main component ---

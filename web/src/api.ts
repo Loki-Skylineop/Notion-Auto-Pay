@@ -814,6 +814,20 @@ export interface ChatPageRef {
 }
 
 // One rendered message of a thread's history.
+// A permission request the agent is waiting on: it stopped mid-turn to ask
+// whether it may go ahead (Notion parks such a step in the transcript with
+// state "confirmation:requested"). id is the step id that goes back on confirm,
+// type/urls carry the reason, tool/server/input say what is being approved.
+export interface ChatConfirm {
+  id: string
+  type?: string
+  tool?: string
+  server?: string
+  urls?: string[]
+  input?: string
+  confirmed?: boolean
+}
+
 export interface ChatHistoryMessage {
   role: 'user' | 'assistant'
   text: string
@@ -821,6 +835,7 @@ export interface ChatHistoryMessage {
   blocks?: ChatBlock[]
   survey?: ChatSurvey
   pages?: ChatPageRef[]
+  confirm?: ChatConfirm
 }
 
 export interface ChatAccountRef {
@@ -918,6 +933,7 @@ export interface ChatSendResult {
   blocks?: ChatBlock[]
   survey?: ChatSurvey
   pages?: ChatPageRef[]
+  confirm?: ChatConfirm
 }
 
 // Live status emitted while the agent is working. `kind` distinguishes
@@ -962,6 +978,9 @@ export interface ChatStreamMeta {
   // running transcript: the answer streamed so far is final, and what follows
   // is a NEW answer to that message.
   onUserMessage?: (text: string, queued: boolean) => void
+  // The agent stopped to ask for permission: show the confirm card right away,
+  // because Notion keeps the stream open while it waits for the answer.
+  onConfirm?: (confirm: ChatConfirm) => void
 }
 
 export type ChatQueueParams = ChatAccountRef & {
@@ -1140,8 +1159,12 @@ async function readChatNdjson(resp: Response, onStatus: (s: ChatStatus) => void,
             // Sent while the agent was working: everything typed out so far is
             // the answer to the PREVIOUS message, what follows is a new answer.
             if (meta?.onUserMessage) meta.onUserMessage((ev.text as string) || '', !!ev.queued)
+          } else if (ev.event === 'confirm') {
+            // The agent stopped mid-turn to ask for permission: Notion keeps the
+            // stream open while it waits, so show the card immediately.
+            if (meta?.onConfirm && ev.confirm?.id) meta.onConfirm(ev.confirm as ChatConfirm)
           } else if (ev.event === 'done') {
-            result = { thread_id: ev.thread_id, title: ev.title, text: ev.text, steps: ev.steps, blocks: ev.blocks || undefined, survey: ev.survey || undefined, pages: ev.pages || undefined }
+            result = { thread_id: ev.thread_id, title: ev.title, text: ev.text, steps: ev.steps, blocks: ev.blocks || undefined, survey: ev.survey || undefined, confirm: ev.confirm || undefined, pages: ev.pages || undefined }
           } else if (ev.event === 'error') {
             streamError = ev.error || 'Ошибка потока'
           }
@@ -1193,4 +1216,184 @@ export async function chatSurvey(params: ChatSurveyParams, onStatus: (s: ChatSta
     throw new Error(msg)
   }
   return readChatNdjson(resp, onStatus, meta)
+}
+
+// chatConfirmTool approves the tool calls the agent asked about and continues the
+// SAME turn: the proxy replays runInferenceTranscript with confirmToolStepIds,
+// so the rest of the answer streams in exactly like chatSurvey.
+export type ChatConfirmParams = ChatAccountRef & {
+  timezone?: string
+  agent: string
+  thread_id: string
+  tool_step_ids: string[]
+}
+
+export async function chatConfirmTool(params: ChatConfirmParams, onStatus: (s: ChatStatus) => void, meta?: ChatStreamMeta): Promise<ChatSendResult> {
+  const resp = await fetch("/admin/chat/confirm", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/x-ndjson" },
+    credentials: "same-origin",
+    body: JSON.stringify(params),
+  })
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "")
+    let msg = `HTTP ${resp.status}`
+    if (text) { try { const d = JSON.parse(text); if (d?.error) msg = d.error } catch { /* ignore */ } }
+    throw new Error(msg)
+  }
+  return readChatNdjson(resp, onStatus, meta)
+}
+// --- «Доп. токены»: гарантированное выключение -----------------------------
+//
+// Одного POST мало. Notion применяет saveTransactionsFanout асинхронно, поэтому
+// чтение сразу после записи может вернуть старое значение, а значение, которое
+// прочиталось как «disabled», через секунду иногда снова оказывается включённым.
+// Плюс сам сервер включает overage на время хода, и фронт об этом не знает —
+// поэтому старая проверка «выключаем только если overage_enabled» просто ничего
+// не делала. Здесь мы не «просим выключить», а добиваемся выключения:
+// пишем -> перечитываем -> повторяем -> через 5 секунд проверяем ещё раз.
+
+export interface OverageStatusParams {
+  tokenV2: string
+  userId?: string
+  spaceId: string
+  // Сколько раз перечитать настройку за один запрос (сервер ограничивает сверху).
+  reads?: number
+}
+
+export interface OverageStatusResult {
+  ok?: boolean
+  policy?: string
+  enabled?: boolean
+  // false — состояние прочитать не удалось, enabled в этом случае ничего не значит.
+  known?: boolean
+  // true — на сервере ещё идёт ход, который держит переключатель включённым.
+  holding?: boolean
+  error?: string
+}
+
+// getOverageStatus читает space.settings.ai_credit_overage_policy прямо из
+// Notion, а не из кеша пула, поэтому годится как проверка «реально ли выключилось».
+export async function getOverageStatus(p: OverageStatusParams): Promise<OverageStatusResult> {
+  try {
+    const resp = await fetch('/admin/overage/status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        token_v2: p.tokenV2,
+        user_id: p.userId || '',
+        space_id: p.spaceId,
+        reads: p.reads || 1,
+      }),
+    })
+    const data = (await resp.json().catch(() => null)) as OverageStatusResult | null
+    if (!data) return { error: `HTTP ${resp.status}` }
+    return data
+  } catch (e) {
+    return { error: e instanceof Error ? e.message : 'network error' }
+  }
+}
+
+export interface ForceOverageOffOptions {
+  tokenV2: string
+  userId?: string
+  spaceId: string
+  // Сколько раз пробовать записать «выключено» в одном заходе.
+  tries?: number
+  // Пауза между попытками записи (растёт линейно).
+  delayMs?: number
+  // Через сколько перепроверить, что выключение действительно применилось.
+  confirmAfterMs?: number
+  // Сколько раз повторить цикл «записать -> подождать -> проверить».
+  rounds?: number
+  // Вызывается один раз, когда Notion подтвердил «выключено».
+  onConfirmed?: () => void
+  log?: (message: string) => void
+}
+
+const overageSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+// Один заход на пространство: параллельные вызовы (первое событие агента, конец
+// хода, стоп) не устраивают шторм запросов, а переиспользуют уже идущую проверку.
+const overageOffInFlight = new Map<string, Promise<boolean>>()
+
+export function forceOverageOff(o: ForceOverageOffOptions): Promise<boolean> {
+  const key = o.spaceId
+  const running = overageOffInFlight.get(key)
+  if (running) return running
+  const started = runForceOverageOff(o).then(
+    (ok) => {
+      overageOffInFlight.delete(key)
+      return ok
+    },
+    (e) => {
+      overageOffInFlight.delete(key)
+      throw e
+    },
+  )
+  overageOffInFlight.set(key, started)
+  return started
+}
+
+async function runForceOverageOff(o: ForceOverageOffOptions): Promise<boolean> {
+  const tries = Math.max(1, o.tries ?? 4)
+  const delayMs = Math.max(0, o.delayMs ?? 500)
+  const confirmAfterMs = Math.max(0, o.confirmAfterMs ?? 5000)
+  const rounds = Math.max(1, o.rounds ?? 3)
+  const log = o.log ?? ((m: string) => console.debug(`[overage] ${m}`))
+  const tag = o.spaceId.slice(0, 8)
+  let confirmed = false
+
+  for (let round = 1; round <= rounds; round++) {
+    // 1. Пишем «выключено», пока сервер не подтвердит саму запись.
+    for (let attempt = 1; attempt <= tries; attempt++) {
+      const res = (await setOverage({
+        tokenV2: o.tokenV2,
+        userId: o.userId,
+        spaceId: o.spaceId,
+        enabled: false,
+      })) as SetOverageResult & { verified?: boolean }
+      if (!res.error && res.verified !== false) {
+        log(`${tag} запись «выключено» принята (заход ${round}, попытка ${attempt})`)
+        break
+      }
+      log(`${tag} запись не подтверждена (заход ${round}, попытка ${attempt}): ${res.error || 'verified=false'}`)
+      if (attempt < tries) await overageSleep(delayMs * attempt)
+    }
+    // 2. Сразу перечитываем — на случай, если запись потерялась совсем.
+    const now = await getOverageStatus({
+      tokenV2: o.tokenV2,
+      userId: o.userId,
+      spaceId: o.spaceId,
+      reads: 2,
+    })
+    if (now.known && now.enabled) {
+      log(`${tag} сразу после записи всё ещё ВКЛЮЧЕНО`)
+    } else if (!now.known) {
+      log(`${tag} состояние прочитать не удалось: ${now.error || 'unknown'}`)
+    }
+    // 3. Главная проверка: через паузу спрашиваем Notion ещё раз — к этому
+    //    моменту транзакция точно применена, и «disabled» уже не врёт.
+    await overageSleep(confirmAfterMs)
+    const later = await getOverageStatus({
+      tokenV2: o.tokenV2,
+      userId: o.userId,
+      spaceId: o.spaceId,
+      reads: 3,
+    })
+    if (later.known && later.enabled === false) {
+      log(`${tag} подтверждено: доп. токены выключены (заход ${round}/${rounds})`)
+      confirmed = true
+      break
+    }
+    if (later.known) {
+      log(`${tag} через ${confirmAfterMs} мс всё ещё ВКЛЮЧЕНО — иду на заход ${round + 1}`)
+    } else {
+      log(`${tag} через ${confirmAfterMs} мс состояние неизвестно — иду на заход ${round + 1}`)
+    }
+  }
+  if (confirmed) o.onConfirmed?.()
+  else log(`${tag} выключение не подтвердилось за ${rounds} заходов — сервер продолжает сам`)
+  return confirmed
 }
