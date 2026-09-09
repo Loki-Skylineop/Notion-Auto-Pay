@@ -1493,6 +1493,17 @@ func buildFullTranscript(acc *Account, messages []ChatMessage, notionModel strin
 			Type:  "context",
 			Value: contextValue,
 		},
+		// Notion ships the base config with enableScriptAgentMcpServers off; the
+		// web client flips it on with a trailing updated-config element. Without
+		// it the script agent is assembled without MCP tools, so a perfectly
+		// connected MCP server stays invisible on the /v1 path.
+		ResearcherTranscriptMsg{
+			ID:   generateUUIDv4(),
+			Type: "updated-config",
+			Value: map[string]interface{}{
+				"enableScriptAgentMcpServers": true,
+			},
+		},
 	}
 
 	// Insert attachment entries before user messages (matches Notion web behavior).

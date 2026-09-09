@@ -38,6 +38,14 @@ type ServerConfig struct {
 	AccountsDir   string `yaml:"accounts_dir"`
 	TokenFile     string `yaml:"token_file"`
 	ApiKey        string `yaml:"api_key"`
+	APIRouting    string `yaml:"api_routing"`
+	APIAccount    string `yaml:"api_account"`
+	APISpace      string `yaml:"api_space"`
+	APISpaceName  string `yaml:"api_space_name"`
+	APISpaceView  string `yaml:"api_space_view_id"`
+	MCPServerURL  string `yaml:"mcp_server_url"`
+	MCPToken      string `yaml:"mcp_token"`
+	MCPName       string `yaml:"mcp_name"`
 	AdminPassword string `yaml:"admin_password"`
 	LogFile       string `yaml:"log_file"`
 	DebugLogging  bool   `yaml:"debug_logging"`

@@ -730,6 +730,7 @@ function CreateWorkspaceMenu({ token, onCreated }: { token: string; onCreated: (
 }
 
 export function WorkspacePool({
+  readOnly = false,
   accounts,
   onRemoveAccount,
   onPoolChange,
@@ -741,6 +742,8 @@ export function WorkspacePool({
   // записывается в localStorage.
   onPoolChange?: (next: DiscoveredAccount[]) => void
   onPaid: () => void
+  // Read-only pay tab for regular users: limits stay visible, writes are gated.
+  readOnly?: boolean
 }) {
   const [pool, setPool] = useState<DiscoveredAccount[]>(accounts)
   const poolRef = useRef(pool)
@@ -877,7 +880,7 @@ export function WorkspacePool({
   const globalPlanName = targetPlan ? targetPlan.name : (cfg?.plan || '')
   const targetPlanLabel = targetPlan ? `${targetPlan.name} ${targetPlan.price}${targetPlan.interval}` : (cfg?.plan || '—')
   const intervalSec = cfg?.interval_seconds ?? 60
-  const canPayNow = !!cfg?.enabled && !!cfg?.has_card
+  const canPayNow = !!cfg?.enabled && !!cfg?.has_card && !readOnly
 
   return (
     <div>
@@ -906,7 +909,7 @@ export function WorkspacePool({
               <button
                 onClick={() => setShowSettings(v => !v)}
                 title="Настройки автооплаты"
-                className={`p-1.5 rounded-md transition-colors bg-transparent border-none cursor-pointer ${showSettings ? 'text-text-primary bg-white/[0.07]' : 'text-text-muted hover:text-text-secondary hover:bg-white/[0.04]'}`}
+                className={`p-1.5 rounded-md transition-colors bg-transparent border-none cursor-pointer ${readOnly ? 'hidden' : ''} ${showSettings ? 'text-text-primary bg-white/[0.07]' : 'text-text-muted hover:text-text-secondary hover:bg-white/[0.04]'}`}
               >
                 <IconGear />
               </button>
@@ -997,8 +1000,8 @@ export function WorkspacePool({
                   </div>
                 </div>
                 <div className="flex items-center gap-0.5 shrink-0">
-                  <CreateWorkspaceMenu token={acc.token_v2} onCreated={() => refreshAccount(acc.token_v2)} />
-                  <AccountMenu token={acc.token_v2} onRemove={() => onRemoveAccount(key)} />
+                  {!readOnly && <CreateWorkspaceMenu token={acc.token_v2} onCreated={() => refreshAccount(acc.token_v2)} />}
+                  {!readOnly && <AccountMenu token={acc.token_v2} onRemove={() => onRemoveAccount(key)} />}
                 </div>
               </div>
 
@@ -1058,6 +1061,7 @@ export function WorkspacePool({
                                 on={space.overage_enabled}
                                 busy={!!overageBusy[space.space_id]}
                                 onToggle={() => {
+                                  if (readOnly) return
                                   const sid = space.space_id
                                   const tok = acc.token_v2
                                   const next = !space.overage_enabled
@@ -1085,7 +1089,7 @@ export function WorkspacePool({
                             setDelErr('')
                             setDelTarget({ token: acc.token_v2, userId: acc.user_id || '', spaceId: space.space_id, name: space.name || 'Workspace' })
                           }}
-                          className="shrink-0 p-1.5 rounded-md text-text-muted hover:text-[#eb5757] hover:bg-white/[0.06] transition-colors bg-transparent border-none cursor-pointer"
+                          className={`shrink-0 p-1.5 rounded-md text-text-muted hover:text-[#eb5757] hover:bg-white/[0.06] transition-colors bg-transparent border-none cursor-pointer ${readOnly ? 'hidden' : ''}`}
                         >
                           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
                             <path d="M4 7h16" />
@@ -1100,7 +1104,7 @@ export function WorkspacePool({
                           type="button"
                           onClick={() => toggleSpace(space.space_id, !autoOn)}
                           title="Автооплата этого пространства при Free тарифе"
-                          className={`flex items-center gap-1.5 px-2 py-1 rounded border text-[10px] font-medium transition-colors bg-transparent cursor-pointer ${autoOn ? 'border-white/[0.12] bg-white/[0.05] text-text-secondary' : 'border-white/[0.06] text-text-muted hover:text-text-secondary hover:border-white/[0.10]'}`}
+                          className={`flex items-center gap-1.5 px-2 py-1 rounded border text-[10px] font-medium transition-colors bg-transparent cursor-pointer ${readOnly ? 'opacity-50 pointer-events-none' : ''} ${autoOn ? 'border-white/[0.12] bg-white/[0.05] text-text-secondary' : 'border-white/[0.06] text-text-muted hover:text-text-secondary hover:border-white/[0.10]'}`}
                         >
                           <span className={`relative inline-flex w-8 h-4 rounded-full transition-colors duration-200 shrink-0 ${autoOn ? 'bg-white' : 'bg-white/10'}`}>
                             <span className={`absolute top-0.5 left-0.5 w-3 h-3 rounded-full transition-transform duration-200 ${autoOn ? 'translate-x-4 bg-black' : 'translate-x-0 bg-white/40'}`} />
@@ -1111,7 +1115,7 @@ export function WorkspacePool({
                           onClick={() =>
                             setPayTarget({ token: acc.token_v2, spaceId: space.space_id, name: space.name || 'Workspace' })
                           }
-                          className="ml-auto px-3 py-1 rounded bg-white text-black text-[11px] font-medium hover:bg-[#f0f0f0] active:bg-[#e0e0e0] transition-colors border-none cursor-pointer"
+                          className={`ml-auto px-3 py-1 rounded bg-white text-black text-[11px] font-medium hover:bg-[#f0f0f0] active:bg-[#e0e0e0] transition-colors border-none cursor-pointer ${readOnly ? 'hidden' : ''}`}
                         >
                           Оплатить
                         </button>
@@ -1121,6 +1125,7 @@ export function WorkspacePool({
                         <select
                           value={cfg?.space_plans?.[space.space_id] || ''}
                           onChange={(e) => setSpacePlan(space.space_id, e.target.value)}
+                          disabled={readOnly}
                           title="План автооплаты для этого пространства"
                           className="flex-1 min-w-0 bg-[#0a0a0a] border border-white/[0.08] rounded px-2 py-1 text-[10px] text-text-secondary focus:outline-none focus:border-white/[0.20] transition-colors cursor-pointer"
                         >

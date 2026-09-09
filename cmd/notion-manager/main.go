@@ -118,6 +118,11 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	// See internal/proxy/mcp_disconnect.go.
 	mux.HandleFunc("/admin/mcp/disconnect", proxy.HandleMcpDisconnect(dashAuth))
 	mux.HandleFunc("/admin/overage/toggle", proxy.HandleOverageToggle(dashAuth))
+
+	// API tab: which Notion account serves /v1, plus a live status snapshot.
+	proxy.InitAPIRoutingFromConfig()
+	mux.HandleFunc("/admin/api/config", proxy.HandleAdminAPIConfig(pool, "config.yaml", dashAuth))
+	mux.HandleFunc("/admin/api/status", proxy.HandleAdminAPIStatus(pool, dashAuth))
 	mux.HandleFunc("/admin/overage/status", proxy.HandleOverageStatus(dashAuth))
 
 	// Chat tab. Proxies the private Notion AI chat protocol per workspace so
@@ -285,6 +290,28 @@ func main() {
 	apiKey := cfg.Server.ApiKey
 	dashAuth := proxy.NewDashboardAuth(dashPasswordHash, apiKey)
 
+	// Multi-user access control. users.json keeps one bcrypt-hashed password
+	// per login; the guard scopes every /admin/* route to the accounts and
+	// workspaces that login owns, while admins keep the whole dashboard.
+	userStore, err := proxy.LoadUserStore(proxy.DefaultUsersFile)
+	if err != nil {
+		log.Fatalf("[users] %v", err)
+	}
+	proxy.AttachUserStore(userStore)
+	guard := proxy.NewAccessGuard(dashAuth, userStore, pool)
+	// Fresh install: seed the admin/admin test login so the panel can be
+	// opened without digging the generated password out of the console.
+	if created, err := userStore.EnsureBootstrapAdmin(); err != nil {
+		log.Printf("[users] bootstrap admin not created: %v", err)
+	} else if created {
+		log.Printf("[users] first run: sign in as %s / %s and change the password on the Users tab", proxy.BootstrapAdminUsername, proxy.BootstrapAdminPassword)
+	}
+	if userStore.Count() == 0 {
+		log.Printf("[users] no logins yet -- sign in with the admin password, then create users on the Users tab")
+	} else {
+		log.Printf("[users] %d login(s) loaded from %s", userStore.Count(), userStore.Path())
+	}
+
 	regDeps := &proxy.RegisterJobsDeps{
 		Pool:        pool,
 		AccountsDir: accountsDir,
@@ -327,6 +354,8 @@ func main() {
 	log.Printf("  GET  /v1/models                   (OpenAI models API)")
 	log.Printf("  GET  /models                      (OpenAI models alias)")
 	log.Printf("  GET  /health")
+	log.Printf("  GET  /admin/me                    (current login + granted scope)")
+	log.Printf("  GET  /admin/users                 (user management, admin only)")
 	log.Printf("  GET  /admin/accounts")
 	log.Printf("  GET  /admin/models")
 	log.Printf("  GET  /admin/settings              (search/proxy/ASK settings)")
@@ -379,7 +408,11 @@ func main() {
 		os.Exit(0)
 	}()
 
-	if err := http.ListenAndServe(":"+port, cors(apiKeyAuthMiddleware(apiKey, mux))); err != nil {
+	// Users: the guard applies the per-login access policy in front of the
+	// whole mux, and HideAPIKeyMeta keeps the proxy API key out of the
+	// dashboard HTML for anyone who is not a signed-in admin.
+	handler := cors(apiKeyAuthMiddleware(apiKey, proxy.HideAPIKeyMeta(guard, guard.Middleware(mux))))
+	if err := http.ListenAndServe(":"+port, handler); err != nil {
 		lanCleanup()
 		log.Fatalf("Server error: %v", err)
 	}

@@ -3,6 +3,9 @@ import { addAccount, discoverWorkspaces, checkAuth, deleteAccount, login as apiL
 import { WorkspacePool, type DiscoveredAccount } from './components/WorkspacePool'
 import { ChatTab } from './components/ChatTab'
 import { ErrorBoundary } from './components/ErrorBoundary'
+import { UsersTab } from './components/UsersTab'
+import { fetchMe, loginWithUsername, type Me } from './apiUsers'
+import { L, TAB_LABELS, type TabId } from './uiLabels'
 
 // Pull the persisted accounts + their workspaces straight from the server so
 // the pool shows up even in a fresh browser / incognito window where the
@@ -79,16 +82,16 @@ const HERO_GLOW = { background: 'radial-gradient(ellipse, rgba(255,255,255,0.045
 
 // Top-level tab switcher between the payment pool (Оплата) and the AI chat
 // surface (Чат). Rendered as the mockup's capsule pill.
-function TabBar({ tab, onChange }: { tab: 'pay' | 'chat'; onChange: (t: 'pay' | 'chat') => void }) {
+function TabBar({ tab, onChange, tabs }: { tab: TabId; onChange: (t: TabId) => void; tabs: readonly TabId[] }) {
   return (
     <div className="p-[3px] rounded-full bg-white/[0.03] border border-white/[0.07]">
-      {(['pay', 'chat'] as const).map(t => (
+      {tabs.map(t => (
         <button
           key={t}
           onClick={() => onChange(t)}
           className={`px-5 py-1.5 rounded-full text-[12px] font-medium transition-all duration-200 border-none cursor-pointer ${tab === t ? 'bg-white text-black' : 'bg-transparent text-text-muted hover:text-text-secondary'}`}
         >
-          {t === 'pay' ? 'Оплата' : 'Чат'}
+          {TAB_LABELS[t]}
         </button>
       ))}
     </div>
@@ -106,6 +109,8 @@ function Hero({
   onLogout,
   tab,
   onTab,
+  tabs,
+  canAdd,
   collapsed,
   onToggleCollapse,
 }: {
@@ -113,8 +118,10 @@ function Hero({
   accountCount: number
   spaceCount: number
   onLogout?: () => void
-  tab?: 'pay' | 'chat'
-  onTab?: (t: 'pay' | 'chat') => void
+  tab?: TabId
+  onTab?: (t: TabId) => void
+  tabs: readonly TabId[]
+  canAdd?: boolean
   collapsed?: boolean
   onToggleCollapse?: () => void
 }) {
@@ -138,14 +145,14 @@ function Hero({
               <span className="text-[11px] text-text-muted tracking-wide font-mono">Notion Auto Pay</span>
             </div>
             <div className="flex items-center gap-2">
-              <button
+              {canAdd && (<button
                 onClick={onAdd}
                 className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-white text-black text-[11px] font-medium hover:bg-[#f2f2f2] active:scale-[0.98] transition-all border-none cursor-pointer"
               >
                 <IconPlus size={12} />
                 <span className="hidden sm:inline">Добавить аккаунт</span>
                 <span className="sm:hidden">Добавить</span>
-              </button>
+              </button>)}
               {onLogout && (
                 <button
                   onClick={onLogout}
@@ -171,7 +178,7 @@ function Hero({
                 <IconChevron up={!collapsed} />
               </button>
             )}
-            <TabBar tab={tab} onChange={onTab} />
+            <TabBar tab={tab} onChange={onTab} tabs={tabs} />
             {!collapsed && (accountCount > 0 || spaceCount > 0) && (
               <div className="flex items-center gap-6 mt-1">
                 <Stat value={accountCount} label="аккаунтов" />
@@ -200,6 +207,7 @@ function Stat({ value, label }: { value: number; label: string }) {
 // current browser session is not yet authenticated. api.login() salts +
 // SHA-256-hashes the password before POSTing it.
 function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
+  const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [show, setShow] = useState(false)
   const [loading, setLoading] = useState(false)
@@ -214,7 +222,9 @@ function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
     setLoading(true)
     setError('')
     try {
-      const res = await apiLogin(password)
+      const res = username.trim()
+        ? await loginWithUsername(username.trim(), password)
+        : await apiLogin(password)
       if (res.ok) { onSuccess(); return }
       setError(res.error || 'Неверный пароль')
     } catch (err) {
@@ -234,9 +244,16 @@ function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
           </div>
         </div>
         <h1 className="text-center text-xl font-medium text-text-primary mb-1">Вход в панель</h1>
-        <p className="text-center text-[12px] text-text-muted mb-8">Введите пароль для доступа</p>
+        <p className="text-center text-[12px] text-text-muted mb-8">{L.loginHint}</p>
 
         <form onSubmit={handleSubmit} className="space-y-3">
+          <input
+            value={username}
+            onChange={e => { setUsername(e.target.value); setError('') }}
+            placeholder={L.loginUser}
+            autoComplete="username"
+            className="w-full bg-[#080808] border border-white/[0.08] rounded-lg px-3.5 py-2.5 text-[13px] text-text-primary placeholder:text-text-muted focus:outline-none focus:border-white/[0.20] transition-colors"
+          />
           <div className="relative">
             <input
               ref={inputRef}
@@ -398,11 +415,18 @@ function matchesAccountKey(a: DiscoveredAccount, key: string): boolean {
   return a.user_id === key || a.user_email === key || a.token_v2 === key
 }
 
-function Dashboard({ onLogout }: { onLogout?: () => void }) {
+function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
+  // Admin rights only once /admin/me confirms them: a slow, failed or offline
+  // answer must never hand a regular user the admin controls. In the open
+  // no-password mode the server itself reports is_admin: true.
+  const isAdmin = me?.is_admin === true
+  const tabs = (isAdmin ? (['pay', 'chat', 'users'] as const) : (['pay', 'chat'] as const)) as readonly TabId[]
+  const canAdd = isAdmin
   const [showAddModal, setShowAddModal] = useState(false)
-  const [tab, setTab] = useState<'pay' | 'chat'>(() => {
+  const [tab, setTab] = useState<TabId>(() => {
     try {
-      return localStorage.getItem('nmp_active_tab') === 'chat' ? 'chat' : 'pay'
+      const saved = localStorage.getItem('nmp_active_tab')
+      return saved === 'chat' ? 'chat' : 'pay'
     } catch {
       return 'pay'
     }
@@ -492,6 +516,11 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
   const accountCount = discovered.length
   const spaceCount = discovered.reduce((s, a) => s + (a.spaces?.length || 0), 0)
 
+  // A regular user must never stay on the admin-only tab.
+  useEffect(() => {
+    if (!isAdmin && tab === 'users') setTab('pay')
+  }, [isAdmin, tab])
+
   return (
     <div className="min-h-screen">
       <Hero
@@ -501,6 +530,8 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
         onLogout={onLogout}
         tab={tab}
         onTab={setTab}
+        tabs={tabs}
+        canAdd={canAdd}
         collapsed={headerCollapsed}
         onToggleCollapse={() => setHeaderCollapsed(v => !v)}
       />
@@ -516,17 +547,20 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
             ) : (
               <div className="flex flex-col items-center justify-center py-24 gap-4">
                 <div className="w-12 h-12 rounded-full border border-white/[0.07] flex items-center justify-center text-text-muted text-2xl">◻</div>
-                <div className="text-[13px] text-text-muted">Пока нет рабочих пространств</div>
-                <button
+                <div className="text-[13px] text-text-muted">{isAdmin ? L.emptyAdmin : L.emptyUser}</div>
+                {canAdd && (<button
                   onClick={() => setShowAddModal(true)}
                   className="flex items-center gap-1.5 px-4 py-2 rounded-lg bg-white text-black text-[12px] font-medium hover:bg-[#f0f0f0] transition-colors border-none cursor-pointer"
                 >
                   <IconPlus size={13} /> Добавить аккаунт
-                </button>
+                </button>)}
               </div>
             )
           ) : (
-            <WorkspacePool accounts={discovered} onRemoveAccount={removeDiscovered} onPoolChange={setDiscovered} onPaid={() => {}} />
+            <>
+              {!isAdmin && <div className="mb-3 text-[11px] text-text-muted">{L.readOnlyNote}</div>}
+              <WorkspacePool accounts={discovered} onRemoveAccount={removeDiscovered} onPoolChange={setDiscovered} onPaid={() => {}} readOnly={!isAdmin} />
+            </>
           )}
         </div>
         <div hidden={tab !== 'chat'}>
@@ -535,9 +569,16 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
             <ChatTab accounts={discovered} active={tab === 'chat'} onPoolChange={setDiscovered} />
           </ErrorBoundary>
         </div>
+        {isAdmin && (
+          <div hidden={tab !== 'users'}>
+            <ErrorBoundary>
+              <UsersTab accounts={discovered} currentUsername={me?.username || ''} active={tab === 'users'} />
+            </ErrorBoundary>
+          </div>
+        )}
       </main>
 
-      {showAddModal && <AddAccountModal onClose={() => setShowAddModal(false)} onDiscovered={upsertDiscovered} />}
+      {canAdd && showAddModal && <AddAccountModal onClose={() => setShowAddModal(false)} onDiscovered={upsertDiscovered} />}
     </div>
   )
 }
@@ -545,6 +586,7 @@ function Dashboard({ onLogout }: { onLogout?: () => void }) {
 export default function App() {
   const [authState, setAuthState] = useState<'loading' | 'login' | 'authed'>('loading')
   const [requiresPassword, setRequiresPassword] = useState(false)
+  const [me, setMe] = useState<Me | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -561,8 +603,19 @@ export default function App() {
     return () => { cancelled = true }
   }, [])
 
+  // Who am I: role and granted scope. Drives the users tab and read-only mode.
+  useEffect(() => {
+    if (authState !== 'authed') return
+    let cancelled = false
+    fetchMe()
+      .then(m => { if (!cancelled) setMe(m) })
+      .catch(() => { if (!cancelled) setMe(null) })
+    return () => { cancelled = true }
+  }, [authState])
+
   const handleLogout = useCallback(async () => {
     try { await apiLogout() } catch { /* ignore */ }
+    setMe(null)
     setAuthState('login')
   }, [])
 
@@ -576,5 +629,5 @@ export default function App() {
     return <LoginScreen onSuccess={() => setAuthState('authed')} />
   }
 
-  return <Dashboard onLogout={requiresPassword ? handleLogout : undefined} />
+  return <Dashboard onLogout={requiresPassword ? handleLogout : undefined} me={me} />
 }

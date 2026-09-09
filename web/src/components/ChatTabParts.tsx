@@ -1443,6 +1443,14 @@ export const Composer = memo(function Composer({
   onCancelQueued?: () => void
 }) {
   const [text, setText] = useState(() => getDraft(draftKey))
+  // Живое зеркало текста и ключа чата. Черновик прошлого диалога уходит в
+  // localStorage ровно в момент переключения чата (и при закрытии вкладки),
+  // поэтому возврат в старый чат всегда показывает недописанное сообщение.
+  const textRef = useRef(text)
+  const draftKeyRef = useRef(draftKey)
+  useEffect(() => {
+    textRef.current = text
+  }, [text])
   const taRef = useRef<HTMLTextAreaElement>(null)
   const fileRef = useRef<HTMLInputElement>(null)
   // Sending waits for the bytes to land, so a file always leaves together with
@@ -1473,9 +1481,29 @@ export const Composer = memo(function Composer({
 
   // Swap the composer to the active chat's saved draft whenever the chat
   // changes (switching threads, opening a new chat, or reloading the page).
+  // Перед подстановкой дописываем черновик того чата, ИЗ которого уходим:
+  // React уже сменил draftKey, а в textRef ещё лежит прежний текст.
   useEffect(() => {
-    setText(getDraft(draftKey))
+    const prevKey = draftKeyRef.current
+    if (prevKey && prevKey !== draftKey) saveDraft(prevKey, textRef.current)
+    draftKeyRef.current = draftKey
+    const restored = getDraft(draftKey)
+    textRef.current = restored
+    setText(restored)
   }, [draftKey])
+
+  // Перезагрузка страницы, закрытие вкладки или размонтирование композера —
+  // тоже повод сохранить недописанное.
+  useEffect(() => {
+    const flush = () => saveDraft(draftKeyRef.current, textRef.current)
+    window.addEventListener('beforeunload', flush)
+    window.addEventListener('pagehide', flush)
+    return () => {
+      window.removeEventListener('beforeunload', flush)
+      window.removeEventListener('pagehide', flush)
+      flush()
+    }
+  }, [])
 
   // Когда вкладка становится видимой (переключили вкладку на «Чат»), resize уже прошёл
   // с scrollHeight=0 и ничего не поменял. Даём браузеру один раз отрисовать
@@ -1495,6 +1523,7 @@ export const Composer = memo(function Composer({
     if (!t || !hasSpace || busyUploading) return
     onSend(t)
     setText('')
+    textRef.current = ''
     saveDraft(draftKey, '')
     requestAnimationFrame(() => {
       const el = taRef.current
@@ -1830,3 +1859,115 @@ export function ConfirmCard({
   )
 }
 // --- main component ---
+
+// --- Экспорт истории диалога ------------------------------------------------
+// Кнопка «скачать» в шапке чата собирает всю переписку в Markdown-файл, явно
+// подписывая каждое сообщение: пользователь или ассистент. Действия агента
+// (мысли и вызовы инструментов) идут отдельным списком перед его ответом.
+
+export function ExportIcon({ size = 15 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M12 3v12" />
+      <path d="m7 10 5 5 5-5" />
+      <path d="M5 21h14" />
+    </svg>
+  )
+}
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : String(n)
+}
+
+// Имя файла: только буквы, цифры и дефисы, чтобы не спорить с файловой системой.
+export function chatExportFilename(title: string): string {
+  const d = new Date()
+  const stamp = `${d.getFullYear()}${pad2(d.getMonth() + 1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}`
+  const slug = (title || 'chat')
+    .toLowerCase()
+    .replace(/[^a-zа-яё0-9]+/gi, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48)
+  return `chat-${slug || 'dialog'}-${stamp}.md`
+}
+
+function exportStepLine(step: ChatStep): string {
+  const label = (step.tool || '').trim()
+  const text = (step.text || '').trim()
+  if (step.kind === 'tool' || label) {
+    return `- 🔧 ${label || 'Инструмент'}${text ? ` — ${text}` : ''}`
+  }
+  return `- 💭 ${text || 'Размышление'}`
+}
+
+export function buildChatMarkdown(args: {
+  title: string
+  spaceName?: string
+  accountLabel?: string
+  messages: ChatMessage[]
+}): string {
+  const { title, spaceName, accountLabel, messages } = args
+  const userCount = messages.filter((m) => m.role === 'user').length
+  const botCount = messages.length - userCount
+  const out: string[] = [
+    `# Экспорт чата — ${title || 'Новый чат'}`,
+    '',
+    `- **Пространство:** ${spaceName || '—'}`,
+    `- **Аккаунт:** ${accountLabel || '—'}`,
+    `- **Дата экспорта:** ${new Date().toLocaleString('ru-RU')}`,
+    `- **Сообщений:** ${messages.length} (пользователь — ${userCount}, ассистент — ${botCount})`,
+    '',
+    '---',
+    '',
+  ]
+
+  messages.forEach((m, i) => {
+    const isUser = m.role === 'user'
+    out.push(`## ${i + 1}. ${isUser ? '👤 Пользователь' : '🤖 Ассистент (ИИ)'}`)
+    out.push('')
+    if (!isUser) {
+      const raw = m.steps && m.steps.length > 0 ? m.steps : (m.blocks || []).flatMap((b) => b.steps || [])
+      const shown = visibleSteps(raw)
+      if (shown.length > 0) {
+        out.push('**Действия агента:**')
+        out.push('')
+        shown.forEach((s) => out.push(exportStepLine(s)))
+        out.push('')
+      }
+    }
+    const body = stripEditReferences(m.text || '').trim()
+    out.push(body || '_(без текста)_')
+    out.push('')
+    if (m.attachments && m.attachments.length > 0) {
+      out.push(`**Вложения:** ${m.attachments.map((a) => `${a.file_name} (${formatBytes(a.file_size)})`).join(', ')}`)
+      out.push('')
+    }
+    if (m.pages && m.pages.length > 0) {
+      out.push('**Страницы Notion:**')
+      out.push('')
+      m.pages.forEach((p) => out.push(`- [${p.name || p.url}](${p.url})`))
+      out.push('')
+    }
+    out.push('---')
+    out.push('')
+  })
+
+  return out.join('\n')
+}
+
+// Скачивание текста файлом — целиком в браузере, без обращения к серверу.
+export function downloadTextFile(filename: string, content: string): void {
+  try {
+    const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = filename
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    setTimeout(() => URL.revokeObjectURL(url), 2000)
+  } catch {
+    // ignore — браузер запретил скачивание
+  }
+}

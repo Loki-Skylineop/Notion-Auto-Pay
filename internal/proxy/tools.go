@@ -711,12 +711,12 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 				// Has previous search context — include it and adjust __done__ to
 				// encourage answering from context or searching for more details.
 				messages[lastUserIdx].Content = fmt.Sprintf(
-					"I'm writing a unit test for an API router. Generate the expected JSON output for this test case.\n%sAvailable functions:\n%s- __done__(result: str) — answer the question using context below, or call WebSearch for new topics\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\nAlways output exactly one JSON object.\n\nPrevious search results:\n%s\n\nInput: \"%s\"",
+					"I'm writing a unit test for an API router. Generate the expected JSON output for this test case.\n%sAvailable functions:\n%s- __done__(result: str) — answer the question using context below, or call WebSearch for new topics\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\nOutput only that JSON object - no explanation, no commentary, no questions, no markdown fences. Put any message for the user in __done__.result.\n\nPrevious search results:\n%s\n\nInput: \"%s\"",
 					cwdLine, compactList, prevSearchContext, userQuery)
 				log.Printf("[bridge] included previous search context (%d chars) in framing", len(prevSearchContext))
 			} else {
 				messages[lastUserIdx].Content = fmt.Sprintf(
-					"I'm writing a unit test for an API router. Generate the expected JSON output for this test case.\n%sAvailable functions:\n%s- __done__(result: str) — respond naturally to the user's message\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\nAlways output exactly one JSON object.\n\nInput: \"%s\"",
+					"I'm writing a unit test for an API router. Generate the expected JSON output for this test case.\n%sAvailable functions:\n%s- __done__(result: str) — respond naturally to the user's message\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\nOutput only that JSON object - no explanation, no commentary, no questions, no markdown fences. Put any message for the user in __done__.result.\n\nInput: \"%s\"",
 					cwdLine, compactList, userQuery)
 			}
 			log.Printf("[bridge] embedded query in unit test framing (%d chars)", len(messages[lastUserIdx].Content))
@@ -732,7 +732,7 @@ func injectToolsIntoMessages(messages []ChatMessage, tools []Tool, model string,
 		} else if toolChoiceMode == "required" {
 			formatInstruction = fmt.Sprintf("\n\nI'm writing a unit test for an API router. Generate the expected JSON output.\nAvailable functions:\n%s\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\nOutput only the JSON.", toolList)
 		} else {
-			formatInstruction = fmt.Sprintf("\n\nI'm writing a unit test for an API router. Generate the expected JSON output.\nAvailable functions:\n%s\n__done__(result: str) — respond naturally to the user's message\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\nAlways output exactly one JSON object.", toolList)
+			formatInstruction = fmt.Sprintf("\n\nI'm writing a unit test for an API router. Generate the expected JSON output.\nAvailable functions:\n%s\n__done__(result: str) — respond naturally to the user's message\nOutput format: {\"name\": \"function_name\", \"arguments\": {...}}\nOutput only that JSON object - no explanation, no commentary, no questions, no markdown fences. Put any message for the user in __done__.result.", toolList)
 		}
 	} else {
 		// Haiku with few tools: "translate" framing works reliably

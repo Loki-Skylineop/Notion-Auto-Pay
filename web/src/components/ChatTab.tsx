@@ -29,6 +29,7 @@ import { ParticleSettings } from './ParticleSettings'
 import { loadParticleConfig, type ParticleConfig } from '../particleSettings'
 import { Dropdown } from './Dropdown'
 import { chatSync, type ChatSyncResult } from '../chatSync'
+import { playChatDoneSound, primeChatSounds } from '../chatSound'
 import {
   shellStyle,
   PAGE_SIZE,
@@ -71,6 +72,10 @@ import {
   ConfirmCard,
   type SpaceOption,
   type ChatMessage,
+  ExportIcon,
+  buildChatMarkdown,
+  chatExportFilename,
+  downloadTextFile,
 } from './ChatTabParts'
 
 // active — видна ли вкладка «Чат» прямо сейчас. Компонент смонтирован всегда
@@ -191,6 +196,12 @@ export function ChatTab({
   const editGuardRef = useRef<{ threadId: string; maxLen: number } | null>(null)
   // Guards the one-time "restore last open thread on reload" effect.
   const restoredThreadRef = useRef(false)
+  // Чаты, чей ход оборвал сам пользователь кнопкой «Стоп»: по ним звук конца
+  // работы не играем — это отмена, а не завершённый ход.
+  const soundSkipRef = useRef<Set<string>>(new Set())
+  // Снимок «кто был занят» с прошлого рендера — по нему ловится переход
+  // «занят -> свободен» (см. эффект со звуком ниже).
+  const prevBusyRef = useRef<Set<string>>(new Set())
 
   useEffect(() => {
     viewKeyRef.current = activeThreadId || newKey
@@ -980,6 +991,10 @@ export function ChatTab({
     const ownStream = !!runningKeys[key]
     const tid = ownStream ? threadIdsRef.current[key] || activeThreadId || '' : activeThreadId || ''
     if (!ownStream && !tid) return
+    // «Стоп» — не «агент закончил»: глушим звук по обоим ключам этого чата
+    // (ключ вкладки и id треда у только что созданного чата различаются).
+    soundSkipRef.current.add(key)
+    if (tid) soundSkipRef.current.add(tid)
     // Гасим цикл только того чата, чей ход останавливаем: фоновые диалоги
     // продолжают опрашиваться и не теряют свой индикатор.
     stopPolling(tid || undefined)
@@ -1021,6 +1036,43 @@ export function ChatTab({
       }).then(() => reconcileFromServer(activeSpace, tid))
     }
   }, [viewKey, runningKeys, activeThreadId, liveText, liveSteps, activeSpace, reconcileFromServer, stopPolling, setRunning, releaseLive, dequeueMessage, killOverage])
+
+  // Звук окончания хода. Конец работы агента виден из двух источников: своего
+  // стрима (runningKeys) и опроса сервера (busyThreads) — второй ловит и ходы,
+  // запущенные в другой вкладке или до перезагрузки. Поэтому слушаем не
+  // отдельный обработчик, а переход «занят -> свободен» по каждому чату.
+  // Ключ вкладки и id треда держим в наборе оба: у нового чата id появляется
+  // уже в середине хода, и без ключа эта замена выглядела бы как конец работы.
+  useEffect(() => {
+    const busy = new Set<string>()
+    for (const [key, on] of Object.entries(runningKeys)) {
+      if (!on) continue
+      busy.add(key)
+      const tid = threadIdsRef.current[key]
+      if (tid) busy.add(tid)
+    }
+    for (const [threadId, on] of Object.entries(busyThreads)) {
+      if (on) busy.add(threadId)
+    }
+    const prev = prevBusyRef.current
+    prevBusyRef.current = busy
+    let finished = false
+    for (const id of prev) {
+      if (busy.has(id)) continue
+      // Осознанный стоп — не завершение работы, звук пропускаем.
+      if (soundSkipRef.current.has(id)) {
+        soundSkipRef.current.delete(id)
+        continue
+      }
+      finished = true
+    }
+    if (finished) playChatDoneSound()
+  }, [runningKeys, busyThreads])
+
+  // Прогреваем оба файла один раз, чтобы первый сигнал не ждал сети.
+  useEffect(() => {
+    primeChatSounds()
+  }, [])
 
   // Shared live-status reducer for both chatStream (handleSend) and chatSurvey
   // (handleSurveySubmit). The backend tags every event with a kind: "tool" (a
@@ -1820,7 +1872,20 @@ export function ChatTab({
         className="hidden md:block shrink-0 w-1 cursor-col-resize bg-white/[0.04] hover:bg-white/[0.14] active:bg-notion-blue/50 transition-colors"
       />
 
-      <section className="relative flex-1 min-w-0 flex flex-col min-h-0 overflow-hidden bg-black">
+      <section className="group relative flex-1 min-w-0 flex flex-col min-h-0 overflow-hidden bg-black">
+        {/* Экспорт истории: проявляется при наведении на область чата, когда
+            агент в этом диалоге уже закончил работу. */}
+        {messages.length > 0 && !showThinking && !historyLoading ? (
+          <button
+            type="button"
+            onClick={() => downloadTextFile(chatExportFilename(activeThreadTitle), buildChatMarkdown({ title: activeThreadTitle, spaceName: activeSpace?.spaceName, accountLabel: activeSpace?.accountLabel, messages }))}
+            title="Скачать историю диалога"
+            aria-label="Скачать историю диалога"
+            className="absolute top-2.5 right-3 z-20 hidden md:flex w-8 h-8 items-center justify-center rounded-lg border border-white/[0.09] bg-black/70 text-text-muted opacity-0 hover:text-text-primary hover:bg-white/[0.06] hover:border-white/[0.18] group-hover:opacity-100 focus-visible:opacity-100 transition-all duration-150 cursor-pointer"
+          >
+            <ExportIcon />
+          </button>
+        ) : null}
         {/* Спрятанная вкладка не должна жечь кадры: холст размонтируем целиком. */}
         {active ? <ParticleField active={showThinking} cfg={particleCfg} /> : null}
 

@@ -946,7 +946,12 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			}
 
 			if acc == nil {
-				if isResearcher {
+				// API tab: an explicitly pinned account wins over the pool
+				// heuristics. On failover the pin is already in tried, so the
+				// pool takes over instead of retrying a dead account.
+				if pinned := pinnedAPIAccount(pool, tried); pinned != nil {
+					acc = pinned
+				} else if isResearcher {
 					if attempt == 0 {
 						acc = pool.NextForResearch()
 					} else {
@@ -2116,7 +2121,10 @@ func handleAnthropicNonStream(w http.ResponseWriter, acc *Account, messages []Ch
 		}
 
 		// When tool actions were detected, suppress residual framing / identity text.
-		if remaining != "" && hasCalls {
+		// __done__ and WebSearch are tool actions too: the real answer is carried by
+		// doneText, so any surrounding prose is unit-test framing residue and must
+		// never reach the client. The streaming path already applies this same guard.
+		if remaining != "" && (hasCalls || prepared.WebSearchQuery != "" || doneText != "") {
 			log.Printf("[bridge] suppressed %d chars of residual tool framing text", len(remaining))
 		} else if remaining != "" {
 			contentBlocks = append(contentBlocks, AnthropicContentBlock{Type: "text", Text: remaining})

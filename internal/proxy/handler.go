@@ -378,9 +378,21 @@ func persistSearchSettings(configPath string) {
 		setYAMLBool(proxyNode, "enable_workspace_search", AppConfig.WorkspaceSearchEnabled())
 		setYAMLBool(proxyNode, "ask_mode_default", AppConfig.AskModeDefault())
 		setYAMLString(proxyNode, "notion_proxy", AppConfig.Proxy.NotionProxy)
+		setYAMLString(proxyNode, "default_model", AppConfig.Proxy.DefaultModel)
 
 		serverNode := getOrCreateYAMLMapping(mapping, "server")
 		setYAMLBool(serverNode, "debug_logging", AppConfig.Server.DebugLogging)
+		// API tab: key + routing decision live in config.yaml so a restart
+		// keeps serving the same account.
+		setYAMLString(serverNode, "api_key", AppConfig.Server.ApiKey)
+		setYAMLString(serverNode, "api_routing", AppConfig.Server.APIRouting)
+		setYAMLString(serverNode, "api_account", AppConfig.Server.APIAccount)
+		setYAMLString(serverNode, "api_space", AppConfig.Server.APISpace)
+		setYAMLString(serverNode, "api_space_name", AppConfig.Server.APISpaceName)
+		setYAMLString(serverNode, "api_space_view_id", AppConfig.Server.APISpaceView)
+		setYAMLString(serverNode, "mcp_server_url", AppConfig.Server.MCPServerURL)
+		setYAMLString(serverNode, "mcp_token", AppConfig.Server.MCPToken)
+		setYAMLString(serverNode, "mcp_name", AppConfig.Server.MCPName)
 	}
 
 	out, err := yaml.Marshal(&root)

@@ -50,3 +50,16 @@ config.yaml
 # binary, NOT the cmd/notion-manager/ source directory)
 /notion-manager
 /notion-manager.exe
+# Dashboard logins (bcrypt password hashes) -- never commit
+users.json
+users.json.tmp
+# local patch backups and build leftovers
+.bak-*/
+*.bak-*
+.overage-backup/
+accounts-expired/
+/notion-manager-linux
+/s1.wav
+/s2.mp3
+web/tsconfig.tsbuildinfo
+_patch/
