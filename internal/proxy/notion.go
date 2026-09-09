@@ -289,30 +289,6 @@ func isHTTPURL(raw string) bool {
 	return u.Host != ""
 }
 
-func resolveToolCitationURL(raw string, toolCallURLs map[string][]string) (string, bool) {
-	if len(toolCallURLs) == 0 {
-		return "", false
-	}
-	toolCallID, idx, hasExplicitIndex, ok := parseToolCitationToken(raw)
-	if !ok {
-		return "", false
-	}
-	urls := toolCallURLs[toolCallID]
-	if len(urls) == 0 {
-		return "", false
-	}
-	if !hasExplicitIndex && len(urls) > 1 {
-		return "", false
-	}
-	if idx > len(urls) {
-		idx = 1
-	}
-	if !isHTTPURL(urls[idx-1]) {
-		return "", false
-	}
-	return urls[idx-1], true
-}
-
 func parseToolCitationToken(raw string) (toolCallID string, idx int, hasExplicitIndex bool, ok bool) {
 	m := toolCitationTokenRe.FindStringSubmatch(strings.TrimSpace(raw))
 	if len(m) != 3 {

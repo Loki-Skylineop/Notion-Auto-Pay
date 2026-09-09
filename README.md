@@ -1,6 +1,6 @@
 # Notion Auto Pay
 
-Локальный сервер для управления аккаунтами Notion: веб-панель для работы с несколькими аккаунтами, автоплатёж, прямой чат с Notion AI и OpenAI-совместимый API.
+Локальный сервер для управления аккаунтами Notion: веб-панель для работы с несколькими аккаунтами, автоплатёж, прямой чат с Notion AI и Anthropic-совместимый API.
 
 ---
 
@@ -19,7 +19,7 @@
   - [Рабочие пространства (Workspaces)](#рабочие-пространства-workspaces)
   - [MCP-серверы](#mcp-серверы)
   - [Доп. токены (Overage)](#доп-токены-overage)
-- [OpenAI-совместимый API](#openai-совместимый-api)
+- [Anthropic-совместимый API](#anthropic-совместимый-api)
 - [HTTP API эндпойнты](#http-api-эндпойнты)
 - [Структура проекта](#структура-проекта)
 - [Частые вопросы](#частые-вопросы)
@@ -35,7 +35,7 @@
 - **автоматически платить** подписку Notion AI по расписанию (auto-pay) серверным планировщиком
 - **активировать free trial** без привязки карты
 - **управлять рабочими пространствами**: создавать/удалять, подключать MCP-серверы, включать доп. токены
-- **предоставлять OpenAI-совместимый API** (`/v1/chat/completions`), который принимают любые приложения, поддерживающие ChatGPT-протокол
+- **предоставлять Anthropic-совместимый API** (`/v1/messages`), который принимают приложения, поддерживающие протокол Claude
 
 Сервер запускается локально, все данные хранятся на вашем компьютере в папке `accounts/`.
 
@@ -150,7 +150,7 @@ Pri включённом пароле автоматически включае�
 ```yaml
 server:
   port: "8081"               # Порт сервера. По умолчанию 8081
-  api_key: "sk-..."          # API-ключ для /v1/chat/completions. Можно любой
+  api_key: "sk-..."          # API-ключ для /v1/* и панели. Можно любой
   admin_password: ""         # Пароль панели. Лучше задавать через --password
 
 stripe:
@@ -270,10 +270,10 @@ accounts/
 
 ---
 
-## OpenAI-совместимый API
+## Anthropic-совместимый API
 
-Сервер предоставляет полностью совместимый с OpenAI эндпойнт `/v1/chat/completions`.
-Подходит для любых приложений: **Open WebUI, LibreChat, Cursor, Continue.dev** и др.
+Сервер предоставляет совместимый с Anthropic Messages API эндпойнт `/v1/messages`.
+Подходит для приложений, умеющих работать с Claude API.
 
 **Параметры:**
 
@@ -286,21 +286,22 @@ Model:     любой (notion-manager использует дефолтную м
 **Пример запроса (`curl`):**
 
 ```bash
-curl http://localhost:8081/v1/chat/completions \
-  -H "Authorization: Bearer sk-...ваш-api-key..." \
+curl http://localhost:8081/v1/messages \
+  -H "x-api-key: sk-...ваш-api-key..." \
   -H "Content-Type: application/json" \
   -d '{
     "model": "notion-ai",
+    "max_tokens": 1024,
     "messages": [{"role": "user", "content": "Привет!"}]
   }'
 ```
 
 **Streaming:**
 ```bash
-curl http://localhost:8081/v1/chat/completions \
-  -H "Authorization: Bearer sk-..." \
+curl http://localhost:8081/v1/messages \
+  -H "x-api-key: sk-..." \
   -H "Content-Type: application/json" \
-  -d '{"model": "notion-ai", "stream": true, "messages": [{"role": "user", "content": "Hello"}]}'
+  -d '{"model": "notion-ai", "max_tokens": 1024, "stream": true, "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
 > Для работы API необходим аккаунт с активным планом Notion AI в базе данных.
@@ -311,11 +312,12 @@ curl http://localhost:8081/v1/chat/completions \
 
 Все `/admin/*` маршруты защищены тем же паролем/API-ключом, что и веб-панель.
 
-### OpenAI API
+### Anthropic-совместимый API
 
 | Метод | Маршрут | Описание |
 |---|---|---|
-| POST | `/v1/chat/completions` | Отправка сообщения через Notion AI (OpenAI-формат, streaming поддерживается) |
+| POST | `/v1/messages` | Отправка сообщения через Notion AI (формат Anthropic Messages, streaming поддерживается) |
+| GET | `/v1/models` | Список доступных моделей |
 
 ### Аккаунты и пространства
 

@@ -53,10 +53,8 @@ func apiKeyAuthMiddleware(apiKey string, next http.Handler) http.Handler {
 func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth *proxy.DashboardAuth, usageStats *proxy.UsageStats, regDeps *proxy.RegisterJobsDeps, autoPay *proxy.AutoPayManager) *http.ServeMux {
 	mux := http.NewServeMux()
 
-	// Anthropic + OpenAI-compatible API endpoints
+	// Anthropic-compatible API endpoints
 	mux.HandleFunc("/v1/messages", proxy.HandleAnthropicMessages(pool))
-	mux.HandleFunc("/v1/chat/completions", proxy.HandleOpenAIChatCompletions(pool))
-	mux.HandleFunc("/v1/responses", proxy.HandleOpenAIResponses(pool))
 	mux.HandleFunc("/v1/models", proxy.HandlePublicModels(pool))
 	mux.HandleFunc("/models", proxy.HandlePublicModels(pool))
 
@@ -119,10 +117,8 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	mux.HandleFunc("/admin/mcp/disconnect", proxy.HandleMcpDisconnect(dashAuth))
 	mux.HandleFunc("/admin/overage/toggle", proxy.HandleOverageToggle(dashAuth))
 
-	// API tab: which Notion account serves /v1, plus a live status snapshot.
+	// Which Notion account serves /v1: auto or pinned, seeded from config.yaml.
 	proxy.InitAPIRoutingFromConfig()
-	mux.HandleFunc("/admin/api/config", proxy.HandleAdminAPIConfig(pool, "config.yaml", dashAuth))
-	mux.HandleFunc("/admin/api/status", proxy.HandleAdminAPIStatus(pool, dashAuth))
 	mux.HandleFunc("/admin/overage/status", proxy.HandleOverageStatus(dashAuth))
 
 	// Chat tab. Proxies the private Notion AI chat protocol per workspace so
@@ -349,10 +345,8 @@ func main() {
 	log.Printf("  GET  /dashboard/                  (Dashboard UI)")
 	log.Printf("  GET  /proxy/start                 (Open proxy for account)")
 	log.Printf("  POST /v1/messages                 (Anthropic Messages API)")
-	log.Printf("  POST /v1/chat/completions         (OpenAI Chat Completions API)")
-	log.Printf("  POST /v1/responses                (OpenAI Responses API)")
-	log.Printf("  GET  /v1/models                   (OpenAI models API)")
-	log.Printf("  GET  /models                      (OpenAI models alias)")
+	log.Printf("  GET  /v1/models                   (models API)")
+	log.Printf("  GET  /models                      (models alias)")
 	log.Printf("  GET  /health")
 	log.Printf("  GET  /admin/me                    (current login + granted scope)")
 	log.Printf("  GET  /admin/users                 (user management, admin only)")

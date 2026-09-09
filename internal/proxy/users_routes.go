@@ -37,10 +37,6 @@ var adminOnlyExact = map[string]bool{
 	"/admin/autopay/run":       true,
 	"/admin/autopay/pay-space": true,
 	"/proxy/start":             true,
-	// Leftover /v1 routing endpoints: the API tab UI is gone, but these
-	// still expose the proxy key, so they stay admin-only.
-	"/admin/api/config": true,
-	"/admin/api/status": true,
 }
 
 // adminOnlyPrefixes covers the routed sub-trees.

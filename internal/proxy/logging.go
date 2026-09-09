@@ -147,13 +147,6 @@ func NotionResponseLoggingEnabled() bool {
 	return notionResponseLoggingEnabled.Load()
 }
 
-func LogAPIInputJSON(requestID, label string, v interface{}) {
-	if !APILogInputEnabled() {
-		return
-	}
-	logJSONPayload("[api-in]", requestID, label, v)
-}
-
 func LogAPIInputJSONBytes(requestID, label string, raw []byte) {
 	if !APILogInputEnabled() {
 		return
@@ -173,13 +166,6 @@ func LogAPIOutputJSON(requestID, label string, v interface{}) {
 		return
 	}
 	logJSONPayload("[api-out]", requestID, label, v)
-}
-
-func LogAPIOutputText(requestID, label, text string) {
-	if !APILogOutputEnabled() {
-		return
-	}
-	logTextPayload("[api-out]", requestID, label, text)
 }
 
 func LogNotionRequestJSON(requestID, label string, v interface{}) {

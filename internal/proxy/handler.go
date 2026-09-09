@@ -390,9 +390,6 @@ func persistSearchSettings(configPath string) {
 		setYAMLString(serverNode, "api_space", AppConfig.Server.APISpace)
 		setYAMLString(serverNode, "api_space_name", AppConfig.Server.APISpaceName)
 		setYAMLString(serverNode, "api_space_view_id", AppConfig.Server.APISpaceView)
-		setYAMLString(serverNode, "mcp_server_url", AppConfig.Server.MCPServerURL)
-		setYAMLString(serverNode, "mcp_token", AppConfig.Server.MCPToken)
-		setYAMLString(serverNode, "mcp_name", AppConfig.Server.MCPName)
 	}
 
 	out, err := yaml.Marshal(&root)

@@ -43,9 +43,6 @@ type ServerConfig struct {
 	APISpace      string `yaml:"api_space"`
 	APISpaceName  string `yaml:"api_space_name"`
 	APISpaceView  string `yaml:"api_space_view_id"`
-	MCPServerURL  string `yaml:"mcp_server_url"`
-	MCPToken      string `yaml:"mcp_token"`
-	MCPName       string `yaml:"mcp_name"`
 	AdminPassword string `yaml:"admin_password"`
 	LogFile       string `yaml:"log_file"`
 	DebugLogging  bool   `yaml:"debug_logging"`
@@ -568,10 +565,6 @@ func (c *Config) TLSDialTimeoutDuration() time.Duration {
 
 func (c *Config) RefreshInterval() time.Duration {
 	return time.Duration(c.Refresh.IntervalMinutes) * time.Minute
-}
-
-func (c *Config) QuotaRecheckInterval() time.Duration {
-	return time.Duration(c.Refresh.QuotaRecheckMinutes) * time.Minute
 }
 
 // QuotaLiveCheckInterval returns the minimum interval between live per-request
