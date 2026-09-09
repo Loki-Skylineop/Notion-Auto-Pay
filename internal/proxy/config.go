@@ -467,7 +467,7 @@ func EnsureApiKey(cfg *Config, configPath string) {
 	}
 
 	cfg.Server.ApiKey = GenerateApiKey()
-	log.Printf("[config] no api_key configured, generated: %s", cfg.Server.ApiKey)
+	log.Printf("[config] no api_key configured; generated a new key (%d chars)", len(cfg.Server.ApiKey))
 
 	// Write the key back to config.yaml
 	if configPath == "" {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/subtle"
 	"flag"
 	"log"
 	"net/http"
@@ -42,8 +43,26 @@ func apiKeyAuthMiddleware(apiKey string, next http.Handler) http.Handler {
 			http.Error(w, `{"error":{"message":"missing api key, use 'Authorization: Bearer <key>' or 'x-api-key: <key>'","type":"auth_error"}}`, http.StatusUnauthorized)
 			return
 		}
-		if key != apiKey {
+		expectedKey := proxy.CurrentAPIKey()
+		if expectedKey == "" {
+			expectedKey = strings.TrimSpace(apiKey)
+		}
+		if subtle.ConstantTimeCompare([]byte(key), []byte(expectedKey)) != 1 {
 			http.Error(w, `{"error":{"message":"invalid api key","type":"auth_error"}}`, http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-dangerous-direct-browser-access, x-airi-session-id, x-airi-round-id, x-airi-app-surface, X-Web-Search, X-Workspace-Search")
+		w.Header().Set("Access-Control-Expose-Headers", "x-notion-thread-id, x-request-id")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
 			return
 		}
 		next.ServeHTTP(w, r)
@@ -53,7 +72,12 @@ func apiKeyAuthMiddleware(apiKey string, next http.Handler) http.Handler {
 func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth *proxy.DashboardAuth, usageStats *proxy.UsageStats, regDeps *proxy.RegisterJobsDeps, autoPay *proxy.AutoPayManager) *http.ServeMux {
 	mux := http.NewServeMux()
 
-	// Anthropic-compatible API endpoints
+	// AIRI uses xsAI's OpenAI-shaped transport on a dedicated route; the
+	// adapter converts it into the existing Anthropic/Notion workflow.
+	mux.HandleFunc("/v1/airi/chat/completions", proxy.HandleAIRIChatCompletions(pool))
+	mux.HandleFunc("/v1/airi/models", proxy.HandlePublicModels(pool))
+
+	// Anthropic-compatible API endpoints.
 	mux.HandleFunc("/v1/messages", proxy.HandleAnthropicMessages(pool))
 	mux.HandleFunc("/v1/models", proxy.HandlePublicModels(pool))
 	mux.HandleFunc("/models", proxy.HandlePublicModels(pool))
@@ -68,6 +92,8 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	mux.HandleFunc("/admin/models", proxy.HandleAdminModels(pool, dashAuth))
 	mux.HandleFunc("/admin/refresh", proxy.HandleAdminRefresh(pool, accountsDir, dashAuth))
 	mux.HandleFunc("/admin/settings", proxy.HandleAdminSettings("config.yaml", dashAuth))
+	// MVP AIRI integration key, model and workspace routing settings.
+	mux.HandleFunc("/admin/api/config", proxy.HandleAdminAPIConfig(pool, "config.yaml", dashAuth))
 	mux.HandleFunc("/admin/stats", proxy.HandleAdminStats(usageStats, dashAuth))
 
 	// Bulk Microsoft-SSO registration. The legacy synchronous endpoint is
@@ -316,19 +342,6 @@ func main() {
 		Auth:        dashAuth,
 	}
 
-	cors := func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, X-Web-Search, X-Workspace-Search")
-			if r.Method == "OPTIONS" {
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
-
 	mux := newMux(pool, accountsDir, apiKey, dashAuth, usageStats, regDeps, autoPay)
 
 	dashStatus := "OPEN (no password)"
@@ -339,11 +352,13 @@ func main() {
 	log.Printf("=== notion-manager ===")
 	log.Printf("Listening on :%s", port)
 	log.Printf("Accounts: %d", pool.Count())
-	log.Printf("API Key: %s", apiKey)
+	log.Printf("API Key: configured (%d chars)", len(apiKey))
 	log.Printf("Dashboard: %s", dashStatus)
 	log.Printf("Endpoints:")
 	log.Printf("  GET  /dashboard/                  (Dashboard UI)")
 	log.Printf("  GET  /proxy/start                 (Open proxy for account)")
+	log.Printf("  POST /v1/airi/chat/completions    (AIRI MVP adapter)")
+	log.Printf("  GET  /v1/airi/models              (AIRI model validation)")
 	log.Printf("  POST /v1/messages                 (Anthropic Messages API)")
 	log.Printf("  GET  /v1/models                   (models API)")
 	log.Printf("  GET  /models                      (models alias)")
@@ -353,6 +368,7 @@ func main() {
 	log.Printf("  GET  /admin/accounts")
 	log.Printf("  GET  /admin/models")
 	log.Printf("  GET  /admin/settings              (search/proxy/ASK settings)")
+	log.Printf("  GET  /admin/api/config            (AIRI key/model/workspace settings)")
 	log.Printf("  GET  /admin/stats                 (token usage stats)")
 	log.Printf("  GET  /admin/workspaces            (all-accounts workspace list)")
 	log.Printf("  POST /admin/workspaces/create     (bulk create random workspaces)")
@@ -405,7 +421,7 @@ func main() {
 	// Users: the guard applies the per-login access policy in front of the
 	// whole mux, and HideAPIKeyMeta keeps the proxy API key out of the
 	// dashboard HTML for anyone who is not a signed-in admin.
-	handler := cors(apiKeyAuthMiddleware(apiKey, proxy.HideAPIKeyMeta(guard, guard.Middleware(mux))))
+	handler := corsMiddleware(apiKeyAuthMiddleware(apiKey, proxy.HideAPIKeyMeta(guard, guard.Middleware(mux))))
 	if err := http.ListenAndServe(":"+port, handler); err != nil {
 		lanCleanup()
 		log.Fatalf("Server error: %v", err)

@@ -605,6 +605,15 @@ func detectToolBridgeNoToolResponse(text string) bool {
 	}
 }
 
+func extractAnthropicSessionSaltFromRequest(r *http.Request, metadata map[string]interface{}) string {
+	if r != nil {
+		if value := strings.TrimSpace(r.Header.Get("x-airi-session-id")); value != "" {
+			return value
+		}
+	}
+	return extractAnthropicSessionSalt(metadata)
+}
+
 func extractAnthropicSessionSalt(metadata map[string]interface{}) string {
 	if len(metadata) == 0 {
 		return ""
@@ -623,7 +632,7 @@ func extractAnthropicSessionSalt(metadata map[string]interface{}) string {
 					return sid
 				}
 			}
-			return ""
+			return trimmed
 		case map[string]interface{}:
 			if sid, ok := tv["session_id"].(string); ok && sid != "" {
 				return sid
@@ -762,10 +771,8 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 			return
 		}
 
-		model := req.Model
-		if model == "" {
-			model = AppConfig.Proxy.DefaultModel
-		}
+		// AIRI uses a stable alias; the dashboard owns the real Notion model.
+		model := resolveAPIModel(req.Model)
 
 		// ── ASK mode resolution ──
 		// 1. Per-request override via "-ask" suffix on the model name
@@ -789,9 +796,9 @@ func HandleAnthropicMessages(pool *AccountPool) http.HandlerFunc {
 		if len(fileAttachments) > 0 {
 			log.Printf("[upload-debug] extracted %d file attachment(s) from request", len(fileAttachments))
 		}
-		sessionSalt := extractAnthropicSessionSalt(req.Metadata)
+		sessionSalt := extractAnthropicSessionSaltFromRequest(r, req.Metadata)
 		if sessionSalt != "" {
-			log.Printf("[session] extracted metadata session salt %s", truncateForLog(sessionSalt, 8))
+			log.Printf("[session] AIRI session salt %s", truncateForLog(sessionSalt, 8))
 		}
 
 		// Log converted internal messages

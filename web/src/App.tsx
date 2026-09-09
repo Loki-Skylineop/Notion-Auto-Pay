@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { addAccount, discoverWorkspaces, checkAuth, deleteAccount, login as apiLogin, logout as apiLogout } from './api'
 import { WorkspacePool, type DiscoveredAccount } from './components/WorkspacePool'
 import { ChatTab } from './components/ChatTab'
+import { ApiKeysTab } from './components/ApiKeysTab'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { UsersTab } from './components/UsersTab'
 import { fetchMe, loginWithUsername, type Me } from './apiUsers'
@@ -420,13 +421,13 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
   // answer must never hand a regular user the admin controls. In the open
   // no-password mode the server itself reports is_admin: true.
   const isAdmin = me?.is_admin === true
-  const tabs = (isAdmin ? (['pay', 'chat', 'users'] as const) : (['pay', 'chat'] as const)) as readonly TabId[]
+  const tabs = (isAdmin ? (['pay', 'chat', 'api', 'users'] as const) : (['pay', 'chat'] as const)) as readonly TabId[]
   const canAdd = isAdmin
   const [showAddModal, setShowAddModal] = useState(false)
   const [tab, setTab] = useState<TabId>(() => {
     try {
       const saved = localStorage.getItem('nmp_active_tab')
-      return saved === 'chat' ? 'chat' : 'pay'
+      return saved === 'chat' || saved === 'api' || saved === 'users' ? saved : 'pay'
     } catch {
       return 'pay'
     }
@@ -518,7 +519,7 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
 
   // A regular user must never stay on the admin-only tab.
   useEffect(() => {
-    if (!isAdmin && tab === 'users') setTab('pay')
+    if (!isAdmin && (tab === 'users' || tab === 'api')) setTab('pay')
   }, [isAdmin, tab])
 
   return (
@@ -569,6 +570,13 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
             <ChatTab accounts={discovered} active={tab === 'chat'} onPoolChange={setDiscovered} />
           </ErrorBoundary>
         </div>
+        {isAdmin && (
+          <div hidden={tab !== 'api'}>
+            <ErrorBoundary>
+              <ApiKeysTab accounts={discovered} active={tab === 'api'} />
+            </ErrorBoundary>
+          </div>
+        )}
         {isAdmin && (
           <div hidden={tab !== 'users'}>
             <ErrorBoundary>

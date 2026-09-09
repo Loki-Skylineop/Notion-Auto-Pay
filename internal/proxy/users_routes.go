@@ -30,6 +30,7 @@ var adminOnlyExact = map[string]bool{
 	"/admin/accounts/add":      true,
 	"/admin/accounts/delete":   true,
 	"/admin/settings":          true,
+	"/admin/api/config":        true,
 	"/admin/stats":             true,
 	"/admin/workspaces/create": true,
 	"/admin/workspaces/delete": true,
