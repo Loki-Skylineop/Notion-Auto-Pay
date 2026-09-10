@@ -115,8 +115,20 @@ func apiAvailableModels(pool *AccountPool) []string {
 	}
 	if pool != nil {
 		for _, entry := range pool.AllModels() {
-			if id := strings.TrimSpace(publicModelID(entry)); id != "" {
-				seen[id] = true
+			id := strings.TrimSpace(publicModelID(entry))
+			if id == "" {
+				continue
+			}
+			seen[id] = true
+			// Only a live pool refresh pushes fetched models into the model
+			// map; accounts restored from disk never did. Register them here
+			// so every name this picker offers can be resolved into a Notion
+			// model id instead of being forwarded raw, which makes Notion fall
+			// back to its automatic model choice.
+			if internalID := strings.TrimSpace(entry.ID); internalID != "" {
+				if _, known := GetModelID(id); !known {
+					SetModelID(id, internalID)
+				}
 			}
 		}
 	}

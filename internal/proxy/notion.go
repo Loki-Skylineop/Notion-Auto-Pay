@@ -158,6 +158,10 @@ func ResolveModel(model string) string {
 			return id
 		}
 	}
+	// Nothing matched. Notion only accepts its own internal model ids, so an
+	// unmapped name is silently ignored by the server, which then falls back
+	// to picking a model automatically.
+	log.Printf("[model] WARNING: %q is not a known Notion model id (no model map entry) — Notion will choose the model automatically", model)
 	return model
 }
 
@@ -1400,7 +1404,7 @@ func buildConfigValue(notionModel string, disableBuiltinTools bool, enableWebSea
 
 	configValue := map[string]interface{}{
 		"type":                       "workflow",
-		"modelFromUser":              !isSubsequentTurn,
+		"modelFromUser":              true,
 		"enableAgentAutomations":     agentEnabled,
 		"enableAgentIntegrations":    agentEnabled,
 		"enableCustomAgents":         !effectiveDisable,
@@ -1424,8 +1428,16 @@ func buildConfigValue(notionModel string, disableBuiltinTools bool, enableWebSea
 		configValue["enableCsvAttachmentSupport"] = true
 	}
 
-	if isSubsequentTurn {
+	// Notion reads the model from the transcript config block, exactly like
+	// its own web client does (see buildChatConfig in chat.go).
+	// debugOverrides.model is a debug-only field the production server ignores,
+	// so a config without "model" made every first turn fall back to Notion's
+	// automatic pick ("Auto") no matter what was selected in the API keys tab.
+	if strings.TrimSpace(notionModel) != "" {
 		configValue["model"] = notionModel
+	}
+
+	if isSubsequentTurn {
 		configValue["isThreadStartedByAdmin"] = true
 	}
 
