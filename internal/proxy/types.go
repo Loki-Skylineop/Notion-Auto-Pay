@@ -105,6 +105,14 @@ type quotaV2Response struct {
 type ModelEntry struct {
 	Name string `json:"name"`
 	ID   string `json:"id"`
+	// Efforts is the reasoning-effort ladder Notion reports for this model
+	// (getAvailableModels -> modelConfiguration.supportedReasoningEfforts).
+	// The ladders genuinely differ per model, so "maximum effort" has to be
+	// resolved against this list instead of being hardcoded globally.
+	Efforts []string `json:"supported_efforts,omitempty"`
+	// DefaultEffort is Notion's own default for this model, used as a fallback
+	// when the supported list is missing.
+	DefaultEffort string `json:"default_effort,omitempty"`
 }
 
 // ========== Shared Internal Types ==========

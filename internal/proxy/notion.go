@@ -90,6 +90,86 @@ func SnapshotModelMap() map[string]string {
 	return copy
 }
 
+// reasoningEffortRank orders Notion's reasoning-effort ladder from cheapest to
+// strongest. Values outside the ladder are ignored so an unexpected string can
+// never win a comparison.
+var reasoningEffortRank = map[string]int{
+	"none":    0,
+	"minimal": 1,
+	"low":     2,
+	"medium":  3,
+	"high":    4,
+	"xhigh":   5,
+	"max":     6,
+}
+
+var (
+	modelEffortsMu sync.RWMutex
+	// modelEfforts maps a Notion internal model id to the strongest reasoning
+	// effort that model actually supports. The sets differ per model (GPT-5.6
+	// offers none..max, Opus 5 low..max, Opus 4.7 only high, Haiku 4.5 none at
+	// all), so requests must ask for a value from the model's own list.
+	modelEfforts = map[string]string{}
+)
+
+// SetModelEfforts records the strongest supported reasoning effort for a Notion
+// model id (thread-safe).
+func SetModelEfforts(modelID string, efforts []string, defaultEffort string) {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return
+	}
+	best, bestRank := "", -1
+	for _, effort := range efforts {
+		effort = strings.ToLower(strings.TrimSpace(effort))
+		rank, known := reasoningEffortRank[effort]
+		if !known {
+			continue
+		}
+		if rank > bestRank {
+			best, bestRank = effort, rank
+		}
+	}
+	if best == "" {
+		fallback := strings.ToLower(strings.TrimSpace(defaultEffort))
+		if _, known := reasoningEffortRank[fallback]; known {
+			best = fallback
+		}
+	}
+	modelEffortsMu.Lock()
+	defer modelEffortsMu.Unlock()
+	if best == "" {
+		delete(modelEfforts, modelID)
+		return
+	}
+	modelEfforts[modelID] = best
+}
+
+// RegisterModelEfforts remembers the effort ladders of a fetched model list.
+// Models that report no ladder at all keep whatever is already known.
+func RegisterModelEfforts(models []ModelEntry) {
+	for _, model := range models {
+		if len(model.Efforts) == 0 && strings.TrimSpace(model.DefaultEffort) == "" {
+			continue
+		}
+		SetModelEfforts(model.ID, model.Efforts, model.DefaultEffort)
+	}
+}
+
+// MaxReasoningEffortFor returns the strongest reasoning effort the given Notion
+// model id supports, or "" when the model's capabilities are still unknown (in
+// that case Notion applies the model's own default instead of erroring on an
+// unsupported value).
+func MaxReasoningEffortFor(modelID string) string {
+	modelID = strings.TrimSpace(modelID)
+	if modelID == "" {
+		return ""
+	}
+	modelEffortsMu.RLock()
+	defer modelEffortsMu.RUnlock()
+	return modelEfforts[modelID]
+}
+
 // ApplyConfig applies loaded configuration to package-level variables.
 func ApplyConfig(cfg *Config) {
 	NotionAPIBase = cfg.Proxy.NotionAPIBase
@@ -1435,6 +1515,14 @@ func buildConfigValue(notionModel string, disableBuiltinTools bool, enableWebSea
 	// automatic pick ("Auto") no matter what was selected in the API keys tab.
 	if strings.TrimSpace(notionModel) != "" {
 		configValue["model"] = notionModel
+		// Always think as hard as the chosen model allows. Notion reads
+		// reasoningEffort from the same config block as the model and falls back
+		// to the model's (weaker) default when it is missing. The ladder differs
+		// per model, so the value comes from Notion's own capability list;
+		// unknown models keep the default instead of risking a rejected value.
+		if effort := MaxReasoningEffortFor(notionModel); effort != "" {
+			configValue["reasoningEffort"] = effort
+		}
 	}
 
 	if isSubsequentTurn {
@@ -1663,6 +1751,12 @@ func FetchModels(acc *Account) ([]ModelEntry, error) {
 			ModelMessage string `json:"modelMessage"`
 			ModelFamily  string `json:"modelFamily"`
 			IsDisabled   bool   `json:"isDisabled"`
+			// Reasoning-effort capabilities are nested per model; they are the
+			// only reliable source for the strongest effort a model accepts.
+			ModelConfiguration struct {
+				SupportedReasoningEfforts []string `json:"supportedReasoningEfforts"`
+				DefaultReasoningEffort    string   `json:"defaultReasoningEffort"`
+			} `json:"modelConfiguration"`
 		} `json:"models"`
 	}
 	if err := json.Unmarshal(respBody, &result); err != nil {
@@ -1672,9 +1766,17 @@ func FetchModels(acc *Account) ([]ModelEntry, error) {
 	var models []ModelEntry
 	for _, m := range result.Models {
 		if !m.IsDisabled {
-			models = append(models, ModelEntry{ID: m.Model, Name: m.ModelMessage})
+			models = append(models, ModelEntry{
+				ID:            m.Model,
+				Name:          m.ModelMessage,
+				Efforts:       m.ModelConfiguration.SupportedReasoningEfforts,
+				DefaultEffort: m.ModelConfiguration.DefaultReasoningEffort,
+			})
 		}
 	}
+	// Remember every ladder so requests can always ask for the strongest effort
+	// the chosen model supports.
+	RegisterModelEfforts(models)
 	return models, nil
 }
 

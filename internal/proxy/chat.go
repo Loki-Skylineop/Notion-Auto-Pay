@@ -776,10 +776,17 @@ func buildChatConfig(isCustom bool, workflowID string, model string, effort stri
 		cfg["model"] = model
 	}
 	// Notion reads reasoningEffort from the same config block as the model.
-	// Leaving it out makes the server fall back to that model's default, so we
-	// only send a value the UI already validated against the model.
-	if !isCustom && strings.TrimSpace(effort) != "" {
-		cfg["reasoningEffort"] = strings.TrimSpace(effort)
+	// Leaving it out makes the server fall back to that model's (weaker)
+	// default, so when the UI sends nothing we fill in the strongest effort the
+	// chosen model supports. An explicit pick from the composer still wins.
+	if !isCustom {
+		chosen := strings.TrimSpace(effort)
+		if chosen == "" {
+			chosen = MaxReasoningEffortFor(model)
+		}
+		if chosen != "" {
+			cfg["reasoningEffort"] = chosen
+		}
 	}
 	if isCustom && workflowID != "" {
 		cfg["workflowId"] = workflowID

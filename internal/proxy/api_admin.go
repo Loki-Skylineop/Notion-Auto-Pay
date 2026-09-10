@@ -130,6 +130,12 @@ func apiAvailableModels(pool *AccountPool) []string {
 					SetModelID(id, internalID)
 				}
 			}
+			// Accounts restored from disk also carry the model's reasoning-effort
+			// ladder, so register it here too: requests then run at maximum effort
+			// even before the first live pool refresh.
+			if len(entry.Efforts) > 0 || strings.TrimSpace(entry.DefaultEffort) != "" {
+				SetModelEfforts(entry.ID, entry.Efforts, entry.DefaultEffort)
+			}
 		}
 	}
 	models := make([]string, 0, len(seen))
