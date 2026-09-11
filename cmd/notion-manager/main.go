@@ -77,6 +77,22 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	mux.HandleFunc("/v1/airi/chat/completions", proxy.HandleAIRIChatCompletions(pool))
 	mux.HandleFunc("/v1/airi/models", proxy.HandlePublicModels(pool))
 
+	// AIRI MVP chat API: a machine-facing wrapper over the same Notion chat
+	// plumbing the dashboard drives, so an MCP client can pick a workspace,
+	// open a chat, post a task and poll for the answer with just the API key.
+	mux.HandleFunc("GET /v1/airi/workspaces", proxy.HandleAIRIWorkspaces(pool))
+	mux.HandleFunc("GET /v1/airi/workspaces/{workspace_id}/agents", proxy.HandleAIRIWorkspaceAgents(pool))
+	mux.HandleFunc("GET /v1/airi/workspaces/{workspace_id}/models", proxy.HandleAIRIWorkspaceModels(pool))
+	mux.HandleFunc("GET /v1/airi/workspaces/{workspace_id}/chats", proxy.HandleAIRIListChats(pool))
+	mux.HandleFunc("POST /v1/airi/workspaces/{workspace_id}/chats", proxy.HandleAIRICreateChat(pool))
+	mux.HandleFunc("GET /v1/airi/chats/{chat_id}", proxy.HandleAIRIChatStatus(pool))
+	mux.HandleFunc("DELETE /v1/airi/chats/{chat_id}", proxy.HandleAIRIDeleteChat(pool))
+	mux.HandleFunc("GET /v1/airi/chats/{chat_id}/messages", proxy.HandleAIRIChatMessages(pool))
+	mux.HandleFunc("POST /v1/airi/chats/{chat_id}/messages", proxy.HandleAIRISendMessage(pool))
+	mux.HandleFunc("GET /v1/airi/chats/{chat_id}/result", proxy.HandleAIRIChatResult(pool))
+	mux.HandleFunc("POST /v1/airi/chats/{chat_id}/stop", proxy.HandleAIRIStopChat(pool))
+	mux.HandleFunc("GET /v1/airi/tasks/{task_id}", proxy.HandleAIRITaskStatus(pool))
+
 	// Anthropic-compatible API endpoints.
 	mux.HandleFunc("/v1/messages", proxy.HandleAnthropicMessages(pool))
 	mux.HandleFunc("/v1/models", proxy.HandlePublicModels(pool))
