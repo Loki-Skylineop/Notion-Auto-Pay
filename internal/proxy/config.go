@@ -60,6 +60,11 @@ type ProxyConfig struct {
 	DisableNotionPrompt   bool   `yaml:"disable_notion_prompt"`
 	EnableWebSearch       *bool  `yaml:"enable_web_search"`
 	EnableWorkspaceSearch *bool  `yaml:"enable_workspace_search"`
+	// EnableMcpTools controls whether the operator's own connections - MCP
+	// servers and the computer module - are exposed to the model on the API
+	// path. They are not part of Notion's built-in tooling, so
+	// disable_notion_prompt must not hide them. nil = enabled.
+	EnableMcpTools *bool `yaml:"enable_mcp_tools"`
 	// AskModeDefault toggles Notion's ASK mode (frontend "Answers only,
 	// won't make edits" — config.useReadOnlyMode=true on the workflow
 	// thread). When true, all chat requests run in read-only mode by
@@ -139,6 +144,7 @@ func DefaultConfig() *Config {
 			DefaultModel:          "opus-4.6",
 			EnableWebSearch:       boolPtr(true),
 			EnableWorkspaceSearch: boolPtr(false),
+			EnableMcpTools:        boolPtr(true),
 			AskModeDefault:        boolPtr(false),
 		},
 		Timeouts: TimeoutConfig{
@@ -593,6 +599,17 @@ func (c *Config) WorkspaceSearchEnabled() bool {
 		return false
 	}
 	return *c.Proxy.EnableWorkspaceSearch
+}
+
+// McpToolsEnabled reports whether user-connected MCP servers and the computer
+// module are exposed to the model (default: true). These are the operator's own
+// connections rather than Notion's built-in tooling, so they stay available even
+// when disable_notion_prompt strips Notion's own agent behaviour.
+func (c *Config) McpToolsEnabled() bool {
+	if c == nil || c.Proxy.EnableMcpTools == nil {
+		return true
+	}
+	return *c.Proxy.EnableMcpTools
 }
 
 // AskModeDefault returns the effective default ASK-mode setting (default: false).

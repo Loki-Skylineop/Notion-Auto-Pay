@@ -167,8 +167,10 @@ func fetchCustomAgents(tokenV2, userID, spaceID string) ([]chatAgent, error) {
 // ---- Models ----
 
 // HandleChatModels proxies getAvailableModels for the built-in assistant model
-// picker. It returns the codename, the human label and the display group so the
-// dashboard can show e.g. "Opus 4.8" and send the codename ambrosia-tart-high.
+// picker. When Notion hides the regular list because workspace model selection
+// is restricted, it falls back to the workspace settings catalogue. Selecting a
+// fallback model writes personal_agent_model_policy so that model is the only
+// enabled one.
 func HandleChatModels(auth *DashboardAuth) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -176,9 +178,10 @@ func HandleChatModels(auth *DashboardAuth) http.HandlerFunc {
 			return
 		}
 		var body struct {
-			TokenV2 string `json:"token_v2"`
-			UserID  string `json:"user_id"`
-			SpaceID string `json:"space_id"`
+			TokenV2       string `json:"token_v2"`
+			UserID        string `json:"user_id"`
+			SpaceID       string `json:"space_id"`
+			SelectedModel string `json:"selected_model"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
@@ -186,55 +189,151 @@ func HandleChatModels(auth *DashboardAuth) http.HandlerFunc {
 		}
 		body.TokenV2 = strings.TrimSpace(body.TokenV2)
 		body.SpaceID = strings.TrimSpace(body.SpaceID)
+		body.SelectedModel = strings.TrimSpace(body.SelectedModel)
 		if body.TokenV2 == "" || body.SpaceID == "" {
 			http.Error(w, `{"error":"token_v2 and space_id are required"}`, http.StatusBadRequest)
 			return
 		}
-		reqBody, _ := json.Marshal(map[string]string{"spaceId": body.SpaceID})
-		resp, err := notionChatRequest(body.TokenV2, body.UserID, body.SpaceID, "getAvailableModels", reqBody, "application/json", chatAPITimeout())
+
+		type notionModel struct {
+			Model              string `json:"model"`
+			ModelMessage       string `json:"modelMessage"`
+			ModelFamily        string `json:"modelFamily"`
+			ModelProvider      string `json:"modelProvider"`
+			DisplayGroup       string `json:"displayGroup"`
+			IsDisabled         bool   `json:"isDisabled"`
+			ModelConfiguration struct {
+				SupportedReasoningEfforts []string `json:"supportedReasoningEfforts"`
+				DefaultReasoningEffort    string   `json:"defaultReasoningEffort"`
+			} `json:"modelConfiguration"`
+		}
+		fetchModels := func(surface string) ([]notionModel, error) {
+			payload := map[string]string{"spaceId": body.SpaceID}
+			if surface != "" {
+				payload["surface"] = surface
+			}
+			reqBody, _ := json.Marshal(payload)
+			resp, err := notionChatRequest(body.TokenV2, body.UserID, body.SpaceID, "getAvailableModels", reqBody, "application/json", chatAPITimeout())
+			if err != nil {
+				return nil, err
+			}
+			defer resp.Body.Close()
+			data, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				return nil, fmt.Errorf("notion %d", resp.StatusCode)
+			}
+			var parsed struct {
+				Models []notionModel `json:"models"`
+			}
+			if err := json.Unmarshal(data, &parsed); err != nil {
+				return nil, fmt.Errorf("decode models: %w", err)
+			}
+			return parsed.Models, nil
+		}
+
+		if body.SelectedModel != "" {
+			models, err := fetchModels("workspace_model_settings")
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			selectedProvider := ""
+			found := false
+			for _, m := range models {
+				if m.Model == body.SelectedModel && !m.IsDisabled {
+					selectedProvider = m.ModelProvider
+					if selectedProvider == "" {
+						selectedProvider = m.ModelFamily
+					}
+					found = true
+					break
+				}
+			}
+			if !found {
+				http.Error(w, `{"error":"selected model is unavailable"}`, http.StatusBadRequest)
+				return
+			}
+
+			disabledModels := make([]string, 0, len(models)-1)
+			disabledProviders := make([]string, 0)
+			seenProviders := map[string]bool{}
+			for _, m := range models {
+				if m.Model != "" && m.Model != body.SelectedModel {
+					disabledModels = append(disabledModels, m.Model)
+				}
+				provider := m.ModelProvider
+				if provider == "" {
+					provider = m.ModelFamily
+				}
+				if provider != "" && provider != selectedProvider && !seenProviders[provider] {
+					seenProviders[provider] = true
+					disabledProviders = append(disabledProviders, provider)
+				}
+			}
+			policyBody, _ := json.Marshal(map[string]interface{}{
+				"spaceId": body.SpaceID,
+				"settingsPatch": map[string]interface{}{
+					"personal_agent_model_policy": map[string]interface{}{
+						"disabledModels":    disabledModels,
+						"disabledProviders": disabledProviders,
+					},
+				},
+				"unsetSettingKeys": []string{},
+			})
+			resp, err := notionChatRequest(body.TokenV2, body.UserID, body.SpaceID, "updateSpaceSettings", policyBody, "application/json", chatAPITimeout())
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			defer resp.Body.Close()
+			io.Copy(io.Discard, resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				w.WriteHeader(http.StatusBadGateway)
+				json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("notion %d", resp.StatusCode)})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "selected_model": body.SelectedModel})
+			return
+		}
+
+		models, err := fetchModels("")
 		if err != nil {
 			w.WriteHeader(http.StatusBadGateway)
 			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
 		}
-		defer resp.Body.Close()
-		data, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode != 200 {
-			w.WriteHeader(http.StatusBadGateway)
-			json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("notion %d", resp.StatusCode)})
-			return
+		hasEnabled := false
+		for _, m := range models {
+			if m.Model != "" && !m.IsDisabled {
+				hasEnabled = true
+				break
+			}
 		}
-		var parsed struct {
-			Models []struct {
-				Model        string `json:"model"`
-				ModelMessage string `json:"modelMessage"`
-				ModelFamily  string `json:"modelFamily"`
-				DisplayGroup string `json:"displayGroup"`
-				IsDisabled   bool   `json:"isDisabled"`
-				// Notion nests each model's reasoning-effort capabilities under
-				// modelConfiguration, and the sets genuinely differ per model:
-				// GPT-5.6 offers none/low/medium/high/xhigh/max, Opus 5 offers
-				// low/medium/high/max, Opus 4.7 only high, Haiku 4.5 none at all.
-				ModelConfiguration struct {
-					SupportedReasoningEfforts []string `json:"supportedReasoningEfforts"`
-					DefaultReasoningEffort    string   `json:"defaultReasoningEffort"`
-				} `json:"modelConfiguration"`
-			} `json:"models"`
+		policySelection := false
+		if !hasEnabled {
+			models, err = fetchModels("workspace_model_settings")
+			if err != nil {
+				w.WriteHeader(http.StatusBadGateway)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			policySelection = len(models) > 0
 		}
-		json.Unmarshal(data, &parsed)
+
 		type outModel struct {
-			ID       string   `json:"id"`
-			Label    string   `json:"label"`
-			Family   string   `json:"family"`
-			Group    string   `json:"group"`
-			Disabled bool     `json:"disabled"`
-			Efforts  []string `json:"efforts"`
-			// DefaultEffort is Notion's own default for this model; the picker
-			// prefers the strongest supported effort and uses this as a fallback.
-			DefaultEffort string `json:"default_effort"`
+			ID              string   `json:"id"`
+			Label           string   `json:"label"`
+			Family          string   `json:"family"`
+			Group           string   `json:"group"`
+			Disabled        bool     `json:"disabled"`
+			Efforts         []string `json:"efforts"`
+			DefaultEffort   string   `json:"default_effort"`
+			PolicySelection bool     `json:"policy_selection,omitempty"`
 		}
-		out := make([]outModel, 0, len(parsed.Models))
-		for _, m := range parsed.Models {
+		out := make([]outModel, 0, len(models))
+		for _, m := range models {
 			if m.Model == "" {
 				continue
 			}
@@ -247,13 +346,14 @@ func HandleChatModels(auth *DashboardAuth) http.HandlerFunc {
 				efforts = []string{}
 			}
 			out = append(out, outModel{
-				ID:            m.Model,
-				Label:         label,
-				Family:        m.ModelFamily,
-				Group:         m.DisplayGroup,
-				Disabled:      m.IsDisabled,
-				Efforts:       efforts,
-				DefaultEffort: m.ModelConfiguration.DefaultReasoningEffort,
+				ID:              m.Model,
+				Label:           label,
+				Family:          m.ModelFamily,
+				Group:           m.DisplayGroup,
+				Disabled:        m.IsDisabled,
+				Efforts:         efforts,
+				DefaultEffort:   m.ModelConfiguration.DefaultReasoningEffort,
+				PolicySelection: policySelection,
 			})
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"models": out})

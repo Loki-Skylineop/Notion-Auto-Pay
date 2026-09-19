@@ -1,10 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import type { WorkspaceInfo as BaseWorkspaceInfo, McpServerInfo } from '../api'
-import { connectMcp, createWorkspaces, deleteWorkspaces, disconnectMcp, discoverWorkspaces, setOverage } from '../api'
-import { SubscribeModal, PLANS } from './SubscribeModal'
+import { connectMcp, createWorkspaces, deleteWorkspaces, disconnectMcp, discoverWorkspaces, setOverage, startTrial } from '../api'
+import { SubscribeModal, PLANS, TRIAL_DAYS } from './SubscribeModal'
 import { AutoPaySettings } from './AutoPaySettings'
 import {
-  fetchAutoPayConfig, updateAutoPayConfig, runAutoPayNow,
+  fetchAutoPayConfig, updateAutoPayConfig, runAutoPayNow, paySpaceWithSavedCard,
   clampIntervalSeconds, type ServerAutoPayConfig, type AutoPayPatch,
 } from '../autopay'
 
@@ -520,6 +520,405 @@ function McpConnectModal({
   )
 }
 
+// ---------------------------------------------------------------------------
+// Массовые действия по пулу.
+//
+// Две операции, которые раньше делались по одному пространству:
+//   'mcp' — подключить один и тот же MCP-сервер ко всем пространствам, где его
+//           ещё нет (кнопка «Все без MCP» выбирает ровно их);
+//   'pay' — оплатить сохранённой картой или включить триал сразу на нескольких
+//           пространствах (кнопка «Все бесплатные» выбирает те, где подписки нет).
+// Запросы идут с ограничением параллельности, прогресс виден по каждой строке,
+// а ошибка одного пространства не останавливает остальные.
+// ---------------------------------------------------------------------------
+
+type BulkMode = 'mcp' | 'pay'
+type BulkState = 'pending' | 'running' | 'ok' | 'error'
+
+interface BulkRow {
+  key: string
+  token: string
+  userId: string
+  spaceId: string
+  spaceViewId: string
+  name: string
+  account: string
+  mcpOn: boolean
+  subscribed: boolean
+}
+
+// MCP подключаем по 4 в параллель, оплату — по 2: за оплатой стоят реальные
+// списания, и дробить их на мелкие пачки безопаснее.
+const BULK_MCP_CONCURRENCY = 4
+const BULK_PAY_CONCURRENCY = 2
+
+// Плоский список «аккаунт + пространство» с уже посчитанными флагами, по
+// которым работает выбор: mcpOn повторяет логику McpBadge, subscribed —
+// ту же проверку тарифа, что и карточка пространства.
+function buildBulkRows(pool: DiscoveredAccount[]): BulkRow[] {
+  const rows: BulkRow[] = []
+  for (const acc of pool) {
+    for (const s of acc.spaces || []) {
+      const tier = (s.plan_type || '').toLowerCase()
+      rows.push({
+        key: acc.token_v2 + '|' + s.space_id,
+        token: acc.token_v2,
+        userId: acc.user_id || '',
+        spaceId: s.space_id,
+        spaceViewId: s.space_view_id,
+        name: s.name || 'Workspace',
+        account: acc.user_email || acc.user_name || 'token',
+        mcpOn: !!s.mcp_connected || (s.mcp_servers || []).some((m) => (m.status || '').toLowerCase() === 'connected'),
+        subscribed: s.is_subscribed || (tier !== '' && tier !== 'free' && tier !== 'team' && tier !== 'personal'),
+      })
+    }
+  }
+  return rows
+}
+
+// Пул воркеров с общим курсором: одна медленная операция не держит очередь.
+async function runBulk<T>(items: T[], limit: number, job: (item: T) => Promise<void>): Promise<void> {
+  let cursor = 0
+  const size = Math.max(1, Math.min(limit, items.length))
+  const workers: Promise<void>[] = []
+  for (let w = 0; w < size; w++) {
+    workers.push((async () => {
+      for (;;) {
+        const i = cursor
+        cursor += 1
+        if (i >= items.length) return
+        await job(items[i])
+      }
+    })())
+  }
+  await Promise.all(workers)
+}
+
+function BulkActionModal({
+  pool,
+  onClose,
+  onFinished,
+}: {
+  pool: DiscoveredAccount[]
+  onClose: () => void
+  onFinished: () => void
+}) {
+  const rows = buildBulkRows(pool)
+
+  // Источники MCP: сохранённые в браузере пресеты + серверы, которые уже видны
+  // в пуле. Токен Notion наружу не отдаёт, поэтому пресет с сохранённым
+  // заголовком подключается в один клик, а чужой сервер попросит токен.
+  const sources: McpPreset[] = loadMcpPresets().map((p) => ({ ...p }))
+  for (const s of collectMcpServers(pool)) {
+    const u = (s.url || '').trim()
+    if (!u || sources.some((o) => o.url === u)) continue
+    sources.push({ url: u, name: s.name, icon: s.icon })
+  }
+  const first = sources[0]
+
+  const [mode, setMode] = useState<BulkMode>('mcp')
+  const [sel, setSel] = useState<Record<string, boolean>>({})
+  const [status, setStatus] = useState<Record<string, { state: BulkState; msg?: string }>>({})
+  const [running, setRunning] = useState(false)
+  const [err, setErr] = useState('')
+
+  const [url, setUrl] = useState(first?.url || '')
+  const [srvName, setSrvName] = useState(first?.name || '')
+  const [icon, setIcon] = useState(first?.icon || '')
+  const [headerName, setHeaderName] = useState(first?.headerName || 'Authorization')
+  const [headerValue, setHeaderValue] = useState(first?.headerValue || '')
+
+  const [payMethod, setPayMethod] = useState<'saved' | 'trial'>('saved')
+  const [plan, setPlan] = useState(PLANS[0].id)
+  const [country, setCountry] = useState('DE')
+  const [trialDays, setTrialDays] = useState(14)
+  const [savedLast4, setSavedLast4] = useState('')
+
+  useEffect(() => {
+    let dead = false
+    fetchAutoPayConfig()
+      .then((c) => { if (!dead && c.has_card) setSavedLast4(c.card_last4 || '••••') })
+      .catch(() => { /* карта просто не показывается */ })
+    return () => { dead = true }
+  }, [])
+
+  // Пока идёт пачка, Escape не закрывает окно: запросы уже в полёте.
+  useEffect(() => {
+    const h = (e: KeyboardEvent) => { if (e.key === 'Escape' && !running) onClose() }
+    window.addEventListener('keydown', h)
+    return () => window.removeEventListener('keydown', h)
+  }, [onClose, running])
+
+  const applyPreset = (p: McpPreset) => {
+    setUrl(p.url)
+    setSrvName((p.name || '').trim())
+    setIcon(p.icon || '')
+    setHeaderName(p.headerName || 'Authorization')
+    setHeaderValue(p.headerValue || '')
+    setErr('')
+  }
+
+  const pickWhere = (fn: (r: BulkRow) => boolean) => {
+    const next: Record<string, boolean> = {}
+    for (const r of rows) if (fn(r)) next[r.key] = true
+    setSel(next)
+    setStatus({})
+    setErr('')
+  }
+
+  const toggleRow = (key: string) => {
+    if (running) return
+    setSel((s) => ({ ...s, [key]: !s[key] }))
+  }
+
+  const total = rows.length
+  const noMcpCount = rows.filter((r) => !r.mcpOn).length
+  const freeCount = rows.filter((r) => !r.subscribed).length
+  const targets = rows.filter((r) => sel[r.key])
+  const selCount = targets.length
+
+  const stats = Object.keys(status).map((k) => status[k])
+  const okN = stats.filter((s) => s.state === 'ok').length
+  const errN = stats.filter((s) => s.state === 'error').length
+  const doneN = okN + errN
+  const pct = stats.length > 0 ? Math.round((doneN / stats.length) * 100) : 0
+
+  const start = async () => {
+    if (!selCount) { setErr('Не выбрано ни одного пространства'); return }
+    if (mode === 'mcp' && !url.trim()) { setErr('Укажите адрес MCP-сервера'); return }
+    if (mode === 'pay' && payMethod === 'saved') {
+      if (!savedLast4) {
+        setErr('На сервере нет сохранённой карты — задайте её в настройках автооплаты')
+        return
+      }
+      const pl = PLANS.find((p) => p.id === plan)
+      const label = pl ? `${pl.name} ${pl.price}${pl.interval}` : plan
+      if (!window.confirm(`Оплатить план ${label} для ${selCount} пространств сохранённой картой?\n\nСписываются реальные деньги, отменить нельзя.`)) return
+    }
+    setErr('')
+    setRunning(true)
+    const fresh: Record<string, { state: BulkState; msg?: string }> = {}
+    for (const t of targets) fresh[t.key] = { state: 'pending' }
+    setStatus(fresh)
+    const mark = (key: string, state: BulkState, msg?: string) => {
+      setStatus((s) => ({ ...s, [key]: { state, msg } }))
+    }
+    let okCount = 0
+    const limit = mode === 'mcp' ? BULK_MCP_CONCURRENCY : BULK_PAY_CONCURRENCY
+    await runBulk(targets, limit, async (r) => {
+      mark(r.key, 'running')
+      try {
+        if (mode === 'mcp') {
+          const res = await connectMcp({
+            tokenV2: r.token,
+            userId: r.userId,
+            spaceId: r.spaceId,
+            spaceViewId: r.spaceViewId,
+            serverUrl: url.trim(),
+            headerName: headerName.trim(),
+            headerValue: headerValue.trim(),
+            name: srvName.trim(),
+            icon: icon.trim(),
+          })
+          if (!res.ok || res.error) { mark(r.key, 'error', res.error || 'не удалось подключить'); return }
+          okCount += 1
+          mark(r.key, 'ok', 'инструментов: ' + (res.tools_count || 0))
+          return
+        }
+        if (payMethod === 'trial') {
+          const res = await startTrial({ token_v2: r.token, space_id: r.spaceId, plan, days: trialDays })
+          if (res.error) { mark(r.key, 'error', res.error); return }
+          okCount += 1
+          mark(r.key, 'ok', res.subscription_status || 'trialing')
+          return
+        }
+        const res = await paySpaceWithSavedCard({ token_v2: r.token, space_id: r.spaceId, plan, country: country || 'DE' })
+        if (res.error) { mark(r.key, 'error', res.error); return }
+        okCount += 1
+        mark(r.key, 'ok', res.plan || plan)
+      } catch (e) {
+        mark(r.key, 'error', e instanceof Error ? e.message : 'ошибка сети')
+      }
+    })
+    // Успешный сервер запоминаем один раз — дальше он подставится сам.
+    if (mode === 'mcp' && okCount > 0) {
+      saveMcpPreset({
+        url: url.trim(),
+        name: srvName.trim(),
+        icon: icon.trim(),
+        headerName: headerName.trim(),
+        headerValue: headerValue.trim(),
+      })
+    }
+    setRunning(false)
+    if (okCount > 0) onFinished()
+  }
+
+  const tabCls = (on: boolean) =>
+    `px-3 py-1.5 rounded-lg text-[12px] font-medium border transition-colors cursor-pointer disabled:opacity-40 ${on ? 'bg-white/[0.08] text-text-primary border-white/[0.18]' : 'bg-transparent text-text-muted border-white/[0.07] hover:text-text-secondary'}`
+
+  const quickCls = 'px-2 py-1 rounded border border-white/[0.09] text-[10px] text-text-secondary hover:text-text-primary hover:border-white/[0.18] transition-colors bg-transparent cursor-pointer disabled:opacity-40'
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" onClick={() => { if (!running) onClose() }}>
+      <div
+        className="w-full max-w-2xl rounded-xl border border-white/[0.10] bg-[#0b0b0b] p-5 max-h-[90vh] overflow-y-auto"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="text-[14px] font-medium text-text-primary mb-1">Массовое действие</div>
+        <div className="text-[11px] text-text-muted mb-4">
+          Всего пространств: {total} · без MCP: {noMcpCount} · без подписки: {freeCount}
+        </div>
+
+        <div className="flex items-center gap-2 mb-4">
+          <button type="button" disabled={running} onClick={() => { setMode('mcp'); setStatus({}); setErr('') }} className={tabCls(mode === 'mcp')}>
+            Подключить MCP
+          </button>
+          <button type="button" disabled={running} onClick={() => { setMode('pay'); setStatus({}); setErr('') }} className={tabCls(mode === 'pay')}>
+            Оплата
+          </button>
+        </div>
+
+        {mode === 'mcp' ? (
+          <div className="mb-4">
+            {sources.length > 0 && (
+              <>
+                <div className="text-[11px] text-text-secondary mb-1.5">Как в других воркспейсах</div>
+                <div className="flex flex-col gap-1.5 mb-3">
+                  {sources.map((p) => (
+                    <button
+                      key={p.url}
+                      type="button"
+                      disabled={running}
+                      onClick={() => applyPreset(p)}
+                      className={`text-left px-2.5 py-1.5 rounded-lg border bg-black transition-colors cursor-pointer ${url === p.url ? 'border-notion-blue/60' : 'border-white/[0.07] hover:border-notion-blue/50'}`}
+                    >
+                      <div className="text-[12px] text-text-primary truncate">{p.icon ? p.icon + ' ' : ''}{(p.name || '').trim() || p.url}</div>
+                      <div className="text-[10px] text-text-muted truncate">{p.url}{p.headerValue ? ' · токен сохранён' : ' · нужен токен'}</div>
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+            <div className="flex flex-col gap-2">
+              <input value={url} disabled={running} onChange={(e) => setUrl(e.target.value)} placeholder="https://example.com/mcp" className={mcpInputCls} />
+              <div className="flex gap-2">
+                <input value={srvName} disabled={running} onChange={(e) => setSrvName(e.target.value)} placeholder="Название (необязательно)" className={mcpInputCls + ' flex-1'} />
+                <input value={icon} disabled={running} onChange={(e) => setIcon(e.target.value)} placeholder="Иконка" className={mcpInputCls + ' w-20 text-center'} />
+              </div>
+              <div className="flex gap-2">
+                <input value={headerName} disabled={running} onChange={(e) => setHeaderName(e.target.value)} placeholder="Authorization" className={mcpInputCls + ' w-40'} />
+                <input value={headerValue} disabled={running} onChange={(e) => setHeaderValue(e.target.value)} placeholder="Токен или «Bearer токен»" className={mcpInputCls + ' flex-1'} />
+              </div>
+              <div className="text-[10px] text-text-muted leading-snug">
+                Один и тот же сервер подключится ко всем выбранным пространствам. Токен вводится один раз и запоминается в браузере.
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div className="mb-4 flex flex-col gap-2">
+            <div className="flex items-center gap-2">
+              <button type="button" disabled={running} onClick={() => setPayMethod('saved')} className={tabCls(payMethod === 'saved')}>
+                Сохранённой картой{savedLast4 ? ` ···· ${savedLast4}` : ''}
+              </button>
+              <button type="button" disabled={running} onClick={() => setPayMethod('trial')} className={tabCls(payMethod === 'trial')}>
+                Триал без карты
+              </button>
+            </div>
+            <div className="flex gap-2">
+              <select value={plan} disabled={running} onChange={(e) => setPlan(e.target.value)} className={mcpInputCls + ' flex-1 cursor-pointer'}>
+                {PLANS.map((pl) => (
+                  <option key={pl.id} value={pl.id}>{pl.name} · {pl.price}{pl.interval}</option>
+                ))}
+              </select>
+              {payMethod === 'trial' ? (
+                <select value={trialDays} disabled={running} onChange={(e) => setTrialDays(parseInt(e.target.value, 10) || 14)} className={mcpInputCls + ' w-28 cursor-pointer'}>
+                  {TRIAL_DAYS.map((d) => (<option key={d} value={d}>{d} дней</option>))}
+                </select>
+              ) : (
+                <input value={country} disabled={running} onChange={(e) => setCountry(e.target.value.toUpperCase().slice(0, 2))} placeholder="DE" className={mcpInputCls + ' w-20 text-center'} />
+              )}
+            </div>
+            {payMethod === 'saved' ? (
+              <div className="text-[10px] text-amber-400/80 leading-snug">
+                Внимание: по каждому выбранному пространству спишутся реальные деньги. Карта берётся из настроек автооплаты на сервере.
+              </div>
+            ) : (
+              <div className="text-[10px] text-text-muted leading-snug">
+                Триал включается без карты. Notion может отказать, если на пространстве он уже был.
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="flex items-center gap-2 mb-2 flex-wrap">
+          <button type="button" disabled={running} onClick={() => pickWhere((r) => !r.mcpOn)} className={quickCls}>Все без MCP ({noMcpCount})</button>
+          <button type="button" disabled={running} onClick={() => pickWhere((r) => !r.subscribed)} className={quickCls}>Все бесплатные ({freeCount})</button>
+          <button type="button" disabled={running} onClick={() => pickWhere(() => true)} className={quickCls}>Все ({total})</button>
+          <button type="button" disabled={running} onClick={() => { setSel({}); setStatus({}) }} className={quickCls}>Снять выбор</button>
+          <span className="ml-auto text-[11px] text-text-secondary">Выбрано: {selCount}</span>
+        </div>
+
+        <div className="max-h-64 overflow-y-auto rounded-lg border border-white/[0.07] divide-y divide-white/[0.05]">
+          {rows.map((r) => {
+            const st = status[r.key]
+            let right = ''
+            let tone = 'text-text-muted'
+            if (st && st.state === 'running') { right = 'идёт…'; tone = 'text-notion-blue' }
+            else if (st && st.state === 'pending') { right = 'в очереди' }
+            else if (st && st.state === 'ok') { right = 'готово' + (st.msg ? ' · ' + st.msg : ''); tone = 'text-ok' }
+            else if (st && st.state === 'error') { right = st.msg || 'ошибка'; tone = 'text-err' }
+            return (
+              <label key={r.key} className={`flex items-center gap-2.5 px-2.5 py-2 ${running ? '' : 'cursor-pointer hover:bg-white/[0.02]'}`}>
+                <input type="checkbox" checked={!!sel[r.key]} disabled={running} onChange={() => toggleRow(r.key)} className="shrink-0" />
+                <span className="min-w-0 flex-1">
+                  <span className="block text-[12px] text-text-primary truncate">{r.name}</span>
+                  <span className="block text-[10px] text-text-muted truncate">{r.account}</span>
+                </span>
+                <span className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded border leading-none ${r.mcpOn ? 'text-emerald-400 border-emerald-900/60 bg-emerald-950/40' : 'text-zinc-500 border-zinc-800 bg-zinc-900'}`}>MCP</span>
+                <span className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded border leading-none ${r.subscribed ? 'text-emerald-400 border-emerald-900/60 bg-emerald-950/40' : 'text-zinc-500 border-zinc-800 bg-zinc-900'}`}>PRO</span>
+                <span className={`shrink-0 text-[10px] max-w-[38%] truncate text-right ${tone}`}>{right}</span>
+              </label>
+            )
+          })}
+        </div>
+
+        {stats.length > 0 && (
+          <div className="mt-3">
+            <div className="flex items-center justify-between text-[11px] text-text-secondary mb-1">
+              <span>{running ? 'Выполняю…' : 'Готово'} {doneN} / {stats.length}</span>
+              <span>успешно: {okN}{errN > 0 ? ` · ошибок: ${errN}` : ''}</span>
+            </div>
+            <div className="h-1 rounded-full bg-white/[0.07] overflow-hidden">
+              <div className="h-full bg-white transition-all duration-300" style={{ width: pct + '%' }} />
+            </div>
+          </div>
+        )}
+
+        {err && <div className="mt-3 text-[11px] text-err break-words">{err}</div>}
+
+        <div className="flex items-center justify-end gap-2 mt-5">
+          <button
+            type="button"
+            disabled={running}
+            onClick={onClose}
+            className="px-3 py-1.5 rounded-lg text-[12px] text-text-secondary hover:text-text-primary transition-colors bg-transparent border-none cursor-pointer disabled:opacity-40"
+          >
+            {doneN > 0 && !running ? 'Закрыть' : 'Отмена'}
+          </button>
+          <button
+            type="button"
+            onClick={start}
+            disabled={running || selCount === 0}
+            className="px-3 py-1.5 rounded-lg text-[12px] font-medium bg-notion-blue text-white disabled:opacity-40 disabled:cursor-not-allowed hover:bg-notion-blue/90 transition-colors border-none cursor-pointer"
+          >
+            {running ? 'Выполняю…' : mode === 'mcp' ? `Подключить MCP (${selCount})` : payMethod === 'trial' ? `Включить триал (${selCount})` : `Оплатить (${selCount})`}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
 // White-on toggle (mockup). Used for the global auto-pay switch in the popover.
 function Toggle({ on, onClick, disabled }: { on: boolean; onClick: () => void; disabled?: boolean }) {
   return (
@@ -765,6 +1164,8 @@ export function WorkspacePool({
   const [refreshing, setRefreshing] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [showCardModal, setShowCardModal] = useState(false)
+  // Массовые действия по всему пулу (подключение MCP / оплата пачкой).
+  const [showBulk, setShowBulk] = useState(false)
   const [lastRun, setLastRun] = useState('')
 
   // Server-side auto-pay config is the single source of truth. The browser
@@ -904,6 +1305,13 @@ export function WorkspacePool({
               className="p-1.5 rounded-md text-text-muted hover:text-text-secondary hover:bg-white/[0.04] transition-colors bg-transparent border-none cursor-pointer disabled:opacity-40"
             >
               <IconRefreshSmall spinning={refreshing} />
+            </button>
+            <button
+              onClick={() => setShowBulk(true)}
+              title="Массовые действия: подключить MCP или оплатить сразу несколько пространств"
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-[11px] font-medium border transition-colors bg-transparent cursor-pointer border-white/[0.09] text-text-secondary hover:text-text-primary hover:border-white/[0.18] ${readOnly ? 'hidden' : ''}`}
+            >
+              <IconBolt />Массовое действие
             </button>
             <div className="relative" ref={popRef}>
               <button
@@ -1174,6 +1582,13 @@ export function WorkspacePool({
         />
       )}
 
+      {showBulk && !readOnly && (
+        <BulkActionModal
+          pool={pool}
+          onClose={() => setShowBulk(false)}
+          onFinished={() => { refresh() }}
+        />
+      )}
       {showCardModal && (
         <AutoPaySettings
           onClose={() => { setShowCardModal(false); reloadCfg() }}

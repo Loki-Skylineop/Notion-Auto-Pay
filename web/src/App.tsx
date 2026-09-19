@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { addAccount, discoverWorkspaces, checkAuth, deleteAccount, login as apiLogin, logout as apiLogout } from './api'
+import { addAccount, discoverWorkspaces, extractTokens, checkAuth, deleteAccount, login as apiLogin, logout as apiLogout } from './api'
 import { WorkspacePool, type DiscoveredAccount } from './components/WorkspacePool'
 import { ChatTab } from './components/ChatTab'
 import { ApiKeysTab } from './components/ApiKeysTab'
@@ -290,112 +290,217 @@ function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
 // --- Add Account Modal ---
 
 function AddAccountModal({ onClose, onDiscovered }: { onClose: () => void; onDiscovered: (acc: DiscoveredAccount) => void }) {
-  const [token, setToken] = useState('')
-  const [loading, setLoading] = useState(false)
+  type BulkStatus = 'pending' | 'running' | 'ok' | 'error'
+  interface BulkItem {
+    token: string
+    status: BulkStatus
+    label?: string
+    error?: string
+  }
+
+  const [text, setText] = useState('')
+  const [running, setRunning] = useState(false)
+  const [done, setDone] = useState(false)
   const [error, setError] = useState('')
-  const [result, setResult] = useState<{ name: string; email: string; space: string; plan_type: string } | null>(null)
+  const [items, setItems] = useState<BulkItem[]>([])
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
   useEffect(() => { inputRef.current?.focus() }, [])
 
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape' && !running) onClose() }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [onClose])
+  }, [onClose, running])
+
+  const tokens = extractTokens(text)
+  const okCount = items.filter(i => i.status === 'ok').length
+  const failCount = items.filter(i => i.status === 'error').length
+  const processed = okCount + failCount
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    const trimmed = token.trim()
-    if (!trimmed) return
-    setLoading(true)
-    setError('')
-    setResult(null)
-    try {
-      const res = await addAccount(trimmed)
-      if (res.error) {
-        setError(res.error)
-        setLoading(false)
-        return
-      }
-      // Авто-обнаружение всех рабочих пространств аккаунта.
-      try {
-        const disc = await discoverWorkspaces(trimmed)
-        if (!disc.error && disc.spaces && disc.spaces.length > 0) {
-          onDiscovered({
-            user_id: disc.user_id,
-            user_name: disc.user_name || res.account?.name,
-            user_email: disc.user_email || res.account?.email,
-            token_v2: trimmed,
-            spaces: disc.spaces,
-          })
-        }
-      } catch { /* discovery best-effort */ }
-      if (res.account) {
-        setResult(res.account)
-      }
-      setTimeout(() => {
-        onClose()
-      }, 1600)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Ошибка запроса')
-    } finally {
-      setLoading(false)
+    if (running) return
+    const list = extractTokens(text)
+    if (list.length === 0) {
+      setError('Не найдено ни одного token_v2. Вставьте токены через запятую, с новой строки или содержимое result.txt.')
+      return
     }
+    setError('')
+    setDone(false)
+    setRunning(true)
+    setItems(list.map(t => ({ token: t, status: 'pending' as BulkStatus })))
+
+    const mark = (idx: number, patch: Partial<BulkItem>) => {
+      setItems(prev => prev.map((it, j) => (j === idx ? { ...it, ...patch } : it)))
+    }
+
+    const worker = async (idx: number) => {
+      const tok = list[idx]
+      mark(idx, { status: 'running' })
+      try {
+        const res = await addAccount(tok)
+        if (res.error) {
+          mark(idx, { status: 'error', error: res.error })
+          return
+        }
+        let label = res.account?.email || res.account?.name || ''
+        try {
+          const disc = await discoverWorkspaces(tok)
+          if (!disc.error && disc.spaces && disc.spaces.length > 0) {
+            onDiscovered({
+              user_id: disc.user_id,
+              user_name: disc.user_name || res.account?.name,
+              user_email: disc.user_email || res.account?.email,
+              token_v2: tok,
+              spaces: disc.spaces,
+            })
+            if (!label) label = disc.user_email || disc.user_name || ''
+            label = `${label}${label ? ' · ' : ''}${disc.spaces.length} простр.`
+          }
+        } catch { /* discovery best-effort */ }
+        mark(idx, { status: 'ok', label: label || 'добавлен' })
+      } catch (err) {
+        mark(idx, { status: 'error', error: err instanceof Error ? err.message : 'Ошибка запроса' })
+      }
+    }
+
+    // Ограниченная параллельность: не бомбим сервер и Notion всеми токенами
+    // сразу, но и не ждём каждый строго по очереди.
+    const CONCURRENCY = 4
+    let next = 0
+    const runners = Array.from({ length: Math.min(CONCURRENCY, list.length) }, async () => {
+      while (next < list.length) {
+        const idx = next++
+        await worker(idx)
+      }
+    })
+    await Promise.all(runners)
+
+    setRunning(false)
+    setDone(true)
+  }
+
+  const statusDot = (s: BulkStatus) => {
+    if (s === 'ok') return <span className='text-ok'>✓</span>
+    if (s === 'error') return <span className='text-err'>✗</span>
+    if (s === 'running') return <span className='text-text-secondary animate-pulse'>…</span>
+    return <span className='text-text-muted'>•</span>
+  }
+
+  const shortToken = (t: string) => (t.length > 22 ? `${t.slice(0, 14)}…${t.slice(-4)}` : t)
+
+  const resetForm = () => {
+    setItems([])
+    setText('')
+    setDone(false)
+    setError('')
+    setTimeout(() => inputRef.current?.focus(), 0)
   }
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/75 backdrop-blur-sm" onClick={onClose} />
-      <div className="relative w-full max-w-md rounded-xl border border-white/[0.12] bg-[#0c0c0c] shadow-modal overflow-hidden">
-        <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.07]">
-          <div className="text-[13px] font-medium text-text-primary">Добавить аккаунт Notion</div>
-          <button onClick={onClose} className="p-1 rounded text-text-muted hover:text-text-secondary bg-transparent border-none cursor-pointer">
+    <div className='fixed inset-0 z-[100] flex items-center justify-center p-4'>
+      <div className='absolute inset-0 bg-black/75 backdrop-blur-sm' onClick={() => { if (!running) onClose() }} />
+      <div className='relative w-full max-w-lg rounded-xl border border-white/[0.12] bg-[#0c0c0c] shadow-modal overflow-hidden'>
+        <div className='flex items-center justify-between px-5 py-4 border-b border-white/[0.07]'>
+          <div className='text-[13px] font-medium text-text-primary'>Массовое добавление аккаунтов Notion</div>
+          <button onClick={onClose} disabled={running} className='p-1 rounded text-text-muted hover:text-text-secondary bg-transparent border-none cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed'>
             <IconClose size={15} />
           </button>
         </div>
 
-        <div className="p-5 space-y-4">
-          {result ? (
-            <div className="flex flex-col items-center py-6 gap-3">
-              <div className="w-10 h-10 rounded-full bg-ok/10 border border-ok/30 flex items-center justify-center text-ok text-lg leading-none">✓</div>
-              <div className="text-[13px] font-medium text-text-primary">Аккаунт добавлен</div>
-              <div className="text-[11px] text-text-muted text-center">
-                {result.name} · {result.email}<br />{result.space} · {result.plan_type}
-              </div>
-            </div>
-          ) : (
-            <form onSubmit={handleSubmit} className="space-y-4">
-              <p className="text-[12px] text-text-secondary leading-relaxed">
-                Откройте <span className="text-text-primary">notion.so</span> → F12 → Application → Cookies →{' '}
-                <code className="px-1 py-0.5 rounded bg-white/[0.05] text-text-secondary font-mono text-[11px]">token_v2</code>
+        <div className='p-5 space-y-4'>
+          {items.length === 0 ? (
+            <form onSubmit={handleSubmit} className='space-y-4'>
+              <p className='text-[12px] text-text-secondary leading-relaxed'>
+                Вставьте один или несколько{' '}
+                <code className='px-1 py-0.5 rounded bg-white/[0.05] text-text-secondary font-mono text-[11px]'>token_v2</code>{' '}
+                — через запятую, с новой строки или целиком содержимое{' '}
+                <span className='text-text-primary'>result.txt</span>.
               </p>
               <textarea
                 ref={inputRef}
-                value={token}
-                onChange={e => { setToken(e.target.value); setError('') }}
-                placeholder="v02:user_token_or_internal:..."
-                rows={4}
-                className="w-full bg-[#080808] border border-white/[0.08] rounded-lg px-3 py-2.5 text-[12px] text-text-primary placeholder:text-text-muted font-mono resize-none focus:outline-none focus:border-white/[0.18] transition-colors"
+                value={text}
+                onChange={e => { setText(e.target.value); setError('') }}
+                placeholder={'v02:token_a...,\nv03:token_b...\n\nили вставьте содержимое result.txt'}
+                rows={7}
+                className='w-full bg-[#080808] border border-white/[0.08] rounded-lg px-3 py-2.5 text-[12px] text-text-primary placeholder:text-text-muted font-mono resize-none focus:outline-none focus:border-white/[0.18] transition-colors'
               />
-              {error && <p className="text-[12px] text-err">{error}</p>}
-              <div className="flex gap-2.5">
+              <div className='flex items-center justify-between text-[11px]'>
+                <span className='text-text-muted'>
+                  {tokens.length > 0 ? `Найдено токенов: ${tokens.length}` : 'Токены не обнаружены'}
+                </span>
+              </div>
+              {error && <p className='text-[12px] text-err'>{error}</p>}
+              <div className='flex gap-2.5'>
                 <button
-                  type="button"
+                  type='button'
                   onClick={onClose}
-                  className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[12px] text-text-muted hover:text-text-secondary hover:border-white/[0.14] transition-colors bg-transparent cursor-pointer"
+                  className='flex-1 py-2 rounded-lg border border-white/[0.08] text-[12px] text-text-muted hover:text-text-secondary hover:border-white/[0.14] transition-colors bg-transparent cursor-pointer'
                 >
                   Отмена
                 </button>
                 <button
-                  type="submit"
-                  disabled={loading || !token.trim()}
-                  className="flex-1 py-2 rounded-lg bg-white text-black text-[12px] font-medium hover:bg-[#f0f0f0] disabled:opacity-35 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2 border-none cursor-pointer"
+                  type='submit'
+                  disabled={tokens.length === 0}
+                  className='flex-1 py-2 rounded-lg bg-white text-black text-[12px] font-medium hover:bg-[#f0f0f0] disabled:opacity-35 disabled:cursor-not-allowed transition-colors flex items-center justify-center gap-2 border-none cursor-pointer'
                 >
-                  {loading ? 'Проверка…' : 'Добавить аккаунт'}
+                  {tokens.length > 1 ? `Добавить ${tokens.length} аккаунтов` : 'Добавить аккаунт'}
                 </button>
               </div>
             </form>
+          ) : (
+            <div className='space-y-4'>
+              <div className='flex items-center justify-between'>
+                <div className='text-[12px] text-text-secondary'>
+                  {running ? `Добавление… ${processed}/${items.length}` : 'Готово'}
+                </div>
+                <div className='text-[11px] text-text-muted'>
+                  <span className='text-ok'>✓ {okCount}</span>
+                  {failCount > 0 && <span className='text-err'> · ✗ {failCount}</span>}
+                </div>
+              </div>
+
+              <div className='h-1 w-full rounded-full bg-white/[0.06] overflow-hidden'>
+                <div
+                  className='h-full bg-notion-blue transition-all'
+                  style={{ width: `${items.length ? (processed / items.length) * 100 : 0}%` }}
+                />
+              </div>
+
+              <div className='max-h-64 overflow-y-auto space-y-1.5 pr-1'>
+                {items.map((it, i) => (
+                  <div key={i} className='flex items-start gap-2 text-[11px] leading-snug'>
+                    <span className='mt-[1px] w-3 text-center shrink-0'>{statusDot(it.status)}</span>
+                    <div className='min-w-0 flex-1'>
+                      <div className='font-mono text-text-muted truncate'>{shortToken(it.token)}</div>
+                      {it.status === 'ok' && it.label && <div className='text-ok truncate'>{it.label}</div>}
+                      {it.status === 'error' && <div className='text-err truncate'>{it.error || 'Ошибка'}</div>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className='flex gap-2.5'>
+                <button
+                  type='button'
+                  onClick={onClose}
+                  disabled={running}
+                  className='flex-1 py-2 rounded-lg border border-white/[0.08] text-[12px] text-text-muted hover:text-text-secondary hover:border-white/[0.14] transition-colors bg-transparent cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed'
+                >
+                  {running ? 'Добавление…' : 'Закрыть'}
+                </button>
+                {done && (
+                  <button
+                    type='button'
+                    onClick={resetForm}
+                    className='flex-1 py-2 rounded-lg bg-white text-black text-[12px] font-medium hover:bg-[#f0f0f0] transition-colors border-none cursor-pointer'
+                  >
+                    Добавить ещё
+                  </button>
+                )}
+              </div>
+            </div>
           )}
         </div>
       </div>

@@ -1404,6 +1404,7 @@ export const Composer = memo(function Composer({
   models,
   selectedModel,
   onModelChange,
+  modelPolicyBusy = false,
   selectedEffort,
   onEffortChange,
   onSend,
@@ -1423,6 +1424,7 @@ export const Composer = memo(function Composer({
   models: ChatModel[]
   selectedModel: string
   onModelChange: (id: string) => void
+  modelPolicyBusy?: boolean
   selectedEffort: string
   onEffortChange: (effort: string) => void
   onSend: (text: string) => void
@@ -1658,8 +1660,10 @@ export const Composer = memo(function Composer({
           <Dropdown
             value={selectedModel}
             onChange={onModelChange}
+            disabled={!hasSpace || modelPolicyBusy}
             title="Модель агента"
             ariaLabel="Модель агента"
+            placeholder={modelPolicyBusy ? 'Применяю…' : 'Выбрать модель'}
             openUp
             align="right"
             className="shrink-0 max-w-[120px] sm:max-w-[150px]"

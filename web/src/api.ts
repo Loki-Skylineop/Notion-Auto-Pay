@@ -239,6 +239,34 @@ export async function addAccount(tokenV2: string): Promise<AddAccountResult> {
   return data
 }
 
+// extractTokens разбирает произвольный текст в список token_v2 для массового
+// добавления аккаунтов. Поддерживает три формата ввода:
+//   1) токены через запятую / точку с запятой / перенос строки;
+//   2) вставленный дамп result.txt со строками вида "token_v2: v03:...";
+//   3) один токен (частный случай).
+// Сначала выбираем все подстроки, начинающиеся с "v0<цифра>:" (v02:/v03: —
+// это реальные токены). Такой шаблон разом покрывает и запятые, и формат
+// result.txt; сама метка "token_v2:" не совпадает, т.к. в ней нет нуля после v.
+// Если префиксных токенов не нашлось — режем ввод по разделителям. Дубликаты
+// отбрасываем, порядок сохраняем.
+export function extractTokens(raw: string): string[] {
+  const out: string[] = []
+  const seen = new Set<string>()
+  const push = (candidate: string) => {
+    const value = candidate.trim()
+    if (value && !seen.has(value)) {
+      seen.add(value)
+      out.push(value)
+    }
+  }
+  const re = /v0\d:[^\s,;]+/g
+  let match: RegExpExecArray | null
+  while ((match = re.exec(raw)) !== null) push(match[0])
+  if (out.length > 0) return out
+  for (const part of raw.split(/[\n,;]+/)) push(part)
+  return out
+}
+
 // --- Settings API ---
 
 export interface SearchSettings {
@@ -742,6 +770,9 @@ export interface ChatModel {
   // Notion's own default effort for this model, used as a fallback when the
   // "strongest supported" rule cannot be applied.
   default_effort?: string
+  // True when the normal model list is empty and this entry came from the
+  // workspace settings catalogue. Picking it must update the workspace policy.
+  policy_selection?: boolean
 }
 
 export interface ChatThread {
@@ -870,6 +901,18 @@ export async function chatModels(ref: { token_v2: string; user_id?: string; spac
   })
   const data = await jsonOrError(resp)
   return Array.isArray(data?.models) ? data.models : []
+}
+// chatSelectModel is used only for the restricted-list fallback. The backend
+// enables the chosen model in personal_agent_model_policy and disables every
+// other model/provider in the workspace.
+export async function chatSelectModel(ref: { token_v2: string; user_id?: string; space_id: string; selected_model: string }): Promise<void> {
+  const resp = await fetch('/admin/chat/models', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify(ref),
+  })
+  await jsonOrError(resp)
 }
 
 export async function chatThreads(ref: { token_v2: string; user_id?: string; space_id: string }): Promise<ChatThread[]> {

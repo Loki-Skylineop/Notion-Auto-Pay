@@ -6,6 +6,7 @@ import {
   chatEdit,
   chatHistory,
   chatModels,
+  chatSelectModel,
   chatQueue,
   chatStream,
   chatSurvey,
@@ -103,6 +104,7 @@ export function ChatTab({
   const [agentId, setAgentId] = useState('default')
   const [models, setModels] = useState<ChatModel[]>([])
   const [selectedModel, setSelectedModel] = useState('')
+  const [modelPolicyBusy, setModelPolicyBusy] = useState(false)
   // Reasoning effort is remembered per model codename and hydrated from
   // localStorage on mount, so reloading the page restores the user pick
   // instead of snapping back to the default.
@@ -520,6 +522,10 @@ export function ChatTab({
           // the page no longer snaps everyone back to the hardcoded default.
           const remembered = loadRememberedModels()[spaceId]
           if (remembered && enabled.some((x) => x.id === remembered)) return remembered
+          // The fallback catalogue means Notion exposed no selectable model.
+          // Keep the picker empty until the user explicitly chooses one; that
+          // choice will be persisted as a workspace model policy below.
+          if (enabled.some((x) => x.policy_selection)) return ''
           const opus = enabled.find((x) => x.id === 'ambrosia-tart-high')
           return opus ? opus.id : enabled[0]?.id || ''
         })
@@ -544,10 +550,31 @@ export function ChatTab({
   // model is not offered in this workspace) must not overwrite the memory.
   const handleModelChange = useCallback(
     (id: string) => {
-      setSelectedModel(id)
-      if (activeSpace) saveRememberedModel(activeSpace.spaceId, id)
+      const apply = async () => {
+        const model = models.find((item) => item.id === id)
+        if (activeSpace && model?.policy_selection) {
+          setModelPolicyBusy(true)
+          setError('')
+          try {
+            await chatSelectModel({
+              token_v2: activeSpace.account.token_v2,
+              user_id: activeSpace.account.user_id,
+              space_id: activeSpace.spaceId,
+              selected_model: id,
+            })
+          } catch (err) {
+            setError(err instanceof Error ? err.message : 'Не удалось применить модель')
+            return
+          } finally {
+            setModelPolicyBusy(false)
+          }
+        }
+        setSelectedModel(id)
+        if (activeSpace) saveRememberedModel(activeSpace.spaceId, id)
+      }
+      void apply()
     },
-    [activeSpace],
+    [activeSpace, models],
   )
 
   // Persist the choice against the current model so it survives reloads.
@@ -1982,6 +2009,7 @@ export function ChatTab({
           models={models}
           selectedModel={selectedModel}
           onModelChange={handleModelChange}
+          modelPolicyBusy={modelPolicyBusy}
           selectedEffort={selectedEffort}
           onEffortChange={handleEffortChange}
           onSend={handleSend}

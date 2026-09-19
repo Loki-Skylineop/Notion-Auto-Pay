@@ -1480,7 +1480,14 @@ func buildConfigValue(notionModel string, disableBuiltinTools bool, enableWebSea
 
 	// When workspace search is enabled, agent integrations must be on
 	// (they control the built-in search tool availability)
-	agentEnabled := !effectiveDisable || wsSearch
+	// MCP servers and the computer module belong to the operator, not to
+	// Notion's built-in tooling, so disable_notion_prompt must not switch them
+	// off: that single flag is why the dashboard could see the desktop while
+	// the API path could not. Agent integrations gate the connections, so they
+	// have to come along whenever MCP is on.
+	mcpEnabled := AppConfig.McpToolsEnabled()
+
+	agentEnabled := !effectiveDisable || wsSearch || mcpEnabled
 
 	configValue := map[string]interface{}{
 		"type":                       "workflow",
@@ -1497,6 +1504,21 @@ func buildConfigValue(notionModel string, disableBuiltinTools bool, enableWebSea
 		"writerMode":                 false,
 		"isCustomAgent":              false,
 		"isCustomAgentBuilder":       false,
+	}
+
+	// Notion ships the base workflow config with the MCP and computer
+	// switches off. Its own web client turns them on (see buildChatConfig in
+	// chat.go) and only that path saw MCP tools. Without them the script agent
+	// is assembled without MCP, so a perfectly connected MCP server stayed
+	// invisible on the /v1 path even though the trailing updated-config asks
+	// for it - and on subsequent turns that element is replayed as an id-only
+	// placeholder, so the base config is the only reliable place for it.
+	configValue["enableScriptAgentMcpServers"] = mcpEnabled
+	configValue["enableComputer"] = mcpEnabled
+	if mcpEnabled {
+		// Notion only surfaces MCP modules through the script agent, so the MCP
+		// flag on its own would leave the model with no way to call the tools.
+		configValue["enableScriptAgent"] = true
 	}
 
 	// searchScopes controls what the built-in search tool can access
@@ -2473,7 +2495,7 @@ func parseNDJSONStream(reader io.Reader, requestID string, cb StreamCallback, na
 			citationKnownURLs = *knownCitationURLs
 		}
 		rewritten := rewriteInternalCitationsWithObserved(rawText, observedCitationFragments, citationKnownURLs)
-		cleaned := cleanAllLangTags(trimTrailingIncompleteCitation(rewritten))
+		cleaned := trimTrailingPartialLangTag(cleanAllLangTags(trimTrailingIncompleteCitation(rewritten)))
 		if cleaned == sentClean {
 			return
 		}
@@ -3622,4 +3644,22 @@ func parseResearcherStream(reader io.Reader, requestID string, cb StreamCallback
 	cb("", true, &usage)
 
 	return nil
+}
+
+// trimTrailingPartialLangTag holds back a trailing prefix of "<lang" - "<",
+// "<l", "<la" or "<lan". Notion splits its leading <lang .../> tag across
+// stream chunks and cleanAllLangTags only recognises the full "<lang" marker,
+// so a shorter prefix used to be emitted as ordinary text. Those bytes were
+// already sent by the time the tag completed and got stripped, which left a
+// stray "<l" glued to the front of the answer: markdown renderers read it as
+// an unclosed HTML tag and hid the whole message. The suffix returns with the
+// next delta, so nothing is lost.
+func trimTrailingPartialLangTag(text string) string {
+	const tag = "<lang"
+	for n := len(tag) - 1; n >= 1; n-- {
+		if strings.HasSuffix(text, tag[:n]) {
+			return text[:len(text)-n]
+		}
+	}
+	return text
 }
