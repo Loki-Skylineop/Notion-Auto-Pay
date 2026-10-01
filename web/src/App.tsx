@@ -538,9 +538,11 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
     }
   })
   const [headerCollapsed, setHeaderCollapsed] = useState(false)
+  const [hydrating, setHydrating] = useState(true)
+  const accountCacheKey = `nmp_discovered_workspaces:${me?.username || '@pending'}`
   const [discovered, setDiscovered] = useState<DiscoveredAccount[]>(() => {
     try {
-      const raw = localStorage.getItem('nmp_discovered_workspaces')
+      const raw = me ? localStorage.getItem(accountCacheKey) : null
       return raw ? (JSON.parse(raw) as DiscoveredAccount[]) : []
     } catch {
       return []
@@ -550,9 +552,9 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
   // WorkspacePool, и после «Обновить» два писателя расходились между собой.
   useEffect(() => {
     try {
-      localStorage.setItem('nmp_discovered_workspaces', JSON.stringify(discovered))
+      if (me && !hydrating) localStorage.setItem(accountCacheKey, JSON.stringify(discovered))
     } catch { /* ignore */ }
-  }, [discovered])
+  }, [discovered, accountCacheKey, me, hydrating])
 
   // Свежий список для колбэков с пустыми зависимостями (removeDiscovered).
   const discoveredRef = useRef<DiscoveredAccount[]>(discovered)
@@ -565,9 +567,17 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
     } catch { /* ignore */ }
   }, [tab])
 
-  const [hydrating, setHydrating] = useState(true)
   useEffect(() => {
+    if (!me || !hydrating) return
+    try {
+      const cached = localStorage.getItem(accountCacheKey)
+      if (cached) setDiscovered(JSON.parse(cached) as DiscoveredAccount[])
+    } catch { /* never fall back to a different login's global cache */ }
+  }, [accountCacheKey, me, hydrating])
+  useEffect(() => {
+    if (!me) return
     let cancelled = false
+    setHydrating(true)
     fetchServerWorkspaces()
       .then(serverAccounts => {
         if (cancelled) return
@@ -593,7 +603,7 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
       .catch(() => { /* сервер не ответил — оставляем кэш как был */ })
       .finally(() => { if (!cancelled) setHydrating(false) })
     return () => { cancelled = true }
-  }, [])
+  }, [me?.username])
 
   const upsertDiscovered = useCallback((acc: DiscoveredAccount) => {
     setDiscovered(prev => {
@@ -672,7 +682,7 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
         <div hidden={tab !== 'chat'}>
           {/* Своя граница ошибок на чат: его падение больше не гасит вкладку «Оплата». */}
           <ErrorBoundary>
-            <ChatTab accounts={discovered} active={tab === 'chat'} onPoolChange={setDiscovered} />
+            {me ? <ChatTab key={me.username || '@open-dashboard'} owner={me.username || '@open-dashboard'} accountsReady={!hydrating} accounts={discovered} active={tab === 'chat'} onPoolChange={setDiscovered} /> : <div className="text-[12px] text-text-muted">Определяю аккаунт панели… Если сервер недоступен, обновите страницу после восстановления связи.</div>}
           </ErrorBoundary>
         </div>
         {isAdmin && (

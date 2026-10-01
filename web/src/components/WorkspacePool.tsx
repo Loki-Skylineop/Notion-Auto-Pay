@@ -3,6 +3,7 @@ import type { WorkspaceInfo as BaseWorkspaceInfo, McpServerInfo } from '../api'
 import { connectMcp, createWorkspaces, deleteWorkspaces, disconnectMcp, discoverWorkspaces, setOverage, startTrial } from '../api'
 import { SubscribeModal, PLANS, TRIAL_DAYS } from './SubscribeModal'
 import { AutoPaySettings } from './AutoPaySettings'
+import { isFreeWorkspace, getFreeOnlyAccounts } from '../workspaceFilters'
 import {
   fetchAutoPayConfig, updateAutoPayConfig, runAutoPayNow, paySpaceWithSavedCard,
   clampIntervalSeconds, type ServerAutoPayConfig, type AutoPayPatch,
@@ -523,16 +524,17 @@ function McpConnectModal({
 // ---------------------------------------------------------------------------
 // Массовые действия по пулу.
 //
-// Две операции, которые раньше делались по одному пространству:
+// Операции по нескольким пространствам:
 //   'mcp' — подключить один и тот же MCP-сервер ко всем пространствам, где его
 //           ещё нет (кнопка «Все без MCP» выбирает ровно их);
 //   'pay' — оплатить сохранённой картой или включить триал сразу на нескольких
-//           пространствах (кнопка «Все бесплатные» выбирает те, где подписки нет).
+//           пространствах (кнопка «Все бесплатные» выбирает те, где подписки нет);
+//   'delete' — удалить Free-пространства с подтверждением и серверной проверкой.
 // Запросы идут с ограничением параллельности, прогресс виден по каждой строке,
 // а ошибка одного пространства не останавливает остальные.
 // ---------------------------------------------------------------------------
 
-type BulkMode = 'mcp' | 'pay'
+type BulkMode = 'mcp' | 'pay' | 'delete'
 type BulkState = 'pending' | 'running' | 'ok' | 'error'
 
 interface BulkRow {
@@ -545,6 +547,7 @@ interface BulkRow {
   account: string
   mcpOn: boolean
   subscribed: boolean
+  free: boolean
 }
 
 // MCP подключаем по 4 в параллель, оплату — по 2: за оплатой стоят реальные
@@ -570,6 +573,7 @@ function buildBulkRows(pool: DiscoveredAccount[]): BulkRow[] {
         account: acc.user_email || acc.user_name || 'token',
         mcpOn: !!s.mcp_connected || (s.mcp_servers || []).some((m) => (m.status || '').toLowerCase() === 'connected'),
         subscribed: s.is_subscribed || (tier !== '' && tier !== 'free' && tier !== 'team' && tier !== 'personal'),
+        free: isFreeWorkspace(s),
       })
     }
   }
@@ -598,12 +602,19 @@ function BulkActionModal({
   pool,
   onClose,
   onFinished,
+  onDeleted,
 }: {
   pool: DiscoveredAccount[]
   onClose: () => void
   onFinished: () => void
+  onDeleted: (spaceId: string) => void
 }) {
-  const rows = buildBulkRows(pool)
+  const [mode, setMode] = useState<BulkMode>('mcp')
+  // Keep deletion outcomes visible, but other modes always use the live pool.
+  const [deleteRows, setDeleteRows] = useState<BulkRow[]>([])
+  const rows = mode === 'delete' ? deleteRows : buildBulkRows(pool)
+  const submittedDeletes = useRef(new Set<string>())
+  const runningRef = useRef(false)
 
   // Источники MCP: сохранённые в браузере пресеты + серверы, которые уже видны
   // в пуле. Токен Notion наружу не отдаёт, поэтому пресет с сохранённым
@@ -616,7 +627,6 @@ function BulkActionModal({
   }
   const first = sources[0]
 
-  const [mode, setMode] = useState<BulkMode>('mcp')
   const [sel, setSel] = useState<Record<string, boolean>>({})
   const [status, setStatus] = useState<Record<string, { state: BulkState; msg?: string }>>({})
   const [running, setRunning] = useState(false)
@@ -660,7 +670,7 @@ function BulkActionModal({
 
   const pickWhere = (fn: (r: BulkRow) => boolean) => {
     const next: Record<string, boolean> = {}
-    for (const r of rows) if (fn(r)) next[r.key] = true
+    for (const r of rows) if (fn(r) && (mode !== 'delete' || r.free)) next[r.key] = true
     setSel(next)
     setStatus({})
     setErr('')
@@ -674,7 +684,8 @@ function BulkActionModal({
   const total = rows.length
   const noMcpCount = rows.filter((r) => !r.mcpOn).length
   const freeCount = rows.filter((r) => !r.subscribed).length
-  const targets = rows.filter((r) => sel[r.key])
+  const deleteFreeCount = rows.filter((r) => r.free).length
+  const targets = rows.filter((r) => sel[r.key] && (mode !== 'delete' || (r.free && !submittedDeletes.current.has(r.spaceId))))
   const selCount = targets.length
 
   const stats = Object.keys(status).map((k) => status[k])
@@ -684,6 +695,8 @@ function BulkActionModal({
   const pct = stats.length > 0 ? Math.round((doneN / stats.length) * 100) : 0
 
   const start = async () => {
+    if (runningRef.current) return
+    if (mode === 'delete' && !window.confirm(`Удалить навсегда ${selCount} Free-пространств?\n\nБудут удалены все их страницы, базы данных и подключения. Отменить это действие нельзя. Перед удалением сервер перепроверит тариф каждого пространства.`)) return
     if (!selCount) { setErr('Не выбрано ни одного пространства'); return }
     if (mode === 'mcp' && !url.trim()) { setErr('Укажите адрес MCP-сервера'); return }
     if (mode === 'pay' && payMethod === 'saved') {
@@ -696,6 +709,7 @@ function BulkActionModal({
       if (!window.confirm(`Оплатить план ${label} для ${selCount} пространств сохранённой картой?\n\nСписываются реальные деньги, отменить нельзя.`)) return
     }
     setErr('')
+    runningRef.current = true
     setRunning(true)
     const fresh: Record<string, { state: BulkState; msg?: string }> = {}
     for (const t of targets) fresh[t.key] = { state: 'pending' }
@@ -704,10 +718,28 @@ function BulkActionModal({
       setStatus((s) => ({ ...s, [key]: { state, msg } }))
     }
     let okCount = 0
-    const limit = mode === 'mcp' ? BULK_MCP_CONCURRENCY : BULK_PAY_CONCURRENCY
+    // Deletions are sequential: shared accounts write through the same user_root.
+    const limit = mode === 'delete' ? 1 : mode === 'mcp' ? BULK_MCP_CONCURRENCY : BULK_PAY_CONCURRENCY
     await runBulk(targets, limit, async (r) => {
       mark(r.key, 'running')
       try {
+        if (mode === 'delete') {
+          if (submittedDeletes.current.has(r.spaceId)) {
+            mark(r.key, 'ok', 'уже отправлено на удаление')
+            return
+          }
+          const res = await deleteWorkspaces(r.token, [r.spaceId], r.userId, true)
+          const deleted = res.deleted.find((s) => s.space_id === r.spaceId)
+          if (!deleted || (deleted.state !== 'success' && deleted.state !== 'in_progress')) {
+            mark(r.key, 'error', res.error || res.errors?.join('; ') || 'удаление не подтверждено')
+            return
+          }
+          submittedDeletes.current.add(r.spaceId)
+          okCount += 1
+          mark(r.key, 'ok', deleted.state === 'success' ? 'удалено' : 'задача отправлена, ещё выполняется')
+          if (deleted.state === 'success') onDeleted(r.spaceId)
+          return
+        }
         if (mode === 'mcp') {
           const res = await connectMcp({
             tokenV2: r.token,
@@ -750,6 +782,7 @@ function BulkActionModal({
         headerValue: headerValue.trim(),
       })
     }
+    runningRef.current = false
     setRunning(false)
     if (okCount > 0) onFinished()
   }
@@ -770,12 +803,21 @@ function BulkActionModal({
           Всего пространств: {total} · без MCP: {noMcpCount} · без подписки: {freeCount}
         </div>
 
-        <div className="flex items-center gap-2 mb-4">
+        <div className="flex items-center gap-2 mb-4 flex-wrap">
           <button type="button" disabled={running} onClick={() => { setMode('mcp'); setStatus({}); setErr('') }} className={tabCls(mode === 'mcp')}>
             Подключить MCP
           </button>
           <button type="button" disabled={running} onClick={() => { setMode('pay'); setStatus({}); setErr('') }} className={tabCls(mode === 'pay')}>
             Оплата
+          </button>
+          <button type="button" disabled={running} onClick={() => {
+            const freshRows = buildBulkRows(pool)
+            setDeleteRows(freshRows)
+            setMode('delete')
+            setSel(Object.fromEntries(freshRows.filter((r) => r.free).map((r) => [r.key, true])))
+            setStatus({}); setErr('')
+          }} className={tabCls(mode === 'delete')}>
+            Удалить Free ({deleteFreeCount})
           </button>
         </div>
 
@@ -815,7 +857,7 @@ function BulkActionModal({
               </div>
             </div>
           </div>
-        ) : (
+        ) : mode === 'pay' ? (
           <div className="mb-4 flex flex-col gap-2">
             <div className="flex items-center gap-2">
               <button type="button" disabled={running} onClick={() => setPayMethod('saved')} className={tabCls(payMethod === 'saved')}>
@@ -849,18 +891,23 @@ function BulkActionModal({
               </div>
             )}
           </div>
+        ) : (
+          <div className="mb-4 rounded-lg border border-err/30 bg-err/5 p-3 text-[11px] text-err leading-relaxed">
+            Удаление навсегда, вместе со страницами и базами. Доступны только Free-пространства.
+            Сервер проверит тариф заново; платные и непроверенные пространства будут пропущены.
+          </div>
         )}
 
         <div className="flex items-center gap-2 mb-2 flex-wrap">
           <button type="button" disabled={running} onClick={() => pickWhere((r) => !r.mcpOn)} className={quickCls}>Все без MCP ({noMcpCount})</button>
-          <button type="button" disabled={running} onClick={() => pickWhere((r) => !r.subscribed)} className={quickCls}>Все бесплатные ({freeCount})</button>
-          <button type="button" disabled={running} onClick={() => pickWhere(() => true)} className={quickCls}>Все ({total})</button>
+          <button type="button" disabled={running} onClick={() => pickWhere((r) => mode === 'delete' ? r.free : !r.subscribed)} className={quickCls}>Все бесплатные ({mode === 'delete' ? deleteFreeCount : freeCount})</button>
+          <button type="button" disabled={running} onClick={() => pickWhere(() => true)} className={quickCls}>Все ({mode === 'delete' ? deleteFreeCount : total})</button>
           <button type="button" disabled={running} onClick={() => { setSel({}); setStatus({}) }} className={quickCls}>Снять выбор</button>
           <span className="ml-auto text-[11px] text-text-secondary">Выбрано: {selCount}</span>
         </div>
 
         <div className="max-h-64 overflow-y-auto rounded-lg border border-white/[0.07] divide-y divide-white/[0.05]">
-          {rows.map((r) => {
+          {rows.filter((r) => mode !== 'delete' || r.free).map((r) => {
             const st = status[r.key]
             let right = ''
             let tone = 'text-text-muted'
@@ -870,7 +917,7 @@ function BulkActionModal({
             else if (st && st.state === 'error') { right = st.msg || 'ошибка'; tone = 'text-err' }
             return (
               <label key={r.key} className={`flex items-center gap-2.5 px-2.5 py-2 ${running ? '' : 'cursor-pointer hover:bg-white/[0.02]'}`}>
-                <input type="checkbox" checked={!!sel[r.key]} disabled={running} onChange={() => toggleRow(r.key)} className="shrink-0" />
+                <input type="checkbox" checked={!!sel[r.key]} disabled={running || (mode === 'delete' && submittedDeletes.current.has(r.spaceId))} onChange={() => toggleRow(r.key)} className="shrink-0" />
                 <span className="min-w-0 flex-1">
                   <span className="block text-[12px] text-text-primary truncate">{r.name}</span>
                   <span className="block text-[10px] text-text-muted truncate">{r.account}</span>
@@ -910,9 +957,9 @@ function BulkActionModal({
             type="button"
             onClick={start}
             disabled={running || selCount === 0}
-            className="px-3 py-1.5 rounded-lg text-[12px] font-medium bg-notion-blue text-white disabled:opacity-40 disabled:cursor-not-allowed hover:bg-notion-blue/90 transition-colors border-none cursor-pointer"
+            className={`px-3 py-1.5 rounded-lg text-[12px] font-medium text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors border-none cursor-pointer ${mode === 'delete' ? 'bg-err hover:bg-err/90' : 'bg-notion-blue hover:bg-notion-blue/90'}`}
           >
-            {running ? 'Выполняю…' : mode === 'mcp' ? `Подключить MCP (${selCount})` : payMethod === 'trial' ? `Включить триал (${selCount})` : `Оплатить (${selCount})`}
+            {running ? 'Выполняю…' : mode === 'delete' ? `Удалить навсегда (${selCount})` : mode === 'mcp' ? `Подключить MCP (${selCount})` : payMethod === 'trial' ? `Включить триал (${selCount})` : `Оплатить (${selCount})`}
           </button>
         </div>
       </div>
@@ -1212,7 +1259,7 @@ export function WorkspacePool({
       for (const acc of current) {
         try {
           const disc = await discoverWorkspaces(acc.token_v2)
-          if (!disc.error && disc.spaces && disc.spaces.length > 0) {
+          if (!disc.error && disc.spaces) {
             next.push({
               user_id: disc.user_id ?? acc.user_id,
               user_name: disc.user_name ?? acc.user_name,
@@ -1240,7 +1287,7 @@ export function WorkspacePool({
   const refreshAccount = useCallback(async (token: string) => {
     try {
       const disc = await discoverWorkspaces(token)
-      if (disc.error || !disc.spaces || disc.spaces.length === 0) return
+      if (disc.error || !disc.spaces) return
       const next = poolRef.current.map(a =>
         a.token_v2 === token
           ? {
@@ -1277,6 +1324,16 @@ export function WorkspacePool({
   if (!pool.length) return null
 
   const totalSpaces = pool.reduce((sum, acc) => sum + (acc.spaces?.length || 0), 0)
+  const freeOnlyAccounts = getFreeOnlyAccounts(pool)
+  const freeSpaces = freeOnlyAccounts.reduce((sum, acc) => sum + acc.spaces.length, 0)
+  const hideAllFree = () => {
+    if (readOnly || refreshing) return
+    const targets = getFreeOnlyAccounts(poolRef.current)
+    if (!targets.length) return
+    if (!window.confirm(`Убрать из списка ${targets.length} аккаунтов, у которых все пространства Free?\n\nКак в «Убрать из списка»: аккаунты и их файлы будут удалены из серверного пула. Пространства в Notion не удаляются. Аккаунты с платными или неизвестными тарифами останутся.`)) return
+    // Reuse precisely the same App callback as the individual AccountMenu action.
+    for (const acc of targets) onRemoveAccount(acc.user_email || acc.token_v2)
+  }
   const targetPlan = PLANS.find(p => p.id === (cfg?.plan || ''))
   const globalPlanName = targetPlan ? targetPlan.name : (cfg?.plan || '')
   const targetPlanLabel = targetPlan ? `${targetPlan.name} ${targetPlan.price}${targetPlan.interval}` : (cfg?.plan || '—')
@@ -1285,7 +1342,7 @@ export function WorkspacePool({
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-5">
+      <div className="flex items-center justify-between mb-5 gap-3 flex-wrap">
         <div className="text-[13px] text-text-secondary">
           Рабочие пространства <span className="text-text-muted">({totalSpaces})</span>
         </div>
@@ -1306,9 +1363,20 @@ export function WorkspacePool({
             >
               <IconRefreshSmall spinning={refreshing} />
             </button>
+            {!readOnly && (
+              <button
+                type="button"
+                onClick={hideAllFree}
+                disabled={refreshing || !freeOnlyAccounts.length}
+                title={`Как «Убрать из списка»: убрать ${freeOnlyAccounts.length} аккаунтов (${freeSpaces} пространств), где все тарифы Free. Аккаунты с платными пространствами сохраняются.`}
+                className="px-2.5 py-1.5 rounded-md text-[11px] border border-white/[0.09] text-text-secondary hover:text-text-primary hover:border-white/[0.18] transition-colors bg-transparent cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Скрыть все Free ({freeSpaces})
+              </button>
+            )}
             <button
               onClick={() => setShowBulk(true)}
-              title="Массовые действия: подключить MCP или оплатить сразу несколько пространств"
+              title="Массовые действия: подключить MCP, оплатить или удалить Free-пространства"
               className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-[11px] font-medium border transition-colors bg-transparent cursor-pointer border-white/[0.09] text-text-secondary hover:text-text-primary hover:border-white/[0.18] ${readOnly ? 'hidden' : ''}`}
             >
               <IconBolt />Массовое действие
@@ -1586,6 +1654,12 @@ export function WorkspacePool({
         <BulkActionModal
           pool={pool}
           onClose={() => setShowBulk(false)}
+          onDeleted={(spaceId) => {
+            const next = poolRef.current.map((acc) => ({ ...acc, spaces: (acc.spaces || []).filter((s) => s.space_id !== spaceId) }))
+            poolRef.current = next
+            setPool(next)
+            persistPool(next)
+          }}
           onFinished={() => { refresh() }}
         />
       )}

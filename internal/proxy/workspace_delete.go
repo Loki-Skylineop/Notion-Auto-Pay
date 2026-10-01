@@ -75,6 +75,19 @@ type DeleteWorkspacesResponse struct {
 	Error     string             `json:"error,omitempty"`
 }
 
+// requireFreeDeletionPlan fails closed: workspace categories and failed lookups
+// must never be mistaken for a confirmed Free subscription.
+func requireFreeDeletionPlan(plan string) error {
+	switch strings.ToLower(strings.TrimSpace(plan)) {
+	case "free", "personal":
+		return nil
+	case "":
+		return fmt.Errorf("не удалось проверить тариф; удаление пропущено")
+	default:
+		return fmt.Errorf("тариф %s не Free; удаление пропущено", plan)
+	}
+}
+
 // wsEnqueueDeleteSpace queues the deleteSpace task and returns its task id.
 func wsEnqueueDeleteSpace(tokenV2, userID, spaceID string) (string, error) {
 	client := getChromeHTTPClient(AppConfig.APITimeoutDuration())
@@ -210,6 +223,7 @@ func HandleDeleteWorkspaces(auth *DashboardAuth) http.HandlerFunc {
 			UserID   string   `json:"user_id"`
 			SpaceID  string   `json:"space_id"`
 			SpaceIDs []string `json:"space_ids"`
+			OnlyFree bool     `json:"only_free"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, `{"error":"invalid request body"}`, http.StatusBadRequest)
@@ -262,6 +276,13 @@ func HandleDeleteWorkspaces(auth *DashboardAuth) http.HandlerFunc {
 		for i, spaceID := range ids {
 			if i > 0 {
 				time.Sleep(deleteSpaceDelay)
+			}
+			if body.OnlyFree {
+				plan, _ := fetchSpaceSubscription(tokenV2, userID, spaceID)
+				if err := requireFreeDeletionPlan(plan); err != nil {
+					out.Errors = append(out.Errors, fmt.Sprintf("space %s: %v", truncate(spaceID, 8), err))
+					continue
+				}
 			}
 			taskID, err := wsEnqueueDeleteSpace(tokenV2, userID, spaceID)
 			if err != nil {

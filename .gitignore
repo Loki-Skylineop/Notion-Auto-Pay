@@ -63,3 +63,10 @@ accounts-expired/
 /s2.mp3
 web/tsconfig.tsbuildinfo
 _patch/
+
+# Per-login chat navigation (private account/workspace identifiers)
+chat-navigation.json
+.chat-navigation-*
+
+# Local Linux release artifact
+/motion-pay-chat-sync-linux

@@ -30,6 +30,9 @@ import { ParticleSettings } from './ParticleSettings'
 import { loadParticleConfig, type ParticleConfig } from '../particleSettings'
 import { Dropdown } from './Dropdown'
 import { chatSync, type ChatSyncResult } from '../chatSync'
+import { useChatNavigation } from '../hooks/useChatNavigation'
+import { useWorkspaceActivity } from '../hooks/useWorkspaceActivity'
+import { stableAccountId, chatSpaceKey, locationKey, sortChatSpaces, activityGroup, resolveInitialChatSpace } from '../chatNavigation'
 import { playChatDoneSound, primeChatSounds } from '../chatSound'
 import {
   shellStyle,
@@ -45,8 +48,6 @@ import {
   OUTER_MIN,
   OUTER_MAX,
   loadOuterWidth,
-  ACTIVE_SPACE_KEY,
-  ACTIVE_THREAD_KEY,
   loadEfforts,
   saveEffort,
   resolveEffort,
@@ -85,21 +86,30 @@ import {
 // не прокрутит — и лог открылся бы в самом начале переписки.
 export function ChatTab({
   accounts,
+  owner,
+  accountsReady = true,
   active = true,
   onPoolChange,
 }: {
   accounts: DiscoveredAccount[]
+  owner: string
+  accountsReady?: boolean
   active?: boolean
   onPoolChange?: (next: DiscoveredAccount[]) => void
 }) {
   const [autoCfg, setAutoCfg] = useState<ServerAutoPayConfig | null>(null)
-  const [spaceKey, setSpaceKey] = useState(() => {
-    try {
-      return localStorage.getItem(ACTIVE_SPACE_KEY) || ''
-    } catch {
-      return ''
-    }
-  })
+  const navigation = useChatNavigation(owner)
+  const [spaceKey, setSpaceKey] = useState('')
+  const [autoCfgReady, setAutoCfgReady] = useState(false)
+  const selectionResolvedRef = useRef(false)
+  const legacyChoiceRef = useRef<{ space: string; thread: string } | null>(null)
+  if (legacyChoiceRef.current === null) {
+    try { legacyChoiceRef.current = { space: localStorage.getItem('nmp_chat_active_space') || '', thread: localStorage.getItem('nmp_chat_active_thread') || '' } }
+    catch { legacyChoiceRef.current = { space: '', thread: '' } }
+  }
+  const migrationThreadRef = useRef('')
+  const [threadsSpaceKey, setThreadsSpaceKey] = useState('')
+  const [agentsSpaceKey, setAgentsSpaceKey] = useState('')
   const [agents, setAgents] = useState<ChatAgent[]>([])
   const [agentId, setAgentId] = useState('default')
   const [models, setModels] = useState<ChatModel[]>([])
@@ -197,7 +207,7 @@ export function ChatTab({
   // без него ответ «воскресает» сразу после нажатия «Отправить».
   const editGuardRef = useRef<{ threadId: string; maxLen: number } | null>(null)
   // Guards the one-time "restore last open thread on reload" effect.
-  const restoredThreadRef = useRef(false)
+  const restoredThreadRef = useRef('')
   // Чаты, чей ход оборвал сам пользователь кнопкой «Стоп»: по ним звук конца
   // работы не играем — это отмена, а не завершённый ход.
   const soundSkipRef = useRef<Set<string>>(new Set())
@@ -369,7 +379,9 @@ export function ChatTab({
   )
 
   useEffect(() => {
-    fetchAutoPayConfig().then(setAutoCfg).catch(() => {})
+    let cancelled = false
+    fetchAutoPayConfig().then(c => { if (!cancelled) setAutoCfg(c) }).catch(() => {}).finally(() => { if (!cancelled) setAutoCfgReady(true) })
+    return () => { cancelled = true }
   }, [])
 
   // Keep isDesktop in sync so the sidebar width is only applied on PC (on
@@ -400,24 +412,8 @@ export function ChatTab({
     }
   }, [outerWidth])
 
-  // Remember the active space so a reload restores the same selection.
-  useEffect(() => {
-    try {
-      if (spaceKey) localStorage.setItem(ACTIVE_SPACE_KEY, spaceKey)
-    } catch {
-      // ignore
-    }
-  }, [spaceKey])
-
-  // Remember the active thread (cleared when on a new chat) for reload restore.
-  useEffect(() => {
-    try {
-      if (activeThreadId) localStorage.setItem(ACTIVE_THREAD_KEY, activeThreadId)
-      else localStorage.removeItem(ACTIVE_THREAD_KEY)
-    } catch {
-      // ignore
-    }
-  }, [activeThreadId])
+  // Navigation is persisted only by explicit choices (not by initial empty state).
+  const savedSpaceKey = navigation.data.active ? locationKey(navigation.data.active) : ''
 
   // Persist the active thread's settled messages so re-opening it is instant.
   // Skipped while a turn is in flight so we never cache a half-streamed state.
@@ -431,12 +427,15 @@ export function ChatTab({
     const out: SpaceOption[] = []
     for (const acc of accounts) {
       const accountLabel = acc.user_email || acc.user_name || acc.user_id || 'Аккаунт'
+      const accountId = stableAccountId(acc)
+      if (!accountId) continue // Never bind a durable selection to a rotating secret token.
       for (const sp of acc.spaces || []) {
+        const key = chatSpaceKey(accountId, sp.space_id)
         const subscribed = sp.is_subscribed === true
         const autoArmed = !!autoCfg?.spaces?.[sp.space_id]
-        if (isFreeTier(sp.plan_type) && !subscribed && !autoArmed) continue
+        if (isFreeTier(sp.plan_type) && !subscribed && !autoArmed && key !== savedSpaceKey && key !== spaceKey) continue
         out.push({
-          key: `${acc.user_id || acc.token_v2}:${sp.space_id}`,
+          key,
           account: acc,
           spaceId: sp.space_id,
           spaceViewId: sp.space_view_id,
@@ -446,7 +445,7 @@ export function ChatTab({
       }
     }
     return out
-  }, [accounts, autoCfg])
+  }, [accounts, autoCfg, savedSpaceKey, spaceKey])
 
   const activeSpace = useMemo(
     () => spaceOptions.find((s) => s.key === spaceKey) || null,
@@ -457,15 +456,65 @@ export function ChatTab({
   onPoolChangeRef.current = onPoolChange
   accountsRef.current = accounts
 
+  const { activity, scan: scanActivity, markMessage } = useWorkspaceActivity(spaceOptions, active && accountsReady && navigation.ready)
+  const sortedSpaceOptions = useMemo(() => sortChatSpaces(spaceOptions, activity), [spaceOptions, activity])
+  const rememberSpace = useCallback((space: SpaceOption, threadId: string) => {
+    navigation.remember({ account_id: stableAccountId(space.account), account_email: space.account.user_email, space_id: space.spaceId, thread_id: threadId })
+  }, [navigation.remember])
+
+  // Restore only after all independent loads have settled. A saved unavailable
+  // workspace stays unavailable: never silently send the user to another account.
   useEffect(() => {
-    if (spaceOptions.length === 0) {
-      if (spaceKey !== '') setSpaceKey('')
+    if (selectionResolvedRef.current || !accountsReady || !navigation.ready || !autoCfgReady) return
+    if (navigation.data.unavailable || (navigation.error && !savedSpaceKey)) {
+      // No trusted server selection or owner-scoped fallback: require a choice.
+      selectionResolvedRef.current = true
       return
     }
-    if (!spaceOptions.some((s) => s.key === spaceKey)) {
-      setSpaceKey(spaceOptions[0].key)
+    // One-time upgrade migration: only an accessible exact account+space
+    // match can seed an EMPTY server profile. Never write an old secret token.
+    const legacy = !savedSpaceKey && navigation.data.revision === 0 && !navigation.error
+      ? spaceOptions.find(s => `${s.account.user_id || s.account.token_v2}:${s.spaceId}` === legacyChoiceRef.current?.space)
+      : undefined
+    const choice = resolveInitialChatSpace(savedSpaceKey || legacy?.key || '', spaceOptions.map(s => s.key), true)
+    if (choice === null) return
+    selectionResolvedRef.current = true
+    if (legacy) {
+      migrationThreadRef.current = legacyChoiceRef.current?.thread || ''
+      rememberSpace(legacy, '')
+    } else if (!savedSpaceKey && navigation.data.revision === 0 && !navigation.error) {
+      // A brand-new login has no saved choice: persist its first fully hydrated
+      // workspace once, so merely using the default also survives device changes.
+      const initial = spaceOptions.find(s => s.key === choice)
+      if (initial) rememberSpace(initial, '')
     }
-  }, [spaceOptions, spaceKey])
+    setSpaceKey(choice)
+  }, [accountsReady, navigation.ready, autoCfgReady, savedSpaceKey, spaceOptions, navigation.data.revision, navigation.data.unavailable, navigation.error, rememberSpace])
+
+  const selectSpace = (key: string) => {
+    const space = spaceOptions.find(s => s.key === key)
+    if (!space || !navigation.ready || !accountsReady) return
+    selectionResolvedRef.current = true
+    setSpaceKey(key)
+    rememberSpace(space, navigation.data.threads[key] || '')
+  }
+  useLayoutEffect(() => {
+    // Invalidate old async history immediately; preserve running background turns.
+    viewKeyRef.current = `${NEW_KEY}:${spaceKey}:${Date.now()}`
+    setNewKey(viewKeyRef.current)
+    setActiveThreadId('')
+    setMessages([])
+    setAttachments([])
+    setPendingThreadId('')
+    setRemoteBusy(false)
+    setLiveText('')
+    setLiveSteps([])
+    setError('')
+    setHistoryLoading(false)
+    restoredThreadRef.current = ''
+    setThreadsSpaceKey('')
+    setAgentsSpaceKey('')
+  }, [spaceKey])
 
   useEffect(() => {
     if (!activeSpace) {
@@ -473,6 +522,9 @@ export function ChatTab({
       setThreads([])
       return
     }
+    setAgents([])
+    setThreads([])
+    setThreadsLoading(true)
     const ref = {
       token_v2: activeSpace.account.token_v2,
       user_id: activeSpace.account.user_id,
@@ -483,17 +535,18 @@ export function ChatTab({
       .then((a) => {
         if (cancelled) return
         setAgents(a)
+        setAgentsSpaceKey(activeSpace.key)
         setAgentId((prev) => (a.some((x) => x.id === prev) ? prev : 'default'))
       })
       .catch(() => {
-        if (!cancelled) setAgents([{ id: 'default', name: 'Обычный агент', kind: 'default' }])
+        if (!cancelled) { setAgents([{ id: 'default', name: 'Обычный агент', kind: 'default' }]); setAgentsSpaceKey(activeSpace.key) }
       })
     chatThreads(ref)
       .then((t) => {
-        if (!cancelled) setThreads(t)
+        if (!cancelled) { setThreads(t); setThreadsSpaceKey(activeSpace.key); setThreadsLoading(false) }
       })
       .catch(() => {
-        if (!cancelled) setThreads([])
+        if (!cancelled) { setThreads([]); setThreadsLoading(false); setError('Не удалось загрузить чаты этого пространства. Нажмите обновление истории.') }
       })
     return () => {
       cancelled = true
@@ -832,15 +885,19 @@ export function ChatTab({
         user_id: activeSpace.account.user_id,
         space_id: activeSpace.spaceId,
       })
+      if (activeSpaceRef.current?.key !== activeSpace.key) return
       setThreads(t)
+      setThreadsSpaceKey(activeSpace.key)
     } catch {
-      // ignore — keep the existing list on failure
+      // Keep the existing list on failure, but never mask a failed restore.
+      if (activeSpaceRef.current?.key === activeSpace.key) setError('Не удалось обновить историю чатов')
     } finally {
-      setThreadsLoading(false)
+      if (activeSpaceRef.current?.key === activeSpace.key) setThreadsLoading(false)
     }
   }, [activeSpace, threadsLoading])
 
   const startNewChat = useCallback(() => {
+    if (activeSpace) { restoredThreadRef.current = activeSpace.key; rememberSpace(activeSpace, '') }
     // Свежий ключ для пустого чата: если в предыдущем «Новом чате» ход
     // ещё идёт, он остаётся при своём ключе, а этот готов к отправке.
     setNewKey(`${NEW_KEY}:${Date.now()}`)
@@ -859,11 +916,14 @@ export function ChatTab({
       const rememberedSpaceModel = loadRememberedModels()[activeSpace.spaceId]
       if (rememberedSpaceModel) applyThreadModel(rememberedSpaceModel)
     }
-  }, [activeSpace, applyThreadModel])
+  }, [activeSpace, applyThreadModel, rememberSpace])
 
   const openThread = useCallback(
-    async (t: ChatThread) => {
+    async (t: ChatThread, persist = true) => {
       if (!activeSpace) return
+      const requestSpaceKey = activeSpace.key
+      restoredThreadRef.current = requestSpaceKey
+      if (persist) rememberSpace(activeSpace, t.id)
       // Гасим только цикл ЭТОГО чата (сейчас запустим его заново). Остальные
       // продолжают работать, поэтому индикатор в соседнем диалоге не гаснет.
       stopPolling(t.id)
@@ -909,6 +969,7 @@ export function ChatTab({
           space_id: activeSpace.spaceId,
           thread_id: t.id,
         })
+        if (activeSpaceRef.current?.key !== requestSpaceKey || viewKeyRef.current !== t.id) return
         const mapped: ChatMessage[] = hist.messages.map((m) => ({ role: m.role, text: m.text, steps: m.steps, blocks: m.blocks, survey: m.survey, confirm: m.confirm, pages: m.pages }))
         if (viewKeyRef.current === t.id && (!cached || cached.hash !== hashMessages(mapped))) {
           setMessages(mapped)
@@ -934,32 +995,33 @@ export function ChatTab({
         // server reports no in-flight turn.
         startPolling(activeSpace, t.id)
       } catch (e) {
-        setError(e instanceof Error ? e.message : 'Не удалось загрузить историю чата')
+        if (activeSpaceRef.current?.key === requestSpaceKey && viewKeyRef.current === t.id) setError(e instanceof Error ? e.message : 'Не удалось загрузить историю чата')
       } finally {
-        instantScrollRef.current = true
-        setHistoryLoading(false)
+        if (activeSpaceRef.current?.key === requestSpaceKey && viewKeyRef.current === t.id) {
+          instantScrollRef.current = true
+          setHistoryLoading(false)
+        }
       }
     },
-    [activeSpace, agents, startPolling, stopPolling, rememberThreadAgent, applyThreadModel, rememberThreadModel],
+    [activeSpace, agents, startPolling, stopPolling, rememberThreadAgent, applyThreadModel, rememberThreadModel, rememberSpace],
   )
 
   // On first load, reopen the chat the user was last viewing -- restoring its
   // history and, through polling, whether the agent is still working there.
   useEffect(() => {
-    if (restoredThreadRef.current) return
-    if (!activeSpace || agents.length === 0 || threads.length === 0) return
-    restoredThreadRef.current = true
+    if (!navigation.ready || !activeSpace || restoredThreadRef.current === activeSpace.key) return
+    if (threadsSpaceKey !== activeSpace.key || agentsSpaceKey !== activeSpace.key) return
+    restoredThreadRef.current = activeSpace.key
     if (!isNewChatKey(viewKeyRef.current)) return
-    let saved = ''
-    try {
-      saved = localStorage.getItem(ACTIVE_THREAD_KEY) || ''
-    } catch {
-      saved = ''
-    }
+    const migrated = migrationThreadRef.current && threads.some(t => t.id === migrationThreadRef.current) ? migrationThreadRef.current : ''
+    migrationThreadRef.current = ''
+    const saved = navigation.data.threads[activeSpace.key] || migrated
     if (!saved) return
-    const t = threads.find((x) => x.id === saved)
-    if (t) void openThread(t)
-  }, [activeSpace, agents, threads, openThread])
+    if (migrated) rememberSpace(activeSpace, migrated)
+    // A recent-list cap must not prevent restoring an older saved thread.
+    const t = threads.find((x) => x.id === saved) || { id: saved, title: 'Сохранённый чат' }
+    void openThread(t, false)
+  }, [activeSpace, agentsSpaceKey, threadsSpaceKey, threads, openThread, navigation.ready, navigation.data.threads, rememberSpace])
 
   const deleteThread = useCallback(
     async (t: ChatThread, e: React.MouseEvent) => {
@@ -1178,7 +1240,14 @@ export function ChatTab({
       onThread: (threadId: string) => {
         // Новый чат узнаёт свой id ещё до первой буквы ответа: без него
         // сообщение, написанное во время самого первого хода, дописать некуда.
-        if (threadId) threadIdsRef.current[key] = threadId
+        if (threadId) {
+          threadIdsRef.current[key] = threadId
+          const space = activeSpaceRef.current
+          if (space && viewKeyRef.current === key) {
+            rememberSpace(space, threadId)
+            markMessage(space.key)
+          }
+        }
       },
       // Агент остановился и просит разрешение: Notion держит стрим открытым,
       // поэтому карточку показываем сразу, а кнопка оживёт, когда ход договорит.
@@ -1215,7 +1284,7 @@ export function ChatTab({
         setStatus(null)
       },
     }),
-    [],
+    [rememberSpace, markMessage],
   )
 
   const handleSend = useCallback(
@@ -1342,17 +1411,23 @@ export function ChatTab({
           // Сразу фиксируем модель хода — и для только что созданного треда.
           if (agentUsed === 'default' && selectedModel) rememberThreadModel(res.thread_id, selectedModel, selectedEffort || undefined)
           migrateQueue(originKey, res.thread_id)
-          setThreads((prev) =>
-            prev.some((t) => t.id === res.thread_id)
-              ? prev
-              : [{ id: res.thread_id, title: res.title || text.slice(0, 40), type: 'workflow' }, ...prev],
-          )
+          if (activeSpaceRef.current?.key === activeSpace.key) {
+            setThreads((prev) =>
+              prev.some((t) => t.id === res.thread_id)
+                ? prev
+                : [{ id: res.thread_id, title: res.title || text.slice(0, 40), type: 'workflow', message_count: 1 }, ...prev],
+            )
+          }
         }
         // Only mutate the visible conversation if the user is still viewing the
         // chat this stream was started from, and the turn wasn't stopped.
         // Otherwise the reply is persisted server-side and shows up on reopen.
         if (viewKeyRef.current === originKey && !stopKeysRef.current[originKey]) {
-          if (res.thread_id && res.thread_id !== activeThreadId) setActiveThreadId(res.thread_id)
+          if (res.thread_id && res.thread_id !== activeThreadId) {
+            setActiveThreadId(res.thread_id)
+            rememberSpace(activeSpace, res.thread_id)
+            markMessage(activeSpace.key)
+          }
           setMessages((prev) => [
             ...prev,
             { role: 'assistant', text: res.text || '(пустой ответ)', steps: res.steps, blocks: res.blocks, survey: res.survey, confirm: res.confirm, pages: res.pages },
@@ -1797,14 +1872,19 @@ export function ChatTab({
             <div className="text-[9px] text-text-muted uppercase tracking-widest mb-1 px-0.5">Пространство</div>
             <Dropdown
               value={spaceKey}
-              onChange={setSpaceKey}
-              disabled={spaceOptions.length === 0}
+              onChange={selectSpace}
+              onOpen={() => { void scanActivity() }}
+              searchable
+              disabled={spaceOptions.length === 0 || !navigation.ready || !accountsReady}
               ariaLabel="Пространство"
-              placeholder="Нет платных пространств"
+              placeholder={!navigation.ready || !accountsReady ? 'Восстанавливаю выбор…' : spaceKey ? 'Сохранённое пространство недоступно' : 'Нет платных пространств'}
               buttonClassName="rounded-md px-2.5 py-1.5 text-[12px]"
               menuClassName="w-full"
-              options={spaceOptions.map((s) => ({ value: s.key, label: `${s.spaceName} · ${s.accountLabel}` }))}
+              options={sortedSpaceOptions.map((s) => ({ value: s.key, label: s.spaceName, description: `${s.accountLabel} · ${activity[s.key]?.hasMessages === true ? 'есть сообщения' : activity[s.key]?.hasMessages === false ? 'без сообщений' : 'история не проверена'}`, group: ['С сообщениями', 'История проверяется / недоступна', 'Без сообщений'][activityGroup(activity[s.key])] }))}
             />
+            {navigation.data.unavailable && <div className="mt-1 text-[10px] text-amber-400 leading-snug">Последнее пространство больше недоступно. Выберите другое вручную.</div>}
+            {navigation.error && <div className="mt-1 text-[10px] text-amber-400 leading-snug">{navigation.error}</div>}
+            {spaceKey && !activeSpace && navigation.ready && accountsReady && <div className="mt-1 text-[10px] text-amber-400 leading-snug">Сохранённый аккаунт или пространство недоступны. Выберите другое явно — автоматического переключения нет.</div>}
           </div>
 
           <div>

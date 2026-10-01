@@ -1,8 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
+import { Fragment, useEffect, useRef, useState } from 'react'
 
 export interface DropdownOption {
   value: string
   label: string
+  description?: string
+  group?: string
 }
 
 // A small custom select that matches the dark Vercel theme. Native <select>
@@ -24,6 +26,8 @@ export function Dropdown({
   className = '',
   buttonClassName = '',
   menuClassName = 'w-full',
+  searchable = false,
+  onOpen,
 }: {
   value: string
   options: DropdownOption[]
@@ -37,8 +41,13 @@ export function Dropdown({
   className?: string
   buttonClassName?: string
   menuClassName?: string
+  searchable?: boolean
+  onOpen?: () => void
 }) {
   const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const normalizedQuery = query.trim().toLocaleLowerCase()
+  const visibleOptions = options.filter(o => !normalizedQuery || `${o.label} ${o.description || ''}`.toLocaleLowerCase().includes(normalizedQuery))
   const rootRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
@@ -71,7 +80,11 @@ export function Dropdown({
         aria-label={ariaLabel}
         aria-haspopup="listbox"
         aria-expanded={open}
-        onClick={() => !disabled && setOpen((v) => !v)}
+        onClick={() => {
+          if (disabled) return
+          if (!open) { setQuery(''); onOpen?.() }
+          setOpen((v) => !v)
+        }}
         className={`w-full flex items-center justify-between gap-2 bg-white/[0.03] border text-left transition-colors cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed ${open ? 'border-white/[0.18]' : 'border-white/[0.07] hover:border-white/[0.12]'} ${buttonClassName}`}
       >
         <span className="truncate text-[#bdbdbd]">{label}</span>
@@ -95,14 +108,18 @@ export function Dropdown({
           role="listbox"
           className={`dropdown-pop no-scrollbar absolute z-50 ${menuPos} ${menuAlign} max-h-64 overflow-y-auto rounded-md border border-white/[0.1] bg-[#0c0c0c] py-1 shadow-float ${menuClassName}`}
         >
-          {options.length === 0 ? (
+          {searchable && <div className="sticky top-0 bg-[#0c0c0c] px-2 pb-1 z-10">
+            <input autoFocus value={query} onChange={e => setQuery(e.target.value)} aria-label="Поиск пространства или аккаунта" placeholder="Поиск пространства / аккаунта" className="w-full rounded border border-white/[0.1] bg-black px-2 py-1.5 text-[11px] text-text-primary outline-none" />
+          </div>}
+          {visibleOptions.length === 0 ? (
             <div className="px-2.5 py-1.5 text-[12px] text-text-muted">Нет вариантов</div>
           ) : (
-            options.map((o) => {
+            visibleOptions.map((o, index) => {
               const active = o.value === value
               return (
+                <Fragment key={o.value}>
+                {o.group && (index === 0 || visibleOptions[index - 1].group !== o.group) && <div className="px-2.5 pt-2 pb-1 text-[9px] uppercase tracking-wider text-text-muted border-t border-white/[0.04]">{o.group}</div>}
                 <button
-                  key={o.value}
                   type="button"
                   role="option"
                   aria-selected={active}
@@ -112,9 +129,13 @@ export function Dropdown({
                   }}
                   className={`w-full flex items-center gap-2 px-2.5 py-1.5 text-left text-[12px] transition-colors bg-transparent border-none cursor-pointer ${active ? 'bg-white/[0.07] text-[#e8e8e8]' : 'text-[#999] hover:bg-white/[0.04] hover:text-[#ccc]'}`}
                 >
-                  <span className="flex-1 truncate">{o.label}</span>
+                  <span className="flex-1 min-w-0">
+                    <span className="block truncate">{o.label}</span>
+                    {o.description && <span className="block truncate text-[10px] text-text-muted mt-0.5">{o.description}</span>}
+                  </span>
                   {active ? <span className="shrink-0 text-[10px] text-notion-blue">✓</span> : null}
                 </button>
+                </Fragment>
               )
             })
           )}

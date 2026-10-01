@@ -363,11 +363,12 @@ func HandleChatModels(auth *DashboardAuth) http.HandlerFunc {
 // ---- Threads ----
 
 type chatThread struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	CreatedAt int64  `json:"created_at"`
-	UpdatedAt int64  `json:"updated_at"`
-	Type      string `json:"type"`
+	ID           string `json:"id"`
+	Title        string `json:"title"`
+	CreatedAt    int64  `json:"created_at"`
+	UpdatedAt    int64  `json:"updated_at"`
+	Type         string `json:"type"`
+	MessageCount *int   `json:"message_count,omitempty"`
 	// AgentID is the workflowId of the custom agent this thread belongs to
 	// (from the thread record's parent pointer), or "default" for the built-in
 	// assistant. The dashboard uses it to preselect the right agent when a
@@ -459,6 +460,10 @@ func HandleChatThreads(auth *DashboardAuth) http.HandlerFunc {
 				agentByThread[id] = agentIDFromThreadParent(rec.Value.Value.ParentTable, rec.Value.Value.ParentID)
 			}
 			for i := range parsed.Transcripts {
+				if rec, ok := rm.RecordMap.Thread[parsed.Transcripts[i].ID]; ok && rec.Value.Value.Messages != nil {
+					count := len(rec.Value.Value.Messages)
+					parsed.Transcripts[i].MessageCount = &count
+				}
 				if a, ok := agentByThread[parsed.Transcripts[i].ID]; ok {
 					parsed.Transcripts[i].AgentID = a
 				}

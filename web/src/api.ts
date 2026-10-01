@@ -725,12 +725,13 @@ export async function deleteWorkspaces(
   tokenV2: string,
   spaceIds: string[],
   userId?: string,
+  onlyFree = false,
 ): Promise<DeleteWorkspacesResult> {
   const resp = await fetch('/admin/workspaces/delete', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     credentials: 'same-origin',
-    body: JSON.stringify({ token_v2: tokenV2, user_id: userId || '', space_ids: spaceIds }),
+    body: JSON.stringify({ token_v2: tokenV2, user_id: userId || '', space_ids: spaceIds, only_free: onlyFree }),
   })
   const data = await readJson<DeleteWorkspacesResult>(resp, 'Сервер удаления пространств вернул некорректный ответ')
   if (!resp.ok) {
@@ -776,6 +777,7 @@ export interface ChatModel {
 }
 
 export interface ChatThread {
+  message_count?: number
   id: string
   title: string
   created_at?: number

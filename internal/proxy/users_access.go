@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -38,9 +39,10 @@ func (c Caller) IsAdmin() bool { return c.AuthOff || c.Role == RoleAdmin }
 // AccessGuard couples the session store, the user registry and the account
 // pool so it can answer "may this caller touch this account/space?".
 type AccessGuard struct {
-	auth  *DashboardAuth
-	store *UserStore
-	pool  *AccountPool
+	auth       *DashboardAuth
+	store      *UserStore
+	pool       *AccountPool
+	navigation *ChatNavigationStore
 
 	// spaceOwners caches space_id -> owning account email. Filled from the
 	// /admin/workspaces discovery responses that flow through this guard, so
@@ -52,11 +54,16 @@ type AccessGuard struct {
 // NewAccessGuard wires the guard. store may be nil, in which case only the
 // legacy single-admin mode exists.
 func NewAccessGuard(auth *DashboardAuth, store *UserStore, pool *AccountPool) *AccessGuard {
+	path := "chat-navigation.json"
+	if store != nil {
+		path = filepath.Join(filepath.Dir(store.Path()), "chat-navigation.json")
+	}
 	return &AccessGuard{
 		auth:        auth,
 		store:       store,
 		pool:        pool,
 		spaceOwners: map[string]string{},
+		navigation:  newChatNavigationStore(path),
 	}
 }
 

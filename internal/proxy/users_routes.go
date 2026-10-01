@@ -97,6 +97,9 @@ func (g *AccessGuard) Middleware(next http.Handler) http.Handler {
 			// Admins reset anyone's password; a user may change their own.
 			g.RequireLogin(HandleAdminUsersPassword(g))(w, r)
 			return
+		case "/admin/chat/navigation":
+			g.RequireLogin(HandleChatNavigation(g))(w, r)
+			return
 		case "/admin/me":
 			g.RequireLogin(HandleAdminMe(g))(w, r)
 			return
