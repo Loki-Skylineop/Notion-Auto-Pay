@@ -1,3 +1,4 @@
+import { AUTH_EXPIRED_EVENT, AUTH_RECOVERY_BLOCKED_EVENT } from './authRecovery'
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { addAccount, discoverWorkspaces, extractTokens, checkAuth, deleteAccount, login as apiLogin, logout as apiLogout } from './api'
 import { WorkspacePool, type DiscoveredAccount } from './components/WorkspacePool'
@@ -710,6 +711,18 @@ export default function App() {
   const [authState, setAuthState] = useState<'loading' | 'login' | 'authed'>('loading')
   const [requiresPassword, setRequiresPassword] = useState(false)
   const [me, setMe] = useState<Me | null>(null)
+  const [recoveryWarning, setRecoveryWarning] = useState(false)
+
+  useEffect(() => {
+    const expired = () => { setMe(null); setRequiresPassword(true); setAuthState('login') }
+    const blocked = () => setRecoveryWarning(true)
+    window.addEventListener(AUTH_EXPIRED_EVENT, expired)
+    window.addEventListener(AUTH_RECOVERY_BLOCKED_EVENT, blocked)
+    return () => {
+      window.removeEventListener(AUTH_EXPIRED_EVENT, expired)
+      window.removeEventListener(AUTH_RECOVERY_BLOCKED_EVENT, blocked)
+    }
+  }, [])
 
   useEffect(() => {
     let cancelled = false
@@ -752,5 +765,8 @@ export default function App() {
     return <LoginScreen onSuccess={() => setAuthState('authed')} />
   }
 
-  return <Dashboard onLogout={requiresPassword ? handleLogout : undefined} me={me} />
+  return <>
+    {recoveryWarning && <div role="alert" className="p-3 text-[12px] text-amber-400 bg-amber-950/30">Повторная ошибка авторизации. Автоперезагрузка приостановлена, чтобы избежать цикла. <button className="underline cursor-pointer" onClick={() => window.location.reload()}>Обновить страницу</button></div>}
+    <Dashboard onLogout={requiresPassword ? handleLogout : undefined} me={me} />
+  </>
 }

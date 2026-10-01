@@ -3,6 +3,9 @@ import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App'
 import { ErrorBoundary } from './components/ErrorBoundary'
+import { installAuthRecovery } from './authRecovery'
+
+installAuthRecovery()
 
 // ErrorBoundary ловит только падения рендера. Ошибки из промисов, таймеров и
 // обработчиков событий раньше уходили в никуда, поэтому логируем их отдельно с

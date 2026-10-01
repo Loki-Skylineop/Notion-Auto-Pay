@@ -388,8 +388,9 @@ export async function getJob(id: string): Promise<RegisterJob> {
   return jsonOrError(resp) as Promise<RegisterJob>
 }
 
-export async function deleteAccount(email: string): Promise<void> {
-  const resp = await fetch(`/admin/accounts/${encodeURIComponent(email)}`, {
+export async function deleteAccount(email: string, onlyMonthlyExhausted = false): Promise<void> {
+  const suffix = onlyMonthlyExhausted ? '?only_monthly_exhausted=true' : ''
+  const resp = await fetch(`/admin/accounts/${encodeURIComponent(email)}${suffix}`, {
     method: 'DELETE',
     credentials: 'same-origin',
   })

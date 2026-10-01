@@ -69,6 +69,8 @@ type RegisterJobsDeps struct {
 	// HandleAdminRegisterStart. Required.
 	Providers *providers.Registry
 	Auth      *DashboardAuth
+	// Optional offline test seam; production uses fresh Notion discovery.
+	MonthlyDiscover func(string) (*AccountWorkspaces, error)
 }
 
 // authorize enforces dashboard auth on every endpoint in this file. If no
@@ -219,18 +221,18 @@ func HandleAdminRegisterStart(deps *RegisterJobsDeps) http.HandlerFunc {
 		// Detach from the request context so cancelled HTTP clients don't
 		// kill the background run.
 		runCtx := context.Background()
-	go regjob.Run(runCtx, deps.Store, job.ID, prov, creds, regjob.RunOpts{
-		Concurrency: concurrency,
-		AccountsDir: deps.AccountsDir,
-		Proxy:       proxyURL,
-		OnSuccess: func(email string) {
-			deps.Pool.ReloadFromDir(deps.AccountsDir)
-			triggerPostRegisterRefresh(deps, email)
-		},
-	})
+		go regjob.Run(runCtx, deps.Store, job.ID, prov, creds, regjob.RunOpts{
+			Concurrency: concurrency,
+			AccountsDir: deps.AccountsDir,
+			Proxy:       proxyURL,
+			OnSuccess: func(email string) {
+				deps.Pool.ReloadFromDir(deps.AccountsDir)
+				triggerPostRegisterRefresh(deps, email)
+			},
+		})
 
-	resp := map[string]interface{}{
-		"job_id":      job.ID,
+		resp := map[string]interface{}{
+			"job_id":      job.ID,
 			"provider":    prov.ID(),
 			"total":       len(creds),
 			"concurrency": concurrency,
@@ -604,6 +606,16 @@ func HandleAdminDeleteAccount(deps *RegisterJobsDeps) http.HandlerFunc {
 			return
 		}
 
+		if r.URL.Query().Get("only_monthly_exhausted") == "true" {
+			if err := verifyMonthlyExhaustedAccount(deps, email); err != nil {
+				w.WriteHeader(http.StatusConflict)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+			if r.Context().Err() != nil {
+				return
+			}
+		}
 		if err := deleteAccountByEmail(deps.Pool, deps.AccountsDir, email); err != nil {
 			if os.IsNotExist(err) {
 				http.Error(w, `{"error":"account not found"}`, http.StatusNotFound)
