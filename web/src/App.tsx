@@ -4,6 +4,7 @@ import { addAccount, discoverWorkspaces, extractTokens, checkAuth, deleteAccount
 import { WorkspacePool, type DiscoveredAccount } from './components/WorkspacePool'
 import { ChatTab } from './components/ChatTab'
 import { ApiKeysTab } from './components/ApiKeysTab'
+import { McpHostsTab } from './components/McpHostsTab'
 import { ErrorBoundary } from './components/ErrorBoundary'
 import { UsersTab } from './components/UsersTab'
 import { fetchMe, loginWithUsername, type Me } from './apiUsers'
@@ -86,12 +87,12 @@ const HERO_GLOW = { background: 'radial-gradient(ellipse, rgba(255,255,255,0.045
 // surface (Чат). Rendered as the mockup's capsule pill.
 function TabBar({ tab, onChange, tabs }: { tab: TabId; onChange: (t: TabId) => void; tabs: readonly TabId[] }) {
   return (
-    <div className="p-[3px] rounded-full bg-white/[0.03] border border-white/[0.07]">
+    <div className="flex flex-wrap justify-center max-w-full p-[3px] rounded-2xl sm:rounded-full bg-white/[0.03] border border-white/[0.07]">
       {tabs.map(t => (
         <button
           key={t}
           onClick={() => onChange(t)}
-          className={`px-5 py-1.5 rounded-full text-[12px] font-medium transition-all duration-200 border-none cursor-pointer ${tab === t ? 'bg-white text-black' : 'bg-transparent text-text-muted hover:text-text-secondary'}`}
+          className={`px-3 sm:px-5 min-h-11 py-1.5 rounded-full text-[12px] font-medium transition-all duration-200 border-none cursor-pointer ${tab === t ? 'bg-white text-black' : 'bg-transparent text-text-muted hover:text-text-secondary'}`}
         >
           {TAB_LABELS[t]}
         </button>
@@ -527,13 +528,13 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
   // answer must never hand a regular user the admin controls. In the open
   // no-password mode the server itself reports is_admin: true.
   const isAdmin = me?.is_admin === true
-  const tabs = (isAdmin ? (['pay', 'chat', 'api', 'users'] as const) : (['pay', 'chat'] as const)) as readonly TabId[]
+  const tabs = (isAdmin ? (['pay', 'chat', 'mcp', 'api', 'users'] as const) : (['pay', 'chat', 'mcp'] as const)) as readonly TabId[]
   const canAdd = isAdmin
   const [showAddModal, setShowAddModal] = useState(false)
   const [tab, setTab] = useState<TabId>(() => {
     try {
       const saved = localStorage.getItem('nmp_active_tab')
-      return saved === 'chat' || saved === 'api' || saved === 'users' ? saved : 'pay'
+      return saved === 'chat' || saved === 'mcp' || saved === 'api' || saved === 'users' ? saved : 'pay'
     } catch {
       return 'pay'
     }
@@ -686,6 +687,7 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
             {me ? <ChatTab key={me.username || '@open-dashboard'} owner={me.username || '@open-dashboard'} accountsReady={!hydrating} accounts={discovered} active={tab === 'chat'} onPoolChange={setDiscovered} /> : <div className="text-[12px] text-text-muted">Определяю аккаунт панели… Если сервер недоступен, обновите страницу после восстановления связи.</div>}
           </ErrorBoundary>
         </div>
+        {me && <div hidden={tab !== 'mcp'}><ErrorBoundary><McpHostsTab key={me.username || '@open-dashboard'} owner={me.username || '@open-dashboard'} active={tab === 'mcp'} /></ErrorBoundary></div>}
         {isAdmin && (
           <div hidden={tab !== 'api'}>
             <ErrorBoundary>

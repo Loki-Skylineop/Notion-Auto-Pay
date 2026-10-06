@@ -359,6 +359,11 @@ func main() {
 	}
 
 	mux := newMux(pool, accountsDir, apiKey, dashAuth, usageStats, regDeps, autoPay)
+	mcpHosts, err := proxy.NewMCPHostStore(filepath.Join(filepath.Dir(userStore.Path()), "mcphosts.json"))
+	if err != nil {
+		log.Fatalf("[mcphost] %v", err)
+	}
+	mcpHosts.Register(mux, guard)
 
 	dashStatus := "OPEN (no password)"
 	if dashPasswordHash != "" {
@@ -437,7 +442,7 @@ func main() {
 	// Users: the guard applies the per-login access policy in front of the
 	// whole mux, and HideAPIKeyMeta keeps the proxy API key out of the
 	// dashboard HTML for anyone who is not a signed-in admin.
-	handler := corsMiddleware(apiKeyAuthMiddleware(apiKey, proxy.HideAPIKeyMeta(guard, guard.Middleware(mux))))
+	handler := mcpHosts.Middleware(corsMiddleware(apiKeyAuthMiddleware(apiKey, proxy.HideAPIKeyMeta(guard, guard.Middleware(mux)))))
 	if err := http.ListenAndServe(":"+port, handler); err != nil {
 		lanCleanup()
 		log.Fatalf("Server error: %v", err)

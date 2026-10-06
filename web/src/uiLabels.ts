@@ -4,11 +4,12 @@
 // было импортировать без круговой зависимости между компонентами.
 
 // Вкладки панели. «users» существует только для администратора.
-export type TabId = 'pay' | 'chat' | 'api' | 'users'
+export type TabId = 'pay' | 'chat' | 'mcp' | 'api' | 'users'
 
 export const TAB_LABELS: Record<TabId, string> = {
   pay: 'Оплата',
   chat: 'Чат',
+  mcp: 'MCP',
   api: 'API ключи',
   users: 'Пользователи',
 }

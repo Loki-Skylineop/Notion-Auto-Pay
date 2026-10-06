@@ -70,3 +70,12 @@ chat-navigation.json
 
 # Local Linux release artifact
 /motion-pay-chat-sync-linux
+
+# MCP host credentials and temporary secret files
+mcphosts.json
+.mcphosts-*
+mcplog_key
+/motion-pay-mcp-linux
+/notion-auto-pay-linux
+/notion-auto-pay-linux-bulk
+/notion-auto-pay-linux-deploy
