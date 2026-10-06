@@ -151,7 +151,16 @@ func TestMCPSetupInvalidAndNoCache(t *testing.T) {
 		t.Fatal("setup")
 	}
 	script := w.Body.String()
-	if strings.Contains(script, "__PRIVATE_B64__") || !strings.Contains(mcpLauncher, "StrictHostKeyChecking=yes") {
+	if strings.HasPrefix(script, "\ufeff") || !strings.HasPrefix(script, "#") {
+		t.Fatal("setup response must not have a UTF-8 BOM for irm | iex")
+	}
+	if strings.Contains(script, "Start-Process powershell.exe") || strings.Contains(script, "Register-ScheduledTask -TaskName") || !strings.Contains(script, "& $launch") || !strings.Contains(script, "Windows-MCP already installed") {
+		t.Fatal("installer must reuse dependencies and stay in the current console")
+	}
+	if !strings.Contains(mcpForegroundRunner, "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE") || !strings.Contains(mcpForegroundRunner, "except KeyboardInterrupt") {
+		t.Fatal("foreground runner must clean up on interrupt and console close")
+	}
+	if strings.Contains(script, "__PRIVATE_B64__") || !strings.Contains(mcpForegroundRunner, "StrictHostKeyChecking=yes") {
 		t.Fatal("template substitution")
 	}
 	w = httptest.NewRecorder()

@@ -9,7 +9,7 @@ The MCP tab manages self-hosted Windows computers behind reverse SSH tunnels. It
 3. Run the displayed PowerShell command on the Windows PC you want to expose.
 4. Add the displayed HTTPS `/mcp` URL and Bearer token to Notion.
 
-The installer uses a per-host environment under `%USERPROFILE%\.windows-mcp-hosts\<host>`, binds Windows-MCP to loopback only, pins the VPS SSH host key, and creates a non-elevated login task (HKCU Run fallback). Multiple hosts do not share Python environments, keys, scripts or processes. It never kills another MCP installation.
+The installer uses a per-host environment under `%USERPROFILE%\.windows-mcp-hosts\<host>`, binds Windows-MCP to loopback only, pins the VPS SSH host key, and runs in the SAME PowerShell console with live server/HTTP/SSH logs. Existing dependencies are reused without downloads. Ctrl+C or closing the console stops the server, its descendants and tunnel via a Windows kill-on-close job object. It creates no login task or background PowerShell window; re-running migrates this host's earlier task/HKCU Run entry to console-only operation. Multiple hosts do not share Python environments, keys, scripts or processes. It never kills another MCP installation.
 
 Create public hosts on the VPS, not in a disconnected Windows dashboard. The Windows build contains the same UI and module but links to the central VPS for public tunnel management; creating local credentials would not install their public SSH key on the VPS.
 
@@ -19,7 +19,7 @@ Create public hosts on the VPS, not in a disconnected Windows dashboard. The Win
 - No code: blocks direct PowerShell/Registry and unknown tool names. Mouse/keyboard, file access and app launching remain possible; **this is not a sandbox or a guarantee that code cannot execute**.
 - Observation: only Snapshot, Screenshot, State/State-Tool and Wait. Other `tools/call` requests are denied by the gateway.
 
-Dashboard access is owner-scoped; admins can manage all hosts. Public computer endpoints use their own Bearer keys, never dashboard cookies or AIRI API keys. Setup URLs contain credentials: never share them. Rotation replaces the setup token, Bearer token and SSH key, and requires reinstalling the host. Rotation does not terminate an already-running tool request or remove old PC-side files. Deleting a host removes its gateway and authorized SSH key; remove its login task/Run entry and local files to uninstall from Windows.
+Dashboard access is owner-scoped; admins can manage all hosts. Public computer endpoints use their own Bearer keys, never dashboard cookies or AIRI API keys. Setup URLs contain credentials: never share them. Rotation replaces the setup token, Bearer token and SSH key, and requires reinstalling the host. Rotation does not terminate an already-running tool request or remove old PC-side files. Deleting a host removes its gateway and authorized SSH key; close its console and remove its local files to uninstall from Windows. Old foreground commands keep running until stopped; run the latest setup command again to receive launcher updates.
 
 ## Deployment
 
