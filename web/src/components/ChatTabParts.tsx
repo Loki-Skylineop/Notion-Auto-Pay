@@ -610,7 +610,9 @@ export function TurnRibbon({ blocks }: { blocks: ChatBlock[] }) {
 
 export function renderInline(text: string, keyPrefix: string): React.ReactNode[] {
   const nodes: React.ReactNode[] = []
-  const regex = /\*\*([^*]+)\*\*|\*([^*]+)\*|`([^`]+)`|\[([^\]]+)\]\(([^)]+)\)/g
+  // Notion responses may escape link delimiters: \\[label\\](url).
+  // Accept both forms without unescaping code or unrelated plain text.
+  const regex = /\*\*([^*]+)\*\*|\*([^*]+)\*|`([^`]+)`|\\?\[([^\]\n]+?)\\?\]\\?\(([^)\n]+?)\\?\)/g
   let last = 0
   let m: RegExpExecArray | null
   let i = 0
@@ -627,11 +629,15 @@ export function renderInline(text: string, keyPrefix: string): React.ReactNode[]
         </code>,
       )
     } else if (m[4] !== undefined) {
-      nodes.push(
-        <a key={`${keyPrefix}-l${i}`} href={m[5]} target="_blank" rel="noreferrer" className="text-notion-blue underline wrap-anywhere">
-          {m[4]}
-        </a>,
-      )
+      const href = m[5].trim()
+      const label = renderInline(m[4], `${keyPrefix}-label${i}`)
+      // Untrusted Markdown must not create executable javascript:/data: links.
+      const safe = /^(?:https?:\/\/|mailto:|tel:|\/|#|\.\.?\/)/i.test(href) && !/[\u0000-\u0020\u007f]/.test(href)
+      nodes.push(safe ? (
+        <a key={`${keyPrefix}-l${i}`} href={href} target="_blank" rel="noopener noreferrer" className="text-notion-blue underline wrap-anywhere">
+          {label}
+        </a>
+      ) : <span key={`${keyPrefix}-l${i}`}>{label}</span>)
     }
     last = regex.lastIndex
     i += 1
