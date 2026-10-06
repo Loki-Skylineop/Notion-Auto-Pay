@@ -705,6 +705,7 @@ export async function createWorkspaces(tokenV2: string, count: number): Promise<
 // необратима, подтверждение целиком на стороне интерфейса.
 
 export interface DeletedWorkspace {
+  excluded?: boolean
   space_id: string
   task_id?: string
   // Состояние задачи на стороне Notion: "success", "in_progress" или "failure".

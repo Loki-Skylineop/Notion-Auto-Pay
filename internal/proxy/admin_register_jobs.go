@@ -632,11 +632,14 @@ func HandleAdminDeleteAccount(deps *RegisterJobsDeps) http.HandlerFunc {
 // matches and drops the corresponding pool entry. Returns os.ErrNotExist if
 // no file matches; that's mapped to a 404 by the handler.
 func deleteAccountByEmail(pool *AccountPool, dir, email string) error {
+	accountFilesMu.Lock()
+	defer accountFilesMu.Unlock()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return err
 	}
-	var target string
+	var targets []string
+	var tokens []string
 	for _, e := range entries {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
 			continue
@@ -647,23 +650,31 @@ func deleteAccountByEmail(pool *AccountPool, dir, email string) error {
 			continue
 		}
 		var raw map[string]interface{}
-		if err := json.Unmarshal(data, &raw); err != nil {
+		if json.Unmarshal(data, &raw) != nil {
 			continue
 		}
-		if got, _ := raw["user_email"].(string); strings.EqualFold(got, email) {
-			target = path
-			break
+		if got, _ := raw["user_email"].(string); strings.EqualFold(strings.TrimSpace(got), strings.TrimSpace(email)) {
+			targets = append(targets, path)
+			token, _ := raw["token_v2"].(string)
+			tokens = append(tokens, token)
 		}
 	}
-	if target == "" {
+	if len(targets) == 0 {
 		return os.ErrNotExist
 	}
-	if err := os.Remove(target); err != nil {
-		return err
+	for _, token := range tokens {
+		if err := excludeAccountToken(token); err != nil {
+			return err
+		}
+	}
+	for _, path := range targets {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 	if pool != nil {
 		pool.RemoveAccountByEmail(email)
 	}
-	log.Printf("[admin] deleted account file: %s (%s)", target, email)
+	log.Printf("[admin] permanently removed %d account files", len(targets))
 	return nil
 }

@@ -80,3 +80,6 @@ mcplog_key
 /notion-auto-pay-linux-bulk
 /notion-auto-pay-linux-deploy
 /release-next.gz
+
+/workspace-exclusions.json
+/workspace-exclusions.json.tmp

@@ -93,6 +93,9 @@ type AccountWorkspaces struct {
 //	the real tier (Free / Plus / Business / Enterprise) we call
 //	/api/v3/getSubscriptionData for each space and use that instead.
 func DiscoverWorkspacesFromToken(tokenV2 string) (*AccountWorkspaces, error) {
+	if accountTokenIsExcluded(tokenV2) {
+		return nil, fmt.Errorf("account was permanently removed from the pool")
+	}
 	client := getChromeHTTPClient(AppConfig.APITimeoutDuration())
 
 	req, err := http.NewRequest("POST", NotionAPIBase+"/loadUserContent", bytes.NewReader([]byte("{}")))
@@ -210,7 +213,7 @@ func DiscoverWorkspacesFromToken(tokenV2 string) (*AccountWorkspaces, error) {
 		if id == "" {
 			id = spaceID
 		}
-		if id == "" || seen[id] {
+		if id == "" || seen[id] || workspaceIsExcluded(id) {
 			return
 		}
 		seen[id] = true
@@ -239,10 +242,6 @@ func DiscoverWorkspacesFromToken(tokenV2 string) (*AccountWorkspaces, error) {
 		}
 	}
 
-	if len(spaces) == 0 {
-		return nil, fmt.Errorf("no workspaces found for this account")
-	}
-
 	// Enrich each space with its REAL subscription tier + AI credit balance
 	// (concurrently).
 	var wg sync.WaitGroup
@@ -250,6 +249,9 @@ func DiscoverWorkspacesFromToken(tokenV2 string) (*AccountWorkspaces, error) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
+			if workspaceIsExcluded(spaces[idx].SpaceID) || accountTokenIsExcluded(tokenV2) {
+				return
+			}
 			planType, planName := fetchSpaceSubscription(tokenV2, userID, spaces[idx].SpaceID)
 			if planType != "" {
 				spaces[idx].PlanType = planType
@@ -297,15 +299,16 @@ func DiscoverWorkspacesFromToken(tokenV2 string) (*AccountWorkspaces, error) {
 	}
 	wg.Wait()
 
-	// Anything we still couldn't classify falls back to Free for display.
-	for i := range spaces {
-		if strings.TrimSpace(spaces[i].PlanType) == "" || strings.EqualFold(spaces[i].PlanType, "team") {
-			if !spaces[i].IsSubscribed {
-				spaces[i].PlanType = "free"
-			}
+	if accountTokenIsExcluded(tokenV2) {
+		return nil, fmt.Errorf("account was permanently removed from the pool")
+	}
+	visible := spaces[:0]
+	for _, space := range spaces {
+		if !workspaceIsExcluded(space.SpaceID) {
+			visible = append(visible, space)
 		}
 	}
-
+	spaces = visible
 	log.Printf("[workspace] found %d workspace(s) for %s", len(spaces), userEmail)
 
 	return &AccountWorkspaces{

@@ -145,6 +145,21 @@ func NewAutoPayManager(pool *AccountPool, accountsDir, stripeKey string) *AutoPa
 
 // saveLocked writes the config to disk atomically. Caller MUST hold m.mu.
 func (m *AutoPayManager) saveLocked() {
+	for id := range m.cfg.Spaces {
+		if workspaceIsExcluded(id) {
+			delete(m.cfg.Spaces, id)
+		}
+	}
+	for id := range m.cfg.SpacePlans {
+		if workspaceIsExcluded(id) {
+			delete(m.cfg.SpacePlans, id)
+		}
+	}
+	for id := range m.cfg.Paid {
+		if workspaceIsExcluded(id) {
+			delete(m.cfg.Paid, id)
+		}
+	}
 	if m.path == "" {
 		return
 	}
@@ -391,6 +406,7 @@ func (m *AutoPayManager) TriggerRun() bool {
 //   - pays the space if it is still Free (fresh PaymentMethod per charge), and
 //   - downgrades the space back to Free (cancels the subscription) once its
 //     premium AI credit balance drops to/below autoPayLowCreditThreshold.
+//
 // Every decision is logged to the console so it's clear why a space was paid,
 // downgraded, or skipped.
 func (m *AutoPayManager) runOnce() {
@@ -466,7 +482,7 @@ func (m *AutoPayManager) runOnce() {
 			shortID := truncate(sp.SpaceID, 8)
 			tier := strings.ToLower(strings.TrimSpace(sp.PlanType))
 			isFree := !sp.IsSubscribed && (tier == "" || tier == "free" || tier == "personal")
-			armedOn := cfg.Spaces[sp.SpaceID]
+			armedOn := cfg.Spaces[sp.SpaceID] && !workspaceIsExcluded(sp.SpaceID)
 
 			if !armedOn {
 				if isFree {

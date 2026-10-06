@@ -1,3 +1,4 @@
+import { forgetAccount, sanitizePool } from './workspaceLifecycle'
 import { AUTH_EXPIRED_EVENT, AUTH_RECOVERY_BLOCKED_EVENT } from './authRecovery'
 import { useState, useEffect, useCallback, useRef } from 'react'
 import { addAccount, discoverWorkspaces, extractTokens, checkAuth, deleteAccount, login as apiLogin, logout as apiLogout } from './api'
@@ -10,9 +11,7 @@ import { UsersTab } from './components/UsersTab'
 import { fetchMe, loginWithUsername, type Me } from './apiUsers'
 import { L, TAB_LABELS, type TabId } from './uiLabels'
 
-// Pull the persisted accounts + their workspaces straight from the server so
-// the pool shows up even in a fresh browser / incognito window where the
-// localStorage cache (nmp_discovered_workspaces) is empty.
+// Server-only membership: never restore account/workspace records from browser storage.
 async function fetchServerWorkspaces(): Promise<DiscoveredAccount[]> {
   const resp = await fetch('/admin/workspaces', {
     headers: { Accept: 'application/json' },
@@ -541,22 +540,18 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
   })
   const [headerCollapsed, setHeaderCollapsed] = useState(false)
   const [hydrating, setHydrating] = useState(true)
-  const accountCacheKey = `nmp_discovered_workspaces:${me?.username || '@pending'}`
-  const [discovered, setDiscovered] = useState<DiscoveredAccount[]>(() => {
-    try {
-      const raw = me ? localStorage.getItem(accountCacheKey) : null
-      return raw ? (JSON.parse(raw) as DiscoveredAccount[]) : []
-    } catch {
-      return []
-    }
-  })
-  // Единственная точка записи кэша. Раньше в этот же ключ писал ещё и
-  // WorkspacePool, и после «Обновить» два писателя расходились между собой.
+  const [discovered, setDiscoveredState] = useState<DiscoveredAccount[]>([])
+  const setDiscovered = useCallback((update: DiscoveredAccount[] | ((prev: DiscoveredAccount[]) => DiscoveredAccount[])) => {
+    setDiscoveredState(prev => sanitizePool(typeof update === 'function' ? update(prev) : update))
+  }, [])
+  // Retire ALL historical workspace caches. F5 starts empty and trusts the server.
   useEffect(() => {
     try {
-      if (me && !hydrating) localStorage.setItem(accountCacheKey, JSON.stringify(discovered))
-    } catch { /* ignore */ }
-  }, [discovered, accountCacheKey, me, hydrating])
+      for (const key of Object.keys(localStorage)) {
+        if (key.startsWith('nmp_discovered_workspaces')) localStorage.removeItem(key)
+      }
+    } catch { /* storage can be disabled */ }
+  }, [])
 
   // Свежий список для колбэков с пустыми зависимостями (removeDiscovered).
   const discoveredRef = useRef<DiscoveredAccount[]>(discovered)
@@ -570,39 +565,15 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
   }, [tab])
 
   useEffect(() => {
-    if (!me || !hydrating) return
-    try {
-      const cached = localStorage.getItem(accountCacheKey)
-      if (cached) setDiscovered(JSON.parse(cached) as DiscoveredAccount[])
-    } catch { /* never fall back to a different login's global cache */ }
-  }, [accountCacheKey, me, hydrating])
-  useEffect(() => {
     if (!me) return
     let cancelled = false
     setHydrating(true)
     fetchServerWorkspaces()
       .then(serverAccounts => {
         if (cancelled) return
-        // Сервер — единственный источник истины по составу аккаунтов.
-        // Раньше здесь склеивались два множества (кэш + ответ сервера), из-за
-        // чего удалённый аккаунт навсегда оставался в localStorage и всплывал
-        // при каждом входе. Теперь кэш нужен только чтобы список не мигал на
-        // первой отрисовке: нет аккаунта на сервере — нет и в интерфейсе.
-        setDiscovered(prev => serverAccounts.map(fresh => {
-          const cached = prev.find(p => accountKey(p) === accountKey(fresh))
-          if (!cached) return fresh
-          // Если discovery по аккаунту временно вернул пусто (Notion прилёг,
-          // токен отвалился), показываем прошлые пространства — но сам состав
-          // всё равно берём из ответа сервера.
-          return {
-            ...fresh,
-            user_name: fresh.user_name || cached.user_name,
-            user_email: fresh.user_email || cached.user_email,
-            spaces: fresh.spaces && fresh.spaces.length > 0 ? fresh.spaces : cached.spaces,
-          }
-        }))
+        setDiscovered(serverAccounts)
       })
-      .catch(() => { /* сервер не ответил — оставляем кэш как был */ })
+      .catch(() => { /* no old browser cache is restored on failure */ })
       .finally(() => { if (!cancelled) setHydrating(false) })
     return () => { cancelled = true }
   }, [me?.username])
@@ -618,18 +589,14 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
   // Удаление аккаунта из пула. Раньше отсюда только фильтровался React-стейт:
   // файл аккаунта на сервере оставался жить, /admin/workspaces продолжал его
   // отдавать, и «удалённый» аккаунт возвращался при следующем входе.
-  const removeDiscovered = useCallback((key: string) => {
+  const removeDiscovered = useCallback(async (key: string) => {
     const acc = discoveredRef.current.find(a => matchesAccountKey(a, key))
+    if (!acc) return
+    if (!acc.user_email) throw new Error('Нет email аккаунта: серверное удаление невозможно, аккаунт не удалён')
+    await deleteAccount(acc.user_email)
+    forgetAccount(acc)
     setDiscovered(prev => prev.filter(a => !matchesAccountKey(a, key)))
-    const email = acc?.user_email
-    if (!email) {
-      console.warn('remove account: у аккаунта нет email, серверный файл не удалён', key)
-      return
-    }
-    deleteAccount(email).catch(err => {
-      console.error('remove account: сервер не удалил аккаунт', email, err)
-    })
-  }, [])
+  }, [setDiscovered])
 
   const accountCount = discovered.length
   const spaceCount = discovered.reduce((s, a) => s + (a.spaces?.length || 0), 0)

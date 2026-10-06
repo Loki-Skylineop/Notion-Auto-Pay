@@ -1,3 +1,4 @@
+import { forgetAccount, forgetSpace, sanitizePool } from '../workspaceLifecycle'
 import { useState, useEffect, useRef, useCallback } from 'react'
 import type { WorkspaceInfo as BaseWorkspaceInfo, McpServerInfo } from '../api'
 import { deleteAccount, connectMcp, createWorkspaces, deleteWorkspaces, disconnectMcp, discoverWorkspaces, setOverage, startTrial } from '../api'
@@ -748,6 +749,7 @@ function BulkActionModal({
           }
           const res = await deleteWorkspaces(r.token, [r.spaceId], r.userId, true)
           const deleted = res.deleted.find((s) => s.space_id === r.spaceId)
+          if (deleted?.excluded) onDeleted(r.spaceId)
           if (!deleted || (deleted.state !== 'success' && deleted.state !== 'in_progress')) {
             mark(r.key, 'error', res.error || res.errors?.join('; ') || 'удаление не подтверждено')
             return
@@ -755,7 +757,7 @@ function BulkActionModal({
           submittedDeletes.current.add(r.spaceId)
           okCount += 1
           mark(r.key, 'ok', deleted.state === 'success' ? 'удалено' : 'задача отправлена, ещё выполняется')
-          if (deleted.state === 'success') onDeleted(r.spaceId)
+          if (deleted.state === 'success' || deleted.state === 'in_progress') onDeleted(r.spaceId)
           return
         }
         if (mode === 'mcp') {
@@ -1222,7 +1224,7 @@ export function WorkspacePool({
   onPaid,
 }: {
   accounts: DiscoveredAccount[]
-  onRemoveAccount: (key: string) => void
+  onRemoveAccount: (key: string) => Promise<void>
   // Обновлённый список уходит в App: там он ложится в state и ровно один раз
   // записывается в localStorage.
   onPoolChange?: (next: DiscoveredAccount[]) => void
@@ -1230,7 +1232,15 @@ export function WorkspacePool({
   // Read-only pay tab for regular users: limits stay visible, writes are gated.
   readOnly?: boolean
 }) {
-  const [pool, setPool] = useState<DiscoveredAccount[]>(accounts)
+  const [pool, setPoolState] = useState<DiscoveredAccount[]>(() => sanitizePool(accounts))
+  const setPool = useCallback((update: DiscoveredAccount[] | ((prev: DiscoveredAccount[]) => DiscoveredAccount[])) => {
+    setPoolState(prev => sanitizePool(typeof update === 'function' ? update(prev) : update))
+  }, [])
+  const [removeBusy, setRemoveBusy] = useState(false)
+  const removeAccount = async (key: string) => {
+    try { await onRemoveAccount(key) }
+    catch (error) { window.alert(error instanceof Error ? error.message : 'Не удалось удалить аккаунт на сервере') }
+  }
   const poolRef = useRef(pool)
   useEffect(() => { setPool(accounts) }, [accounts])
   useEffect(() => { poolRef.current = pool }, [pool])
@@ -1284,7 +1294,7 @@ export function WorkspacePool({
   // Никакой записи в localStorage: отдаём свежий список наверх, чтобы состояние
   // App и кэш обновлялись из одного места.
   const persistPool = useCallback((next: DiscoveredAccount[]) => {
-    onPoolChange?.(next)
+    onPoolChange?.(sanitizePool(next))
   }, [onPoolChange])
 
   // Manual list refresh: re-discovers plans + counts for display only. Paying
@@ -1365,13 +1375,22 @@ export function WorkspacePool({
   const totalSpaces = pool.reduce((sum, acc) => sum + (acc.spaces?.length || 0), 0)
   const freeOnlyAccounts = getFreeOnlyAccounts(pool)
   const freeSpaces = freeOnlyAccounts.reduce((sum, acc) => sum + acc.spaces.length, 0)
-  const hideAllFree = () => {
+  const hideAllFree = async () => {
     if (readOnly || refreshing) return
     const targets = getFreeOnlyAccounts(poolRef.current)
     if (!targets.length) return
     if (!window.confirm(`Убрать из списка ${targets.length} аккаунтов, у которых все пространства Free?\n\nКак в «Убрать из списка»: аккаунты и их файлы будут удалены из серверного пула. Пространства в Notion не удаляются. Аккаунты с платными или неизвестными тарифами останутся.`)) return
     // Reuse precisely the same App callback as the individual AccountMenu action.
-    for (const acc of targets) onRemoveAccount(acc.user_email || acc.token_v2)
+    if (removeBusy) return
+    setRemoveBusy(true)
+    const errors: string[] = []
+    try {
+      for (const acc of targets) {
+        try { await onRemoveAccount(acc.user_email || acc.token_v2) }
+        catch (error) { errors.push(`${acc.user_email || 'Аккаунт'}: ${error instanceof Error ? error.message : 'ошибка удаления'}`) }
+      }
+    } finally { setRemoveBusy(false) }
+    if (errors.length) window.alert(`Не удалены с сервера:\n${errors.join('\n')}`)
   }
   const targetPlan = PLANS.find(p => p.id === (cfg?.plan || ''))
   const globalPlanName = targetPlan ? targetPlan.name : (cfg?.plan || '')
@@ -1516,7 +1535,7 @@ export function WorkspacePool({
                 </div>
                 <div className="flex items-center gap-0.5 shrink-0">
                   {!readOnly && <CreateWorkspaceMenu token={acc.token_v2} onCreated={() => refreshAccount(acc.token_v2)} />}
-                  {!readOnly && <AccountMenu token={acc.token_v2} onRemove={() => onRemoveAccount(key)} />}
+                  {!readOnly && <AccountMenu token={acc.token_v2} onRemove={() => { void removeAccount(key) }} />}
                 </div>
               </div>
 
@@ -1694,14 +1713,16 @@ export function WorkspacePool({
           pool={pool}
           onClose={() => setShowBulk(false)}
           onDeleted={(spaceId) => {
+            forgetSpace(spaceId)
             const next = poolRef.current.map((acc) => ({ ...acc, spaces: (acc.spaces || []).filter((s) => s.space_id !== spaceId) }))
-            poolRef.current = next
+            poolRef.current = sanitizePool(next)
             setPool(next)
             persistPool(next)
           }}
           onAccountDeleted={(email) => {
+            for (const acc of poolRef.current) if (acc.user_email?.trim().toLowerCase() === email) forgetAccount(acc)
             const next = poolRef.current.filter(a => a.user_email?.trim().toLowerCase() !== email)
-            poolRef.current = next
+            poolRef.current = sanitizePool(next)
             setPool(next)
             persistPool(next)
           }}
@@ -1763,16 +1784,27 @@ export function WorkspacePool({
                     (res) => {
                       setDelBusy(false)
                       const first = res.deleted && res.deleted.length > 0 ? res.deleted[0] : null
-                      if (res.error) {
-                        setDelErr(res.error)
+                      if (first?.excluded) {
+                        forgetSpace(sid)
+                        const next = sanitizePool(poolRef.current)
+                        poolRef.current = next
+                        setPool(next)
+                        persistPool(next)
+                      }
+                      if (res.error || res.errors?.length || !first) {
+                        setDelErr(res.error || res.errors?.join("; ") || "Сервер не подтвердил удаление")
                         return
                       }
                       if (first && first.state === 'failure') {
                         setDelErr('Notion сообщил, что задача удаления завершилась ошибкой')
                         return
                       }
+                      forgetSpace(sid)
+                      const next = sanitizePool(poolRef.current)
+                      poolRef.current = sanitizePool(next)
+                      setPool(next)
+                      persistPool(next)
                       setDelTarget(null)
-                      refreshAccount(t)
                     },
                     (e) => {
                       setDelBusy(false)

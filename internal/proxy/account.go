@@ -20,6 +20,8 @@ import (
 // fake Notion server (the real code path uses a TLS-fingerprinted
 // transport pinned to www.notion.so, which can't be repointed at httptest
 // URLs).
+var accountFilesMu sync.Mutex
+
 var (
 	quotaFetcher   = CheckQuota
 	modelsFetcher  = FetchModels
@@ -178,7 +180,18 @@ func (p *AccountPool) LoadFromDir(dir string) error {
 			log.Printf("[account] skip %s: %v", entry.Name(), err)
 			continue
 		}
-		if acc.TokenV2 == "" || acc.UserID == "" || acc.SpaceID == "" {
+		if accountTokenIsExcluded(acc.TokenV2) {
+			continue
+		}
+		if acc.TokenV2 != "" && acc.UserID != "" && (workspaceIsExcluded(acc.SpaceID) || acc.SpaceID == "") {
+			fresh, err := DiscoverWorkspacesFromToken(acc.TokenV2)
+			if err != nil || len(fresh.Spaces) == 0 {
+				continue
+			}
+			sp := fresh.Spaces[0]
+			acc.SpaceID, acc.SpaceName, acc.SpaceViewID, acc.PlanType = sp.SpaceID, sp.Name, sp.SpaceViewID, sp.PlanType
+		}
+		if acc.TokenV2 == "" || acc.UserID == "" || (acc.SpaceID == "" && workspaceExclusions.Load() != nil) {
 			log.Printf("[account] skip %s: missing required fields", entry.Name())
 			continue
 		}
@@ -245,7 +258,18 @@ func (p *AccountPool) ReloadFromDir(dir string) {
 		if err := json.Unmarshal(data, &acc); err != nil {
 			continue
 		}
-		if acc.TokenV2 == "" || acc.UserID == "" || acc.SpaceID == "" {
+		if accountTokenIsExcluded(acc.TokenV2) {
+			continue
+		}
+		if acc.TokenV2 != "" && acc.UserID != "" && (workspaceIsExcluded(acc.SpaceID) || acc.SpaceID == "") {
+			fresh, err := DiscoverWorkspacesFromToken(acc.TokenV2)
+			if err != nil || len(fresh.Spaces) == 0 {
+				continue
+			}
+			sp := fresh.Spaces[0]
+			acc.SpaceID, acc.SpaceName, acc.SpaceViewID, acc.PlanType = sp.SpaceID, sp.Name, sp.SpaceViewID, sp.PlanType
+		}
+		if acc.TokenV2 == "" || acc.UserID == "" || (acc.SpaceID == "" && workspaceExclusions.Load() != nil) {
 			continue
 		}
 		if known[acc.UserID] {
@@ -486,7 +510,7 @@ func (p *AccountPool) hasNoWorkspace(acc *Account) bool {
 // isUnusable folds quota-exhausted and no-workspace accounts into a
 // single "do not select" predicate used by every picker.
 func (p *AccountPool) isUnusable(acc *Account) bool {
-	return p.isQuotaExhausted(acc) || p.hasNoWorkspace(acc)
+	return (acc.SpaceID == "" && workspaceExclusions.Load() != nil) || workspaceIsExcluded(acc.SpaceID) || accountTokenIsExcluded(acc.TokenV2) || p.isQuotaExhausted(acc) || p.hasNoWorkspace(acc)
 }
 
 // applyWorkspaceCount records the latest probe result. Caller must NOT
@@ -676,48 +700,15 @@ func (p *AccountPool) isQuotaExhaustedRLock(acc *Account) bool {
 // RemoveAccount removes an account from the pool and deletes its JSON file from disk.
 // Used for free-plan accounts that are confirmed exhausted (e.g. premium feature unavailable).
 func (p *AccountPool) RemoveAccount(acc *Account) {
-	p.mu.Lock()
-	for i, a := range p.accounts {
-		if a == acc {
-			p.accounts = append(p.accounts[:i], p.accounts[i+1:]...)
-			break
-		}
-	}
-	p.mu.Unlock()
-
-	// Delete the JSON file from disk
-	dir := ""
-	if AppConfig != nil {
-		dir = AppConfig.Server.AccountsDir
-	}
-	if dir == "" {
+	if AppConfig == nil || AppConfig.Server.AccountsDir == "" {
+		p.RemoveAccountByEmail(acc.UserEmail)
 		return
 	}
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		path := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		var existing map[string]interface{}
-		if err := json.Unmarshal(data, &existing); err != nil {
-			continue
-		}
-		email, _ := existing["user_email"].(string)
-		if email == acc.UserEmail {
-			if err := os.Remove(path); err != nil {
-				log.Printf("[account] failed to delete %s: %v", path, err)
-			} else {
-				log.Printf("[account] deleted exhausted free account file: %s (%s)", path, acc.UserEmail)
-			}
-			break
+	if err := deleteAccountByEmail(p, AppConfig.Server.AccountsDir, acc.UserEmail); err != nil {
+		if os.IsNotExist(err) {
+			p.RemoveAccountByEmail(acc.UserEmail)
+		} else {
+			log.Printf("[account] permanent removal failed: %v", err)
 		}
 	}
 }
@@ -728,13 +719,17 @@ func (p *AccountPool) RemoveAccount(acc *Account) {
 func (p *AccountPool) RemoveAccountByEmail(email string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for i, a := range p.accounts {
-		if strings.EqualFold(a.UserEmail, email) {
-			p.accounts = append(p.accounts[:i], p.accounts[i+1:]...)
-			return true
+	kept := p.accounts[:0]
+	removed := false
+	for _, a := range p.accounts {
+		if strings.EqualFold(strings.TrimSpace(a.UserEmail), strings.TrimSpace(email)) {
+			removed = true
+		} else {
+			kept = append(kept, a)
 		}
 	}
-	return false
+	p.accounts = kept
+	return removed
 }
 
 // AvailableCount returns the number of accounts the pool can currently
@@ -880,6 +875,9 @@ func (p *AccountPool) RefreshAll(accountsDir string) {
 	sem := make(chan struct{}, concurrency)
 
 	for _, acc := range accs {
+		if accountTokenIsExcluded(acc.TokenV2) || workspaceIsExcluded(acc.SpaceID) || (acc.SpaceID == "" && workspaceExclusions.Load() != nil) {
+			continue
+		}
 		quota := acc.quotaSnapshot()
 		// Skip permanently exhausted accounts (free plan, no recovery possible)
 		if quota.PermanentlyExhausted {
@@ -1005,6 +1003,8 @@ func normalizeModelName(displayName string) string {
 
 // SaveAccounts persists current account state (models, quota) back to JSON files
 func (p *AccountPool) SaveAccounts(dir string) {
+	accountFilesMu.Lock()
+	defer accountFilesMu.Unlock()
 	p.mu.RLock()
 	accs := make([]*Account, len(p.accounts))
 	copy(accs, p.accounts)
@@ -1097,6 +1097,8 @@ func (p *AccountPool) SaveAccounts(dir string) {
 // Returns an error if no on-disk file matches acc.UserEmail; that is a
 // real-world signal someone deleted the account file out from under us.
 func saveAccountFile(dir string, acc *Account) error {
+	accountFilesMu.Lock()
+	defer accountFilesMu.Unlock()
 	if acc == nil {
 		return fmt.Errorf("saveAccountFile: nil account")
 	}

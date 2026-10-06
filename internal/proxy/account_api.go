@@ -231,6 +231,11 @@ func DiscoverAccountFromToken(tokenV2 string) (*Account, error) {
 
 // SaveAccountToFile writes an Account to a JSON file in the accounts directory.
 func SaveAccountToFile(acc *Account, dir string) (string, error) {
+	accountFilesMu.Lock()
+	defer accountFilesMu.Unlock()
+	if accountTokenIsExcluded(acc.TokenV2) {
+		return "", fmt.Errorf("account was permanently removed from the pool")
+	}
 	// Generate a safe filename from the email or username
 	name := acc.UserEmail
 	if name == "" {
@@ -330,32 +335,7 @@ func (p *AccountPool) AddAccount(acc *Account) {
 
 // DeleteAccountFile removes the JSON file for an account from the accounts directory.
 func DeleteAccountFile(email, dir string) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("read accounts dir: %w", err)
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
-			continue
-		}
-		path := filepath.Join(dir, entry.Name())
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		var existing map[string]interface{}
-		if err := json.Unmarshal(data, &existing); err != nil {
-			continue
-		}
-		if e, _ := existing["user_email"].(string); e == email {
-			if err := os.Remove(path); err != nil {
-				return fmt.Errorf("delete file %s: %w", entry.Name(), err)
-			}
-			log.Printf("[account] deleted file: %s", entry.Name())
-			return nil
-		}
-	}
-	return fmt.Errorf("account file not found for %s", email)
+	return deleteAccountByEmail(nil, dir, email)
 }
 
 // HandleAddAccount accepts a token_v2, discovers account info via Notion APIs,
@@ -459,17 +439,10 @@ func HandleDeleteAccount(pool *AccountPool, accountsDir string, auth *DashboardA
 			return
 		}
 
-		// Remove from pool
-		if !pool.RemoveAccountByEmail(email) {
-			w.WriteHeader(http.StatusNotFound)
-			json.NewEncoder(w).Encode(map[string]string{"error": "account not found in pool"})
+		if err := deleteAccountByEmail(pool, accountsDir, email); err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
 			return
-		}
-
-		// Delete file
-		if err := DeleteAccountFile(email, accountsDir); err != nil {
-			log.Printf("[delete-account] file deletion warning: %v", err)
-			// Account removed from pool but file not deleted — not fatal
 		}
 
 		log.Printf("[delete-account] removed: %s", email)

@@ -145,7 +145,7 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	// Delete workspaces. Replays the web client's single async task per space
 	// (enqueueTask{deleteSpace}) and then polls getTasks until Notion reports
 	// success. Irreversible. See internal/proxy/workspace_delete.go.
-	mux.HandleFunc("/admin/workspaces/delete", proxy.HandleDeleteWorkspaces(dashAuth))
+	mux.HandleFunc("/admin/workspaces/delete", proxy.HandleDeleteWorkspaces(dashAuth, pool))
 	// Attach an MCP server to a single workspace. Replays the exact four-step
 	// sequence the Notion web client performs: validateMcpConnection ->
 	// createAgentChatModule -> postWorkflowsMcpServerConnect ->
@@ -271,6 +271,9 @@ func main() {
 	accountsDir := cfg.Server.AccountsDir
 	tokenFile := cfg.Server.TokenFile
 
+	if err := proxy.ConfigureWorkspaceExclusions(accountsDir); err != nil {
+		log.Fatalf("workspace exclusions: %v", err)
+	}
 	pool := proxy.NewAccountPool()
 
 	if _, err := os.Stat(accountsDir); err == nil {
@@ -315,6 +318,7 @@ func main() {
 	// dashboard). Re-tokenizes the saved card per workspace so it works
 	// with the browser closed.
 	autoPay := proxy.NewAutoPayManager(pool, accountsDir, cfg.Stripe.Key)
+	proxy.SetWorkspaceAutoPay(autoPay)
 	autoPay.Start()
 
 	// Async batch-register store + provider registry.

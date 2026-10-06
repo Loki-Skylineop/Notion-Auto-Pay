@@ -62,9 +62,33 @@ func HandleListWorkspaces(pool *AccountPool, auth *DashboardAuth) http.HandlerFu
 		// ones we could resolve. Always emit a (possibly empty) JSON array.
 		out := make([]*AccountWorkspaces, 0, len(results))
 		for _, aw := range results {
-			if aw != nil {
-				out = append(out, aw)
+			if aw == nil || accountTokenIsExcluded(aw.TokenV2) {
+				continue
 			}
+			visible := aw.Spaces[:0]
+			for _, space := range aw.Spaces {
+				if !workspaceIsExcluded(space.SpaceID) {
+					visible = append(visible, space)
+				}
+			}
+			aw.Spaces = visible
+			pool.mu.RLock()
+			var current *Account
+			for _, account := range pool.accounts {
+				if account.TokenV2 == aw.TokenV2 {
+					current = account
+					break
+				}
+			}
+			needsPrimary := current != nil && (current.SpaceID == "" || workspaceIsExcluded(current.SpaceID))
+			pool.mu.RUnlock()
+			if current == nil {
+				continue
+			}
+			if needsPrimary && len(visible) > 0 {
+				pool.repointPrimaryWorkspace(current, visible[0])
+			}
+			out = append(out, aw)
 		}
 
 		if err := json.NewEncoder(w).Encode(out); err != nil {

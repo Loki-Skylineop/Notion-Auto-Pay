@@ -60,9 +60,10 @@ const (
 // state, so a queued-but-unconfirmed deletion is reported honestly instead of
 // being flattened into a plain success.
 type DeletedWorkspace struct {
-	SpaceID string `json:"space_id"`
-	TaskID  string `json:"task_id,omitempty"`
-	State   string `json:"state,omitempty"`
+	SpaceID  string `json:"space_id"`
+	TaskID   string `json:"task_id,omitempty"`
+	State    string `json:"state,omitempty"`
+	Excluded bool   `json:"excluded,omitempty"`
 }
 
 // DeleteWorkspacesResponse is the /admin/workspaces/delete payload. Like the
@@ -205,7 +206,7 @@ func wsAwaitDeleteTask(tokenV2, userID, spaceID, taskID string) string {
 // HandleDeleteWorkspaces deletes one or more workspaces for one account token.
 // Deletions run sequentially for the same reason creations do: they all write
 // through that account's single user_root record.
-func HandleDeleteWorkspaces(auth *DashboardAuth) http.HandlerFunc {
+func HandleDeleteWorkspaces(auth *DashboardAuth, pools ...*AccountPool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 
@@ -290,12 +291,20 @@ func HandleDeleteWorkspaces(auth *DashboardAuth) http.HandlerFunc {
 				out.Errors = append(out.Errors, err.Error())
 				continue
 			}
+			if err := excludeWorkspace(spaceID); err != nil {
+				out.Errors = append(out.Errors, "Не удалось сохранить исключение пространства: "+err.Error())
+				continue
+			}
+			if len(pools) > 0 && pools[0] != nil {
+				pools[0].forgetPrimaryWorkspace(spaceID)
+			}
 			state := wsAwaitDeleteTask(tokenV2, userID, spaceID, taskID)
 			log.Printf("[workspace] deleted space=%s task=%s state=%s", truncate(spaceID, 8), truncate(taskID, 8), state)
 			out.Deleted = append(out.Deleted, DeletedWorkspace{
-				SpaceID: spaceID,
-				TaskID:  taskID,
-				State:   state,
+				SpaceID:  spaceID,
+				TaskID:   taskID,
+				State:    state,
+				Excluded: true,
 			})
 			if state == "failure" {
 				out.Errors = append(out.Errors, fmt.Sprintf("space %s: Notion reported the delete task as failed", truncate(spaceID, 8)))
