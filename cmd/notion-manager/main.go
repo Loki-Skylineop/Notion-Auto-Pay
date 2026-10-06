@@ -213,8 +213,13 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	rp := proxy.NewReverseProxy(pool)
 	mux.HandleFunc("/proxy/start", proxy.HandleProxyStart(pool, rp, dashAuth))
 
-	// Catch-all: reverse proxy for paths with valid np_session, 404 for everything else
+	// The bare server address opens the dashboard. Other paths and non-navigation
+	// requests keep their existing reverse-proxy behavior.
 	mux.Handle("/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+			http.Redirect(w, r, "/dashboard/", http.StatusFound)
+			return
+		}
 		rp.ServeHTTP(w, r)
 	}))
 

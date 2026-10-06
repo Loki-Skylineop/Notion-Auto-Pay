@@ -173,3 +173,43 @@ func TestCORSMiddleware_AllowsAIRIHeaders(t *testing.T) {
 		}
 	}
 }
+
+func TestNewMux_RootRedirectsToDashboard(t *testing.T) {
+	originalConfig := proxy.AppConfig
+	proxy.AppConfig = proxy.DefaultConfig()
+	t.Cleanup(func() { proxy.AppConfig = originalConfig })
+	pool := proxy.NewAccountPool()
+	auth := proxy.NewDashboardAuth("", "sk-test")
+	deps := &proxy.RegisterJobsDeps{Pool: pool, Auth: auth}
+	handler := apiKeyAuthMiddleware("sk-test", newMux(pool, "", "sk-test", auth, proxy.InitUsageStats(""), deps, proxy.NewAutoPayManager(pool, "", "")))
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		for _, path := range []string{"/", "/?from=bookmark"} {
+			for _, cookie := range []string{"", "np_session=old-session"} {
+				rec := httptest.NewRecorder()
+				req := httptest.NewRequest(method, path, nil)
+				if cookie != "" {
+					req.Header.Set("Cookie", cookie)
+				}
+				handler.ServeHTTP(rec, req)
+				if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/dashboard/" {
+					t.Fatalf("%s %s: status=%d location=%q", method, path, rec.Code, rec.Header().Get("Location"))
+				}
+			}
+		}
+	}
+	for _, tc := range []struct {
+		method, path string
+		want         int
+	}{
+		{http.MethodGet, "/dashboard/", http.StatusOK},
+		{http.MethodGet, "/v1/airi/models", http.StatusUnauthorized},
+		{http.MethodGet, "/not-a-route", http.StatusNotFound},
+		{http.MethodPost, "/", http.StatusNotFound},
+	} {
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, httptest.NewRequest(tc.method, tc.path, nil))
+		if rec.Code != tc.want {
+			t.Fatalf("%s %s: status=%d want=%d", tc.method, tc.path, rec.Code, tc.want)
+		}
+	}
+}
