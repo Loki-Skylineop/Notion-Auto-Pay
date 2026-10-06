@@ -545,7 +545,7 @@ export function StepsTree({ steps }: { steps: ChatStep[] }) {
 // user's turn and the answer, mirroring how Notion renders its steps. Expanded
 // by default; the small header folds long lists away. (Replaces the old
 // collapsed-by-default "Шаги агента · N" blob.)
-export function StepsBlock({ steps, defaultOpen = true }: { steps: ChatStep[]; defaultOpen?: boolean }) {
+export function StepsBlock({ steps, defaultOpen = false }: { steps: ChatStep[]; defaultOpen?: boolean }) {
   const shown = visibleSteps(steps)
   const [open, setOpen] = useState(defaultOpen)
   if (shown.length === 0) return null
@@ -612,16 +612,16 @@ export function renderInline(text: string, keyPrefix: string): React.ReactNode[]
   const nodes: React.ReactNode[] = []
   // Notion responses may escape link delimiters: \\[label\\](url).
   // Accept both forms without unescaping code or unrelated plain text.
-  const regex = /\*\*([^*]+)\*\*|\*([^*]+)\*|`([^`]+)`|\\?\[([^\]\n]+?)\\?\]\\?\(([^)\n]+?)\\?\)/g
+  const regex = /\*\*([^*]+)\*\*|\*([^*]+)\*|`([^`]+)`|\\*\[([^\]\n]+?)\\*\]\\*\(([^)\n]+?)\\*\)|(\\*\[\\*\^call_[^\]\r\n]*(?:\]|$))/g
   let last = 0
   let m: RegExpExecArray | null
   let i = 0
   while ((m = regex.exec(text)) !== null) {
     if (m.index > last) nodes.push(text.slice(last, m.index))
     if (m[1] !== undefined) {
-      nodes.push(<strong key={`${keyPrefix}-b${i}`} className="text-[#e8e8e8] font-medium">{m[1]}</strong>)
+      nodes.push(<strong key={`${keyPrefix}-b${i}`} className="text-[#e8e8e8] font-medium">{renderInline(m[1], `${keyPrefix}-bold${i}`)}</strong>)
     } else if (m[2] !== undefined) {
-      nodes.push(<em key={`${keyPrefix}-i${i}`}>{m[2]}</em>)
+      nodes.push(<em key={`${keyPrefix}-i${i}`}>{renderInline(m[2], `${keyPrefix}-em${i}`)}</em>)
     } else if (m[3] !== undefined) {
       nodes.push(
         <code key={`${keyPrefix}-c${i}`} className="px-1 py-0.5 rounded bg-white/[0.06] text-[#aaa] text-[0.85em] font-mono wrap-anywhere">
@@ -1087,15 +1087,17 @@ export const MessageRow = memo(function MessageRow({
 // step tree, then the answer typing out with a blinking caret. When the turn
 // finishes this is replaced by a normal (caret-free) MessageRow.
 export function StreamingRow({ status, steps, liveText }: { status: ChatStatus | null; steps: ChatStep[]; liveText: string }) {
-  const phase = liveText ? 'Печатает…' : status?.label || 'Думаю…'
+  const usingTool = status?.kind === 'tool' || /использую инструмент/i.test(status?.label || '')
+  const phase = liveText ? 'Печатает…' : usingTool ? 'Использую инструмент' : status?.label || 'Думаю…'
   return (
-    <div className="flex gap-3 min-w-0">
+    <>
+      {steps.length > 0 ? <div className="ml-8 mb-2"><StepsBlock steps={steps} defaultOpen={false} /></div> : null}
+      <div className="flex gap-3 min-w-0">
       <div className="shrink-0 mt-0.5 w-5 h-5 rounded-full bg-white/[0.05] border border-white/[0.09] flex items-center justify-center">
         <span className="inline-block w-2.5 h-2.5 rounded-full border-2 border-notion-blue border-t-transparent animate-spin" />
       </div>
       <div className="min-w-0 flex-1">
-        <div className="mb-1.5 text-[12px] font-medium text-[#666]">{phase}</div>
-        {steps.length > 0 ? <div className="mb-2"><StepsTree steps={steps} /></div> : null}
+        <div role="status" className="mb-1.5 text-[12px] font-medium text-[#666]">{phase}</div>
         {liveText ? (
           <div className="text-[13.5px] leading-relaxed text-[#8a8a8a]">
             <MessageBody text={liveText} />
@@ -1110,6 +1112,7 @@ export function StreamingRow({ status, steps, liveText }: { status: ChatStatus |
         )}
       </div>
     </div>
+    </>
   )
 }
 
