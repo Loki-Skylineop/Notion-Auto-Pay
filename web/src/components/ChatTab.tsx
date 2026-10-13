@@ -2064,7 +2064,6 @@ export function ChatTab({
             <StreamingRow
               status={liveOwner === viewKey ? status : null}
               steps={liveOwner === viewKey ? liveSteps : []}
-              liveText={liveOwner === viewKey ? liveText : ''}
             />
           ) : null}
         </div>

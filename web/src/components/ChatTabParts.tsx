@@ -1083,36 +1083,31 @@ export const MessageRow = memo(function MessageRow({
   )
 })
 
-// The live assistant turn while the agent is still working. It makes the
-// current state obvious: thinking dots before any text arrives, the agent's
-// step tree, then the answer typing out with a blinking caret. When the turn
-// finishes this is replaced by a normal (caret-free) MessageRow.
-export function StreamingRow({ status, steps, liveText }: { status: ChatStatus | null; steps: ChatStep[]; liveText: string }) {
+// Progress only: the transcript is the single place that renders answer text.
+// Text events still feed the live buffer for stop/recovery, but never create
+// a second answer preview or a redundant typing status under the transcript.
+export function StreamingRow({ status, steps }: { status: ChatStatus | null; steps: ChatStep[] }) {
   const usingTool = status?.kind === 'tool' || /использую инструмент/i.test(status?.label || '')
-  const phase = liveText ? 'Печатает…' : usingTool ? 'Использую инструмент' : status?.label || 'Думаю…'
+  const writing = status?.kind === 'text' || /печата|typing/i.test(status?.label || '')
+  const phase = usingTool ? 'Использую инструмент' : writing ? null : status?.label || 'Думаю…'
   return (
     <>
       {steps.length > 0 ? <div className="ml-8 mb-2"><StepsBlock steps={steps} defaultOpen={false} /></div> : null}
-      <div className="flex gap-3 min-w-0">
-      <div className="shrink-0 mt-0.5 w-5 h-5 rounded-full bg-white/[0.05] border border-white/[0.09] flex items-center justify-center">
-        <span className="inline-block w-2.5 h-2.5 rounded-full border-2 border-notion-blue border-t-transparent animate-spin" />
-      </div>
-      <div className="min-w-0 flex-1">
-        <div role="status" className="mb-1.5 text-[12px] font-medium text-[#666]">{phase}</div>
-        {liveText ? (
-          <div className="text-[13.5px] leading-relaxed text-[#8a8a8a]">
-            <MessageBody text={liveText} />
-            <span className="stream-caret" />
+      {phase ? (
+        <div className="flex gap-3 min-w-0">
+          <div className="shrink-0 mt-0.5 w-5 h-5 rounded-full bg-white/[0.05] border border-white/[0.09] flex items-center justify-center">
+            <span className="inline-block w-2.5 h-2.5 rounded-full border-2 border-notion-blue border-t-transparent animate-spin" />
           </div>
-        ) : (
-          <div className="flex items-center gap-1.5 py-1">
-            <span className="w-1.5 h-1.5 rounded-full bg-[#444] animate-bounce" style={dotDelay0} />
-            <span className="w-1.5 h-1.5 rounded-full bg-[#444] animate-bounce" style={dotDelay1} />
-            <span className="w-1.5 h-1.5 rounded-full bg-[#444] animate-bounce" style={dotDelay2} />
+          <div className="min-w-0 flex-1">
+            <div role="status" className="mb-1.5 text-[12px] font-medium text-[#666]">{phase}</div>
+            <div className="flex items-center gap-1.5 py-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-[#444] animate-bounce" style={dotDelay0} />
+              <span className="w-1.5 h-1.5 rounded-full bg-[#444] animate-bounce" style={dotDelay1} />
+              <span className="w-1.5 h-1.5 rounded-full bg-[#444] animate-bounce" style={dotDelay2} />
+            </div>
           </div>
-        )}
-      </div>
-    </div>
+        </div>
+      ) : null}
     </>
   )
 }
