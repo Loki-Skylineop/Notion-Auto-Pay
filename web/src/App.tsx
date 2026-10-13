@@ -103,7 +103,7 @@ function TabBar({ tab, onChange, tabs }: { tab: TabId; onChange: (t: TabId) => v
 // Hero band: brand capsule (top-left), primary actions (top-right), centered
 // tab pill + stats. Subtle white/blue/violet glow over the black canvas. A
 // small chevron above the tab pill collapses the whole band to free up space —
-// when collapsed only the chevron + tab pill remain.
+// when collapsed only the chevron remains; the active tab stays mounted.
 function Hero({
   onAdd,
   accountCount,
@@ -128,7 +128,7 @@ function Hero({
   onToggleCollapse?: () => void
 }) {
   return (
-    <header className="relative overflow-hidden border-b border-white/[0.06]">
+    <header className="relative shrink-0 overflow-hidden border-b border-white/[0.06]">
       {!collapsed && (
         <div aria-hidden="true" className="absolute inset-0 pointer-events-none overflow-hidden">
           <div className="hero-glow absolute -top-20 left-0 right-0 mx-auto w-[600px] h-[300px] rounded-full" style={HERO_GLOW} />
@@ -139,9 +139,9 @@ function Hero({
 
       <div aria-hidden="true" className="hero-sweep absolute bottom-0 left-0 right-0 h-px pointer-events-none" />
 
-      <div className={`relative max-w-4xl mx-auto px-5 sm:px-8 ${collapsed ? 'pt-2 pb-2' : 'pt-6 pb-5'}`}>
+      <div className={`relative max-w-4xl mx-auto px-5 sm:px-8 ${collapsed ? 'py-0' : 'pt-4 pb-3 sm:pt-6 sm:pb-5'}`}>
         {!collapsed && (
-          <div className="flex items-center justify-between mb-6">
+          <div className="flex items-center justify-between mb-3 sm:mb-6">
             <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-white/[0.08] bg-white/[0.02]">
               <span className="brand-star text-[11px] text-white/80">✦</span>
               <span className="text-[11px] text-text-muted tracking-wide font-mono">Notion Auto Pay</span>
@@ -175,12 +175,14 @@ function Hero({
                 onClick={onToggleCollapse}
                 title={collapsed ? 'Развернуть шапку' : 'Свернуть шапку'}
                 aria-label={collapsed ? 'Развернуть шапку' : 'Свернуть шапку'}
-                className="-mb-0.5 p-1 rounded-md text-text-muted hover:text-text-secondary hover:bg-white/[0.04] transition-colors bg-transparent border-none cursor-pointer"
+                type="button"
+                aria-expanded={!collapsed}
+                className="min-w-11 min-h-11 flex items-center justify-center rounded-md text-text-muted hover:text-text-secondary hover:bg-white/[0.04] focus-visible:outline focus-visible:outline-2 focus-visible:outline-white/60 transition-colors bg-transparent border-none cursor-pointer"
               >
                 <IconChevron up={!collapsed} />
               </button>
             )}
-            <TabBar tab={tab} onChange={onTab} tabs={tabs} />
+            {!collapsed && <TabBar tab={tab} onChange={onTab} tabs={tabs} />}
             {!collapsed && (accountCount > 0 || spaceCount > 0) && (
               <div className="flex items-center gap-6 mt-1">
                 <Stat value={accountCount} label="аккаунтов" />
@@ -607,7 +609,7 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
   }, [isAdmin, tab])
 
   return (
-    <div className="min-h-screen">
+    <div className={tab === 'chat' ? 'h-dvh min-h-0 flex flex-col overflow-hidden' : 'min-h-screen'}>
       <Hero
         onAdd={() => setShowAddModal(true)}
         accountCount={accountCount}
@@ -621,7 +623,7 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
         onToggleCollapse={() => setHeaderCollapsed(v => !v)}
       />
 
-      <main className={`px-5 sm:px-8 py-7 ${tab === 'chat' ? 'w-full' : 'max-w-4xl mx-auto'}`}>
+      <main className={tab === 'chat' ? 'w-full flex-1 min-h-0 overflow-hidden px-2 py-2 sm:px-8 sm:py-4' : 'px-5 sm:px-8 py-7 max-w-4xl mx-auto'}>
         {/* Обе вкладки смонтированы всегда и просто прячутся через hidden. Так
             чат помнит, какой диалог был открыт, а идущий ход агента не рвётся,
             когда пользователь уходит на «Оплату» и возвращается обратно. */}
@@ -648,7 +650,7 @@ function Dashboard({ onLogout, me }: { onLogout?: () => void; me: Me | null }) {
             </>
           )}
         </div>
-        <div hidden={tab !== 'chat'}>
+        <div hidden={tab !== 'chat'} className="h-full min-h-0">
           {/* Своя граница ошибок на чат: его падение больше не гасит вкладку «Оплата». */}
           <ErrorBoundary>
             {me ? <ChatTab key={me.username || '@open-dashboard'} owner={me.username || '@open-dashboard'} accountsReady={!hydrating} accounts={discovered} active={tab === 'chat'} onPoolChange={setDiscovered} /> : <div className="text-[12px] text-text-muted">Определяю аккаунт панели… Если сервер недоступен, обновите страницу после восстановления связи.</div>}

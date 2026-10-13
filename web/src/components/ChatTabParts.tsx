@@ -13,7 +13,8 @@ import {
 import type { DiscoveredAccount } from './WorkspacePool'
 import { Dropdown } from './Dropdown'
 
-export const shellStyle: React.CSSProperties = { height: 'calc(100dvh - 168px)', minHeight: '420px' }
+// Fill the space actually left by the header, including its collapsed state.
+export const shellStyle: React.CSSProperties = { height: '100%', minHeight: 0 }
 
 // How many messages to render initially, and how many more to reveal each time
 // the user scrolls to the top of the log (lazy loading keeps long threads fast).

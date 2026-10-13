@@ -1839,7 +1839,7 @@ export function ChatTab({
   }
 
   return (
-    <div className="relative mx-auto" style={isDesktop ? { width: outerWidth, maxWidth: '100%' } : undefined}>
+    <div className="relative mx-auto h-full min-h-0" style={isDesktop ? { width: outerWidth, maxWidth: '100%' } : undefined}>
     <div className="relative flex min-h-0 overflow-hidden rounded-xl border border-white/[0.08]" style={shellStyle}>
       {/* Mobile drawer backdrop */}
       {sidebarOpen ? (
