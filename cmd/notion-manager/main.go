@@ -130,9 +130,9 @@ func newMux(pool *proxy.AccountPool, accountsDir string, apiKey string, dashAuth
 	// Subscription payment endpoints
 	mux.HandleFunc("/admin/subscribe", proxy.HandleSubscribe(accountsDir, dashAuth))
 	mux.HandleFunc("/admin/subscribe/checkout", proxy.HandleSubscribeCheckout(proxy.AppConfig.Stripe.Key, dashAuth))
-	// Free trial activation (no card at all). Replays the payload captured
-	// from the Notion web client: updateSubscription + trialData + trialEnd.
+	// Trial offers: original no-card flow and two explicitly selected payment presets.
 	mux.HandleFunc("/admin/subscribe/trial", proxy.HandleSubscribeTrial(dashAuth))
+	mux.HandleFunc("/admin/subscribe/trial-defaults", proxy.HandleTrialDefaults(dashAuth))
 
 	// Workspace discovery endpoint
 	mux.HandleFunc("/admin/discover", proxy.HandleDiscoverWorkspaces(dashAuth))

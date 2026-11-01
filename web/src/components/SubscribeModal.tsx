@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { fetchAutoPayConfig, paySpaceWithSavedCard } from '../autopay'
-import { startTrial } from '../api'
+import { fetchTrialDefaults, startTrial } from '../api'
+import type { TrialMethod } from '../api'
 
 declare global {
   interface Window {
@@ -47,6 +48,16 @@ export const TRIAL_DAYS = [7, 14, 30]
 // План, который улетал из веб-клиента вместе с триалом.
 export const TRIAL_DEFAULT_PLAN = 'business_monthly_eur_202505'
 
+const SCRIPT_TRIAL_PLAN = 'business_monthly_usd_202505'
+export const SCRIPT_TRIAL_PLANS: PlanOption[] = [
+  { id: SCRIPT_TRIAL_PLAN, name: 'Business · 14 дней', price: '24 USD', interval: '/мес после триала' },
+]
+export const TRIAL_PRESETS: { id: TrialMethod; title: string; description: string }[] = [
+  { id: 'sidebar', title: 'Способ 1 · Без карты', description: 'Прежний вариант: карта не передаётся.' },
+  { id: 'script33', title: 'Способ 2 · notion_trial (2)', description: 'Без выбранного пространства — самое новое Free.' },
+  { id: 'script33_v2', title: 'Способ 3 · notion_trial_14_v2', description: 'Без выбранного пространства — самое новое. Платное не изменяется.' },
+]
+
 export function SubscribeModal({
   onClose,
   onSuccess,
@@ -61,7 +72,7 @@ export function SubscribeModal({
   workspaceName?: string
 }) {
   const [token, setToken] = useState(initialToken || '')
-  const [plan, setPlan] = useState(PLANS[0].id)
+  const [plan, setPlan] = useState(stripeEnvOk() ? PLANS[0].id : TRIAL_DEFAULT_PLAN)
   const [country, setCountry] = useState('DE')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
@@ -87,6 +98,26 @@ export function SubscribeModal({
   const [trialDays, setTrialDays] = useState(14)
   const [trialCaptcha, setTrialCaptcha] = useState('')
   const [trialLoading, setTrialLoading] = useState(false)
+  const [trialMethod, setTrialMethod] = useState<TrialMethod>('sidebar')
+  const [trialPaymentID, setTrialPaymentID] = useState('')
+  const [trialCountry, setTrialCountry] = useState('')
+  const [trialRenewalConfirmed, setTrialRenewalConfirmed] = useState(false)
+  const trialDefaultsEdited = useRef({ payment: false, country: false })
+  useEffect(() => {
+    let active = true
+    fetchTrialDefaults().then(defaults => {
+      if (!active) return
+      if (!trialDefaultsEdited.current.payment && defaults.payment_method_id) setTrialPaymentID(defaults.payment_method_id)
+      if (!trialDefaultsEdited.current.country && defaults.country) setTrialCountry(defaults.country)
+    }).catch(() => { /* Defaults are optional; manual entry remains available. */ })
+    return () => { active = false }
+  }, [])
+  const trialNeedsPayment = trialMethod !== 'sidebar'
+  const trialPaymentValid = /^pm_[A-Za-z0-9]{1,128}$/.test(trialPaymentID.trim())
+  const trialCountryValid = /^[A-Z]{2}$/.test(trialCountry)
+  const requestedTrialDays = trialNeedsPayment ? 14 : trialDays
+  const busy = loading || savedLoading || trialLoading
+  const trialInFlight = useRef(false)
   const cardRef = useRef<HTMLDivElement>(null)
   // IMPORTANT: a single Stripe instance must be shared between the Card Element
   // and createPaymentMethod. Creating a second window.Stripe(...) for the
@@ -97,13 +128,22 @@ export function SubscribeModal({
   const cardElementRef = useRef<any>(null)
   const tokenRef = useRef<HTMLTextAreaElement>(null)
 
+  function selectTrialPreset(next: TrialMethod) {
+    if (busy || result) return
+    setTrialMethod(next)
+    setPlan(next === 'sidebar' ? TRIAL_DEFAULT_PLAN : SCRIPT_TRIAL_PLAN)
+    setTrialDays(14)
+    setTrialRenewalConfirmed(false)
+    setError('')
+  }
+
   useEffect(() => { if (!initialToken) tokenRef.current?.focus() }, [initialToken])
 
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape' && !busy) onClose() }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [onClose])
+  }, [onClose, busy])
 
   // Load the server-saved card so we can show "···· 1234" and offer to pay with
   // it. Best-effort — if it fails we just hide the saved-card block.
@@ -161,11 +201,16 @@ export function SubscribeModal({
     }
   }
 
-  // Триал без карты. Сервер повторяет запрос из HAR: POST
-  // /api/v3/updateSubscription с trialData + trialEnd и без paymentMethodId.
+  // Each preset is submitted once by the UI; card-upfront presets require consent.
   const handleTrial = async () => {
+    if (trialInFlight.current) return
     const trimmedToken = token.trim()
     if (!trimmedToken) { setError('token_v2 пуст'); return }
+    if (trialNeedsPayment && (!trialPaymentValid || !trialCountryValid || !trialRenewalConfirmed)) {
+      setError('Укажите свой paymentMethodId, реальную страну плательщика и подтвердите условия продления.')
+      return
+    }
+    trialInFlight.current = true
     setTrialLoading(true)
     setError('')
     setResult(null)
@@ -173,9 +218,15 @@ export function SubscribeModal({
       const r = await startTrial({
         token_v2: trimmedToken,
         space_id: spaceId || '',
-        plan,
-        days: trialDays,
+        plan: trialNeedsPayment ? SCRIPT_TRIAL_PLAN : plan,
+        days: requestedTrialDays,
         captcha_token: trialCaptcha.trim(),
+        trial_method: trialMethod,
+        ...(trialNeedsPayment ? {
+          payment_method_id: trialPaymentID.trim(),
+          country: trialCountry,
+          confirm_auto_renew: trialRenewalConfirmed,
+        } : {}),
       })
       if (r.error) {
         setError(r.error)
@@ -187,6 +238,7 @@ export function SubscribeModal({
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Ошибка запроса')
     } finally {
+      trialInFlight.current = false
       setTrialLoading(false)
     }
   }
@@ -275,33 +327,37 @@ export function SubscribeModal({
   }
 
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={onClose}>
+    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => { if (!busy) onClose() }}>
       <div className="w-full max-w-lg bg-bg-card border border-border rounded-2xl shadow-modal p-6 max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-[18px] font-semibold tracking-tight text-text-primary">{workspaceName ? `Оплатить · ${workspaceName}` : 'Оплатить подписку Notion'}</h2>
-          <button onClick={onClose} className="w-7 h-7 flex items-center justify-center rounded-full text-text-muted hover:text-text-primary hover:bg-bg-secondary bg-transparent border-none cursor-pointer text-lg leading-none">×</button>
+          <button onClick={onClose} disabled={busy} aria-label="Закрыть окно оплаты" className="w-7 h-7 flex items-center justify-center rounded-full text-text-muted hover:text-text-primary hover:bg-bg-secondary bg-transparent border-none cursor-pointer text-lg leading-none">×</button>
         </div>
 
         <div className="text-[13px] text-text-secondary mb-4">
           {workspaceName
-            ? <p>Оформление подписки для пространства <span className="text-text-primary font-medium">{workspaceName}</span>. Выберите план и введите данные карты.</p>
-            : <p>Вставьте <code className="font-mono bg-bg-secondary px-1.5 py-0.5 rounded text-[12px] text-text-primary">token_v2</code>, выберите план и введите данные карты.</p>}
+            ? <p>Оформление подписки для пространства <span className="text-text-primary font-medium">{workspaceName}</span>. Выберите оплату картой или один из вариантов триала.</p>
+            : <p>Вставьте <code className="font-mono bg-bg-secondary px-1.5 py-0.5 rounded text-[12px] text-text-primary">token_v2</code>, выберите способ оплаты или вариант триала.</p>}
         </div>
 
         <div className="flex gap-2 mb-4">
           <button
             type="button"
-            onClick={() => { setMethod('card'); setError('') }}
-            className={`flex-1 px-3 py-2 rounded-lg border text-[12px] font-medium cursor-pointer transition-all ${method === 'card' ? 'border-text-primary bg-white/5 text-text-primary' : 'border-border bg-bg-card text-text-secondary hover:border-hairline-strong'}`}
+            disabled={busy || !!result}
+            aria-pressed={method === 'card'}
+            onClick={() => { setMethod('card'); if (!PLANS.some(p => p.id === plan)) setPlan(PLANS[0].id); setError('') }}
+            className={`flex-1 min-h-11 px-3 py-2 rounded-lg border text-sm font-medium cursor-pointer transition-all ${method === 'card' ? 'border-text-primary bg-white/5 text-text-primary' : 'border-border bg-bg-card text-text-secondary hover:border-hairline-strong'}`}
           >
             Картой
           </button>
           <button
             type="button"
-            onClick={() => { setMethod('trial'); setPlan(TRIAL_DEFAULT_PLAN); setError('') }}
-            className={`flex-1 px-3 py-2 rounded-lg border text-[12px] font-medium cursor-pointer transition-all ${method === 'trial' ? 'border-text-primary bg-white/5 text-text-primary' : 'border-border bg-bg-card text-text-secondary hover:border-hairline-strong'}`}
+            disabled={busy || !!result}
+            aria-pressed={method === 'trial'}
+            onClick={() => { setMethod('trial'); setPlan(trialNeedsPayment ? SCRIPT_TRIAL_PLAN : TRIAL_DEFAULT_PLAN); setError('') }}
+            className={`flex-1 min-h-11 px-3 py-2 rounded-lg border text-sm font-medium cursor-pointer transition-all ${method === 'trial' ? 'border-text-primary bg-white/5 text-text-primary' : 'border-border bg-bg-card text-text-secondary hover:border-hairline-strong'}`}
           >
-            Триал без карты
+            Триал · 3 способа
           </button>
         </div>
 
@@ -321,11 +377,12 @@ export function SubscribeModal({
           )}
 
           <label className="text-[11px] text-text-muted mb-1 block">План</label>
-          <div className="grid grid-cols-2 gap-2 mb-3">
-            {PLANS.map(p => (
+          <div className={`grid ${method === 'trial' && trialNeedsPayment ? 'grid-cols-1' : 'grid-cols-2'} gap-2 mb-3`}>
+            {(method === 'trial' && trialNeedsPayment ? SCRIPT_TRIAL_PLANS : PLANS).map(p => (
               <button
                 key={p.id}
                 type="button"
+                disabled={busy || !!result}
                 onClick={() => setPlan(p.id)}
                 className={`p-2.5 rounded-lg border text-left cursor-pointer transition-all ${
                   plan === p.id
@@ -339,7 +396,7 @@ export function SubscribeModal({
             ))}
           </div>
 
-          {stripeError && (
+          {method === 'card' && stripeError && (
             <div className="mb-3 p-3 bg-bg-secondary border border-border rounded-lg">
               <div className="text-err text-[12px] font-medium mb-1">Оплата новой картой недоступна</div>
               <div className="text-[12px] text-text-secondary">{stripeError}</div>
@@ -355,32 +412,50 @@ export function SubscribeModal({
 
           {method === 'trial' && (
             <div className="mb-3 p-3 bg-bg-secondary border border-border rounded-lg">
-              <div className="text-[11px] text-text-muted mb-1">Триал без карты</div>
-              <p className="text-[12px] text-text-secondary mb-2">
-                Метод из HAR: тот же <code className="font-mono text-[11px] text-text-primary">updateSubscription</code>, но с <code className="font-mono text-[11px] text-text-primary">trialData</code> и <code className="font-mono text-[11px] text-text-primary">trialEnd</code> вместо карты. Notion отвечает <span className="text-text-primary">trialing</span>, деньги не списываются.
-              </p>
-              <label className="text-[11px] text-text-muted mb-1 block">Длительность</label>
+              <label htmlFor="trial-method" className="block text-sm text-text-primary font-medium mb-2">Способ триала</label>
+              <select id="trial-method" value={trialMethod} onChange={e => selectTrialPreset(e.target.value as TrialMethod)} disabled={busy || !!result}
+                className="w-full min-h-11 py-2 px-3 bg-bg-input border border-border rounded-lg text-sm text-text-primary outline-none focus:border-notion-blue">
+                {TRIAL_PRESETS.map(preset => <option key={preset.id} value={preset.id}>{preset.title}</option>)}
+              </select>
+              <p className="text-sm text-text-secondary mt-2 mb-3">{TRIAL_PRESETS.find(preset => preset.id === trialMethod)?.description}</p>
+              {spaceId && <p className="text-sm text-text-secondary mb-3">Применяется только к выбранному пространству.</p>}
+              {trialNeedsPayment ? (
+                <div className="mb-4 space-y-3">
+                  <p className="text-sm text-text-primary leading-relaxed">Business на 14 дней с платёжным методом. После триала возможно продление: 24 USD за место в месяц до налогов. Окончательные условия определяет Notion.</p>
+                  <div>
+                    <label htmlFor="trial-payment-id" className="block text-sm text-text-primary mb-1">Ваш paymentMethodId</label>
+                    <input id="trial-payment-id" value={trialPaymentID} onChange={e => { trialDefaultsEdited.current.payment = true; setTrialPaymentID(e.target.value) }}
+                      required disabled={busy} autoComplete="off" spellCheck={false} maxLength={131} pattern="pm_[A-Za-z0-9]{1,128}" placeholder="pm_..."
+                      className="w-full min-h-11 py-2 px-3 bg-bg-input border border-border rounded-lg text-sm text-text-primary font-mono outline-none focus:border-notion-blue" />
+                    <p className="text-sm text-text-secondary mt-1">Свой разрешённый метод оплаты для этого аккаунта. Идентификатор из примеров не подставляется.</p>
+                  </div>
+                  <div>
+                    <label htmlFor="trial-country" className="block text-sm text-text-primary mb-1">Реальная страна плательщика</label>
+                    <input id="trial-country" value={trialCountry} onChange={e => { trialDefaultsEdited.current.country = true; setTrialCountry(e.target.value.replace(/[^a-z]/gi, '').toUpperCase()) }}
+                      required disabled={busy} autoComplete="off" minLength={2} maxLength={2} pattern="[A-Z]{2}" placeholder="Например, DE"
+                      className="w-full min-h-11 py-2 px-3 bg-bg-input border border-border rounded-lg text-sm text-text-primary outline-none focus:border-notion-blue" />
+                  </div>
+                  <label className="flex min-h-11 gap-3 items-start text-sm text-text-primary cursor-pointer">
+                    <input type="checkbox" checked={trialRenewalConfirmed} onChange={e => setTrialRenewalConfirmed(e.target.checked)} required disabled={busy} className="mt-1 shrink-0" />
+                    <span>Подтверждаю, что платёжный метод мой, и понимаю возможность платного автопродления после 14 дней.</span>
+                  </label>
+                </div>
+              ) : <p className="text-sm text-text-secondary mb-3">Прежний вариант без передачи карты. Доступность триала проверяет Notion.</p>}
+              <div className="text-sm text-text-primary mb-1">Длительность</div>
               <div className="flex gap-2 mb-3">
-                {TRIAL_DAYS.map(d => (
-                  <button
-                    key={d}
-                    type="button"
-                    onClick={() => setTrialDays(d)}
-                    className={`flex-1 py-1.5 rounded-lg border text-[12px] cursor-pointer transition-all ${trialDays === d ? 'border-text-primary bg-white/5 text-text-primary' : 'border-border bg-bg-card text-text-secondary hover:border-hairline-strong'}`}
-                  >
+                {(trialNeedsPayment ? [14] : TRIAL_DAYS).map(d => (
+                  <button key={d} type="button" disabled={busy || !!result} onClick={() => setTrialDays(d)}
+                    aria-pressed={requestedTrialDays === d}
+                    className={`flex-1 min-h-11 rounded-lg border text-sm cursor-pointer ${requestedTrialDays === d ? 'border-text-primary bg-white/5 text-text-primary' : 'border-border text-text-secondary'}`}>
                     {d} дней
                   </button>
                 ))}
               </div>
-              <label className="text-[11px] text-text-muted mb-1 block">captchaToken (если Notion попросит)</label>
-              <textarea
-                value={trialCaptcha}
-                onChange={e => setTrialCaptcha(e.target.value)}
-                placeholder="P1_eyJ..."
-                rows={2}
-                className="w-full py-2 px-3 bg-bg-input border border-border rounded-lg text-[12px] text-text-primary outline-none focus:border-notion-blue transition-all placeholder:text-text-muted resize-none font-mono"
-              />
-              <div className="text-[10px] text-text-muted mt-1.5">Сначала пробуем без captcha (3 попытки). Если Notion ответит «Trial activation is not allowed» — вставьте свежий hCaptcha-токен из DevTools и повторите.</div>
+              <label htmlFor="trial-captcha" className="text-sm text-text-primary mb-1 block">captchaToken, если требуется</label>
+              <textarea id="trial-captcha" value={trialCaptcha} onChange={e => setTrialCaptcha(e.target.value)} disabled={busy}
+                placeholder="P1_eyJ..." rows={2}
+                className="w-full py-2 px-3 bg-bg-input border border-border rounded-lg text-sm text-text-primary outline-none focus:border-notion-blue resize-none font-mono" />
+              <p className="text-sm text-text-secondary mt-2">Доступность подтверждает Notion. Новые варианты не повторяются автоматически.</p>
             </div>
           )}
 
@@ -420,22 +495,22 @@ export function SubscribeModal({
             </select>
           </div>
 
-          {error && <div className="text-err text-[12px] mb-2 px-1">{error}</div>}
+          {error && <div role="alert" className="text-err text-sm mb-2 px-1 break-words">{error}</div>}
           {result && (
             <div className="mb-2 p-3 bg-ok/10 border border-ok/30 rounded-lg text-[12px]">
               <div className="text-ok font-medium">{result}</div>
             </div>
           )}
 
-          <div className="flex gap-2.5 mt-2">
-            <button type="button" onClick={onClose}
-              className="flex-1 h-11 bg-bg-card hover:bg-bg-secondary text-text-primary rounded-full text-[14px] font-medium cursor-pointer transition-colors border border-border">
+          <div className="flex flex-col-reverse sm:flex-row gap-2.5 mt-2">
+            <button type="button" onClick={onClose} disabled={busy}
+              className="flex-1 h-11 min-h-11 shrink-0 bg-bg-card hover:bg-bg-secondary text-text-primary rounded-full text-[14px] font-medium cursor-pointer transition-colors border border-border">
               Отмена
             </button>
-            <button type="submit" disabled={loading || savedLoading || trialLoading || !token.trim() || !!result || (method === 'card' && !stripeLoaded)}
-              className="flex-1 h-11 bg-white hover:bg-white/90 text-black rounded-full text-[14px] font-medium cursor-pointer transition-colors border-none disabled:opacity-40 disabled:cursor-not-allowed">
+            <button type="submit" disabled={busy || !token.trim() || !!result || (method === 'card' && !stripeLoaded) || (method === 'trial' && trialNeedsPayment && (!trialPaymentValid || !trialCountryValid || !trialRenewalConfirmed))}
+              className="flex-1 h-11 min-h-11 shrink-0 bg-white hover:bg-white/90 text-black rounded-full text-[14px] font-medium cursor-pointer transition-colors border-none disabled:opacity-40 disabled:cursor-not-allowed">
               {method === 'trial'
-                ? (trialLoading ? 'Активирую триал...' : `Активировать триал на ${trialDays} дней`)
+                ? (trialLoading ? 'Активирую триал...' : `Запросить триал на ${requestedTrialDays} дней`)
                 : (loading ? 'Обработка...' : 'Оплатить новой картой')}
             </button>
           </div>

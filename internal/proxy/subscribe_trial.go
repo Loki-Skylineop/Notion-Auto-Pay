@@ -48,6 +48,7 @@ const (
 
 // TrialResponse is what /admin/subscribe/trial answers to the dashboard.
 type TrialResponse struct {
+	TrialMethod        string `json:"trial_method,omitempty"`
 	Status             string `json:"status,omitempty"`
 	Email              string `json:"email,omitempty"`
 	SpaceID            string `json:"space_id,omitempty"`
@@ -71,6 +72,11 @@ type trialRequest struct {
 	From          string
 	CaptchaToken  string
 	ClientVersion string
+	Method        string
+	PaymentID     string
+	Country       string
+	BillingEmail  string
+	CustomerName  string
 }
 
 // notionTrialResult is the 200 payload Notion returns for a started trial.
@@ -86,8 +92,8 @@ func writeTrialJSON(w http.ResponseWriter, status int, resp TrialResponse) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// HandleSubscribeTrial activates a Notion free trial for one workspace without
-// any card at all.
+// HandleSubscribeTrial requests one eligible trial. The legacy/sidebar offer
+// needs no card; the two script33 offers require the customer's payment method.
 //
 // POST /admin/subscribe/trial
 // Body: {token_v2, space_id, plan, days, captcha_token, trial_id, from}
@@ -111,6 +117,10 @@ func HandleSubscribeTrial(auth *DashboardAuth) http.HandlerFunc {
 			CaptchaToken string `json:"captcha_token"`
 			TrialID      string `json:"trial_id"`
 			From         string `json:"from"`
+			TrialMethod  string `json:"trial_method"`
+			PaymentID    string `json:"payment_method_id"`
+			Country      string `json:"country"`
+			ConfirmRenew bool   `json:"confirm_auto_renew"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeTrialJSON(w, http.StatusBadRequest, TrialResponse{Error: "invalid request body"})
@@ -120,6 +130,17 @@ func HandleSubscribeTrial(auth *DashboardAuth) http.HandlerFunc {
 		token := strings.TrimSpace(body.TokenV2)
 		if token == "" {
 			writeTrialJSON(w, http.StatusBadRequest, TrialResponse{Error: "token_v2 is required"})
+			return
+		}
+		method, err := normalizeTrialMethod(body.TrialMethod)
+		if err != nil {
+			writeTrialJSON(w, http.StatusBadRequest, TrialResponse{Error: err.Error()})
+			return
+		}
+		paymentID := strings.TrimSpace(body.PaymentID)
+		country := strings.ToUpper(strings.TrimSpace(body.Country))
+		if err := validateTrialPayment(method, paymentID, country, body.ConfirmRenew); err != nil {
+			writeTrialJSON(w, http.StatusBadRequest, TrialResponse{Error: err.Error()})
 			return
 		}
 		plan := strings.TrimSpace(body.Plan)
@@ -142,6 +163,11 @@ func HandleSubscribeTrial(auth *DashboardAuth) http.HandlerFunc {
 			from = defaultTrialFrom
 		}
 
+		if trialMethodNeedsPayment(method) {
+			// The supplied scripts describe one fixed, card-upfront offer.
+			plan, days, trialID, from = scriptTrialPlan, defaultTrialDays, scriptTrialID, scriptTrialFrom
+		}
+
 		acc, err := DiscoverAccountFromToken(token)
 		if err != nil {
 			writeTrialJSON(w, http.StatusBadRequest, TrialResponse{Error: fmt.Sprintf("account discovery failed: %v", err)})
@@ -160,7 +186,22 @@ func HandleSubscribeTrial(auth *DashboardAuth) http.HandlerFunc {
 			clientVersion = DefaultClientVersion
 		}
 
-		log.Printf("[trial] space=%s plan=%s days=%d captcha=%v (%s)", truncate(spaceID, 8), plan, days, strings.TrimSpace(body.CaptchaToken) != "", acc.UserEmail)
+		if trialMethodNeedsPayment(method) {
+			if strings.TrimSpace(acc.UserEmail) == "" {
+				writeTrialJSON(w, http.StatusBadRequest, TrialResponse{Error: "the authenticated account has no billing email"})
+				return
+			}
+			spaceID, err = discoverScriptTrialSpace(r.Context(), token, acc.UserID, method, strings.TrimSpace(body.SpaceID))
+			if err != nil {
+				writeTrialJSON(w, http.StatusBadRequest, TrialResponse{Error: err.Error()})
+				return
+			}
+			if workspaceIsExcluded(spaceID) {
+				writeTrialJSON(w, http.StatusBadRequest, TrialResponse{Error: "the selected workspace was removed from the pool"})
+				return
+			}
+		}
+		log.Printf("[trial] method=%s space=%s plan=%s days=%d captcha=%v (%s)", method, truncate(spaceID, 8), plan, days, strings.TrimSpace(body.CaptchaToken) != "", acc.UserEmail)
 
 		var (
 			out      *notionTrialResult
@@ -168,7 +209,12 @@ func HandleSubscribeTrial(auth *DashboardAuth) http.HandlerFunc {
 			attempts int
 			trialEnd string
 		)
-		for attempt := 1; attempt <= trialMaxAttempts; attempt++ {
+		attemptLimit := trialMaxAttempts
+		if trialMethodNeedsPayment(method) {
+			// A payment-bearing request must never be blindly replayed.
+			attemptLimit = 1
+		}
+		for attempt := 1; attempt <= attemptLimit; attempt++ {
 			attempts = attempt
 			trialEnd = time.Now().Add(time.Duration(days) * 24 * time.Hour).Format(trialTimeLayout)
 			out, lastErr = callNotionTrialSubscription(trialRequest{
@@ -181,12 +227,17 @@ func HandleSubscribeTrial(auth *DashboardAuth) http.HandlerFunc {
 				From:          from,
 				CaptchaToken:  strings.TrimSpace(body.CaptchaToken),
 				ClientVersion: clientVersion,
+				Method:        method,
+				PaymentID:     paymentID,
+				Country:       country,
+				BillingEmail:  acc.UserEmail,
+				CustomerName:  acc.UserName,
 			})
 			if lastErr == nil {
 				break
 			}
-			log.Printf("[trial]   attempt %d/%d failed: %v", attempt, trialMaxAttempts, lastErr)
-			if attempt < trialMaxAttempts {
+			log.Printf("[trial]   attempt %d/%d failed: %v", attempt, attemptLimit, lastErr)
+			if attempt < attemptLimit {
 				time.Sleep(trialRetryDelay)
 			}
 		}
@@ -210,6 +261,7 @@ func HandleSubscribeTrial(auth *DashboardAuth) http.HandlerFunc {
 		log.Printf("[trial]   OK space=%s status=%q until %s", truncate(spaceID, 8), subStatus, trialEnd)
 		writeTrialJSON(w, http.StatusOK, TrialResponse{
 			Status:             "ok",
+			TrialMethod:        method,
 			Email:              acc.UserEmail,
 			SpaceID:            spaceID,
 			Plan:               plan,
@@ -222,8 +274,11 @@ func HandleSubscribeTrial(auth *DashboardAuth) http.HandlerFunc {
 	}
 }
 
-// callNotionTrialSubscription replays the captured trial payload once.
-func callNotionTrialSubscription(req trialRequest) (*notionTrialResult, error) {
+// buildNotionTrialPayload keeps the card-free and card-upfront offers separate.
+func buildNotionTrialPayload(req trialRequest) map[string]interface{} {
+	if trialMethodNeedsPayment(req.Method) {
+		req.Plan = scriptTrialPlan
+	}
 	price := map[string]interface{}{
 		"externalId":      req.Plan,
 		"product":         extractProduct(req.Plan),
@@ -255,7 +310,27 @@ func callNotionTrialSubscription(req trialRequest) (*notionTrialResult, error) {
 	if req.CaptchaToken != "" {
 		payload["captchaToken"] = req.CaptchaToken
 	}
+	if trialMethodNeedsPayment(req.Method) {
+		name := strings.TrimSpace(req.CustomerName)
+		if name == "" {
+			name = "Admin"
+		}
+		payload["billingEmail"] = req.BillingEmail
+		payload["customerName"] = name
+		payload["businessName"] = ""
+		payload["addressZip"] = ""
+		payload["addressCountry"] = req.Country
+		payload["paymentMethodId"] = req.PaymentID
+		// These two source files omit autoConvert: disclose renewal in the UI.
+		payload["trialData"] = map[string]interface{}{"id": scriptTrialID, "from": scriptTrialFrom}
+		payload["from"] = scriptTrialFrom
+	}
+	return payload
+}
 
+// callNotionTrialSubscription sends one request; a trial must be confirmed.
+func callNotionTrialSubscription(req trialRequest) (*notionTrialResult, error) {
+	payload := buildNotionTrialPayload(req)
 	bodyBytes, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
@@ -290,11 +365,7 @@ func callNotionTrialSubscription(req trialRequest) (*notionTrialResult, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("%s", trialErrorMessage(resp.StatusCode, respBody))
 	}
-	var out notionTrialResult
-	if err := json.Unmarshal(respBody, &out); err != nil {
-		return nil, fmt.Errorf("unexpected Notion response: %s", truncate(string(respBody), 200))
-	}
-	return &out, nil
+	return parseNotionTrialResult(respBody)
 }
 
 // notionWebOrigin derives the web origin from the configured API base.

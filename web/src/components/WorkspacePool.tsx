@@ -1,8 +1,8 @@
 import { forgetAccount, forgetSpace, sanitizePool } from '../workspaceLifecycle'
 import { useState, useEffect, useRef, useCallback } from 'react'
-import type { WorkspaceInfo as BaseWorkspaceInfo, McpServerInfo } from '../api'
-import { deleteAccount, connectMcp, createWorkspaces, deleteWorkspaces, disconnectMcp, discoverWorkspaces, setOverage, startTrial } from '../api'
-import { SubscribeModal, PLANS, TRIAL_DAYS } from './SubscribeModal'
+import type { WorkspaceInfo as BaseWorkspaceInfo, McpServerInfo, TrialMethod } from '../api'
+import { deleteAccount, connectMcp, createWorkspaces, deleteWorkspaces, disconnectMcp, discoverWorkspaces, setOverage, fetchTrialDefaults, startTrial } from '../api'
+import { SubscribeModal, PLANS, TRIAL_DAYS, TRIAL_PRESETS, SCRIPT_TRIAL_PLANS } from './SubscribeModal'
 import { AutoPaySettings } from './AutoPaySettings'
 import { isFreeWorkspace, getFreeOnlyAccounts, getMonthlyExhaustedAccounts } from '../workspaceFilters'
 import {
@@ -377,6 +377,7 @@ function collectMcpServers(list: DiscoveredAccount[]): McpServerInfo[] {
 }
 
 const mcpInputCls = 'px-2.5 py-1.5 rounded-lg bg-black border border-white/[0.10] text-[12px] text-text-primary placeholder:text-text-muted focus:outline-none focus:border-notion-blue/60'
+const bulkTrialInputCls = mcpInputCls.replace('text-[12px]', 'text-sm')
 
 function McpConnectModal({
   target,
@@ -649,7 +650,28 @@ function BulkActionModal({
   const [plan, setPlan] = useState(PLANS[0].id)
   const [country, setCountry] = useState('DE')
   const [trialDays, setTrialDays] = useState(14)
+  const [trialMethod, setTrialMethod] = useState<TrialMethod>('sidebar')
+  const [trialPaymentID, setTrialPaymentID] = useState('')
+  const [trialCountry, setTrialCountry] = useState('')
+  const [trialRenewalConfirmed, setTrialRenewalConfirmed] = useState(false)
+  const trialDefaultsEdited = useRef({ payment: false, country: false })
+  useEffect(() => {
+    let active = true
+    fetchTrialDefaults().then(defaults => {
+      if (!active) return
+      if (!trialDefaultsEdited.current.payment && defaults.payment_method_id) setTrialPaymentID(defaults.payment_method_id)
+      if (!trialDefaultsEdited.current.country && defaults.country) setTrialCountry(defaults.country)
+    }).catch(() => { /* Defaults are optional; manual entry remains available. */ })
+    return () => { active = false }
+  }, [])
   const [savedLast4, setSavedLast4] = useState('')
+  const trialNeedsPayment = payMethod === 'trial' && trialMethod !== 'sidebar'
+  const trialPaymentValid = /^pm_[A-Za-z0-9]{1,128}$/.test(trialPaymentID.trim())
+  const trialCountryValid = /^[A-Z]{2}$/.test(trialCountry)
+
+  useEffect(() => {
+    setTrialRenewalConfirmed(false)
+  }, [payMethod, trialMethod, trialPaymentID, trialCountry, sel])
 
   useEffect(() => {
     let dead = false
@@ -716,6 +738,12 @@ function BulkActionModal({
       const label = pl ? `${pl.name} ${pl.price}${pl.interval}` : plan
       if (!window.confirm(`Оплатить план ${label} для ${selCount} пространств сохранённой картой?\n\nСписываются реальные деньги, отменить нельзя.`)) return
     }
+    if (mode === 'pay' && trialNeedsPayment) {
+      if (!trialPaymentValid) { setErr('Укажите корректный paymentMethodId (pm_…)'); return }
+      if (!trialCountryValid) { setErr('Укажите реальную страну плательщика: код из двух букв'); return }
+      if (!trialRenewalConfirmed) { setErr('Подтвердите платное автопродление для выбранных пространств'); return }
+      if (!window.confirm(`Включить Business-триал на 14 дней для ${selCount} выбранных пространств?\n\nПосле триала возможно платное автопродление (${SCRIPT_TRIAL_PLANS[0].price}/мес за каждое пространство). Используйте только разрешённый способ оплаты и реальную страну плательщика.`)) return
+    }
     setErr('')
     runningRef.current = true
     setRunning(true)
@@ -778,7 +806,16 @@ function BulkActionModal({
           return
         }
         if (payMethod === 'trial') {
-          const res = await startTrial({ token_v2: r.token, space_id: r.spaceId, plan, days: trialDays })
+          const res = await startTrial({
+            token_v2: r.token, space_id: r.spaceId,
+            plan: trialNeedsPayment ? SCRIPT_TRIAL_PLANS[0].id : plan,
+            days: trialNeedsPayment ? 14 : trialDays,
+            trial_method: trialMethod,
+            ...(trialNeedsPayment ? {
+              payment_method_id: trialPaymentID.trim(), country: trialCountry,
+              confirm_auto_renew: trialRenewalConfirmed,
+            } : {}),
+          })
           if (res.error) { mark(r.key, 'error', res.error); return }
           okCount += 1
           mark(r.key, 'ok', res.subscription_status || 'trialing')
@@ -899,26 +936,65 @@ function BulkActionModal({
                 Сохранённой картой{savedLast4 ? ` ···· ${savedLast4}` : ''}
               </button>
               <button type="button" disabled={running} onClick={() => setPayMethod('trial')} className={tabCls(payMethod === 'trial')}>
-                Триал без карты
+                Триал · 3 способа
               </button>
             </div>
-            <div className="flex gap-2">
-              <select value={plan} disabled={running} onChange={(e) => setPlan(e.target.value)} className={mcpInputCls + ' flex-1 cursor-pointer'}>
-                {PLANS.map((pl) => (
+            {payMethod === 'trial' && (
+              <label htmlFor="bulk-trial-method" className="flex flex-col gap-2 text-sm text-text-secondary">
+                Способ триала
+                <select id="bulk-trial-method" value={trialMethod} disabled={running}
+                  onChange={(e) => setTrialMethod(e.target.value as TrialMethod)}
+                  className={bulkTrialInputCls + ' min-h-11 w-full min-w-0 cursor-pointer text-sm'}>
+                  {TRIAL_PRESETS.map((preset) => <option key={preset.id} value={preset.id}>{preset.title}</option>)}
+                </select>
+              </label>
+            )}
+            <div className="flex flex-col gap-2 sm:flex-row">
+              <select aria-label="Тариф" value={trialNeedsPayment ? SCRIPT_TRIAL_PLANS[0].id : plan}
+                disabled={running || trialNeedsPayment} onChange={(e) => setPlan(e.target.value)}
+                className={bulkTrialInputCls + ' min-h-11 min-w-0 flex-1 cursor-pointer text-sm'}>
+                {(trialNeedsPayment ? SCRIPT_TRIAL_PLANS : PLANS).map((pl) => (
                   <option key={pl.id} value={pl.id}>{pl.name} · {pl.price}{pl.interval}</option>
                 ))}
               </select>
               {payMethod === 'trial' ? (
-                <select value={trialDays} disabled={running} onChange={(e) => setTrialDays(parseInt(e.target.value, 10) || 14)} className={mcpInputCls + ' w-28 cursor-pointer'}>
+                <select aria-label="Длительность триала" value={trialNeedsPayment ? 14 : trialDays}
+                  disabled={running || trialNeedsPayment} onChange={(e) => setTrialDays(parseInt(e.target.value, 10) || 14)}
+                  className={bulkTrialInputCls + ' min-h-11 w-full cursor-pointer text-sm sm:w-28'}>
                   {TRIAL_DAYS.map((d) => (<option key={d} value={d}>{d} дней</option>))}
                 </select>
               ) : (
-                <input value={country} disabled={running} onChange={(e) => setCountry(e.target.value.toUpperCase().slice(0, 2))} placeholder="DE" className={mcpInputCls + ' w-20 text-center'} />
+                <input aria-label="Страна плательщика" value={country} disabled={running} onChange={(e) => setCountry(e.target.value.toUpperCase().slice(0, 2))} placeholder="DE" className={bulkTrialInputCls + ' min-h-11 w-20 text-center'} />
               )}
             </div>
+            {trialNeedsPayment && (
+              <div className="grid grid-cols-1 gap-3 rounded-lg border border-white/[0.10] p-3 sm:grid-cols-2">
+                <label htmlFor="bulk-trial-payment-id" className="flex min-w-0 flex-col gap-2 text-sm text-text-secondary sm:col-span-2">
+                  paymentMethodId
+                  <input id="bulk-trial-payment-id" value={trialPaymentID} disabled={running}
+                    onChange={(e) => { trialDefaultsEdited.current.payment = true; setTrialPaymentID(e.target.value) }} placeholder="pm_…" spellCheck={false}
+                    className={bulkTrialInputCls + ' min-h-11 w-full min-w-0 font-mono text-sm'} />
+                </label>
+                <label htmlFor="bulk-trial-country" className="flex min-w-0 flex-col gap-2 text-sm text-text-secondary sm:col-span-2">
+                  Реальная страна плательщика (ISO)
+                  <input id="bulk-trial-country" value={trialCountry} disabled={running} maxLength={2}
+                    onChange={(e) => { trialDefaultsEdited.current.country = true; setTrialCountry(e.target.value.replace(/[^a-z]/gi, '').toUpperCase()) }}
+                    className={bulkTrialInputCls + ' min-h-11 w-24 text-center text-sm'} />
+                </label>
+                <label className="flex cursor-pointer items-start gap-3 text-sm leading-relaxed text-amber-300 sm:col-span-2">
+                  <input id="bulk-trial-renewal" type="checkbox" checked={trialRenewalConfirmed} disabled={running}
+                    onChange={(e) => setTrialRenewalConfirmed(e.target.checked)} className="mt-1 h-4 w-4 shrink-0" />
+                  <span>Это разрешённый мной способ оплаты. Подтверждаю платное автопродление после триала для каждого выбранного пространства.</span>
+                </label>
+              </div>
+            )}
             {payMethod === 'saved' ? (
               <div className="text-[10px] text-amber-400/80 leading-snug">
                 Внимание: по каждому выбранному пространству спишутся реальные деньги. Карта берётся из настроек автооплаты на сервере.
+              </div>
+            ) : trialNeedsPayment ? (
+              <div className="text-sm leading-relaxed text-amber-300">
+                Business на 14 дней для выбранных пространств. После триала — возможное автопродление по {SCRIPT_TRIAL_PLANS[0].price}/мес за каждое пространство. При отказе Notion другой способ автоматически не запускается.
               </div>
             ) : (
               <div className="text-[10px] text-text-muted leading-snug">
@@ -997,7 +1073,7 @@ function BulkActionModal({
           <button
             type="button"
             onClick={start}
-            disabled={running || selCount === 0}
+            disabled={running || selCount === 0 || (mode === 'pay' && trialNeedsPayment && (!trialPaymentValid || !trialCountryValid || !trialRenewalConfirmed))}
             className={`px-3 py-1.5 rounded-lg text-[12px] font-medium text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors border-none cursor-pointer ${mode === 'delete' || mode === 'monthly' ? 'bg-err hover:bg-err/90' : 'bg-notion-blue hover:bg-notion-blue/90'}`}
           >
             {running ? 'Выполняю…' : mode === 'monthly' ? `Удалить аккаунты из пула (${selCount})` : mode === 'delete' ? `Удалить навсегда (${selCount})` : mode === 'mcp' ? `Подключить MCP (${selCount})` : payMethod === 'trial' ? `Включить триал (${selCount})` : `Оплатить (${selCount})`}

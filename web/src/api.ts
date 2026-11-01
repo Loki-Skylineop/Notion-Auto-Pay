@@ -436,7 +436,10 @@ export async function subscribe(tokenV2: string, paymentMethodId: string, plan: 
 
 // --- Trial API ---
 
+export type TrialMethod = 'sidebar' | 'script33' | 'script33_v2'
+
 export interface TrialResult {
+  trial_method?: TrialMethod
   status?: string
   error?: string
   email?: string
@@ -455,12 +458,15 @@ export interface TrialInput {
   plan?: string
   days?: number
   captcha_token?: string
+  trial_method?: TrialMethod
+  payment_method_id?: string
+  country?: string
+  confirm_auto_renew?: boolean
 }
 
-// Активация бесплатного триала для одного пространства — карта не нужна.
-// Сервер повторяет запрос, снятый с веб-клиента Notion (HAR): тот же
-// /api/v3/updateSubscription, но с trialData + trialEnd и без paymentMethodId.
-// Успех выглядит как {"subscriptionStatus":"trialing", "invoiceUrl": "..."}.
+// Legacy/sidebar omits a payment method. The two script33 presets require
+// the customer's own payment method, real billing country and renewal consent.
+// Only an explicit trialing response is considered a successful activation.
 export async function startTrial(input: TrialInput): Promise<TrialResult> {
   const resp = await fetch('/admin/subscribe/trial', {
     method: 'POST',
@@ -469,10 +475,31 @@ export async function startTrial(input: TrialInput): Promise<TrialResult> {
     body: JSON.stringify(input),
   })
   const text = await resp.text()
-  let data: TrialResult = {}
-  try { data = text ? JSON.parse(text) : {} } catch { data = {} }
+  let data: TrialResult
+  try { data = JSON.parse(text) } catch { return { error: `Некорректный ответ сервера (HTTP ${resp.status})` } }
+  if (!data || typeof data !== 'object') return { error: 'Сервер не подтвердил активацию триала' }
   if (!resp.ok || data.error) return { error: data.error || `HTTP ${resp.status}` }
+  if (data.status !== 'ok' || data.subscription_status !== 'trialing') {
+    return { error: 'Сервер не подтвердил триал. Проверьте подписку перед повторным запросом.' }
+  }
   return data
+}
+
+export interface TrialDefaults {
+  payment_method_id?: string
+  country?: string
+}
+
+// Personal defaults stay on the server and are available only to their owner.
+export async function fetchTrialDefaults(): Promise<TrialDefaults> {
+  const resp = await fetch('/admin/subscribe/trial-defaults', { credentials: 'same-origin', cache: 'no-store' })
+  if (!resp.ok) return {}
+  const data = await resp.json()
+  if (!data || typeof data !== 'object') return {}
+  return {
+    payment_method_id: typeof data.payment_method_id === 'string' ? data.payment_method_id : undefined,
+    country: typeof data.country === 'string' ? data.country : undefined,
+  }
 }
 
 // --- Workspace Discovery API ---
